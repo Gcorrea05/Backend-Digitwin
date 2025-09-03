@@ -1,0 +1,11 @@
+name,nodeid,datatype
+Avancado_1S2,ns=4;s=|var|CECC-LK.Application.IoConfig_Globals_Mapping.Avancado_1S2,Boolean
+Recuado_1S1,ns=4;s=|var|CECC-LK.Application.IoConfig_Globals_Mapping.Recuado_1S1,Boolean
+Avancado_2S2,ns=4;s=|var|CECC-LK.Application.IoConfig_Globals_Mapping.Avancado_2S2,Boolean
+Recuado_2S1,ns=4;s=|var|CECC-LK.Application.IoConfig_Globals_Mapping.Recuado_2S1,Boolean
+V1_12,ns=4;s=|var|CECC-LK.Application.IoConfig_Globals_Mapping.V1_12,Boolean
+V1_14,ns=4;s=|var|CECC-LK.Application.IoConfig_Globals_Mapping.V1_14,Boolean
+V2_12,ns=4;s=|var|CECC-LK.Application.IoConfig_Globals_Mapping.V2_12,Boolean
+V2_14,ns=4;s=|var|CECC-LK.Application.IoConfig_Globals_Mapping.V2_14,Boolean
+INICIA,ns=4;s=|var|CECC-LK.Application.IoConfig_Globals_Mapping.Inicia,Boolean
+PARA,ns=4;s=|var|CECC-LK.Application.IoConfig_Globals_Mapping.Para,Boolean
