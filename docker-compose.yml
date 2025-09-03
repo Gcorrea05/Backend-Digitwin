@@ -1,0 +1,38 @@
+version: "3.8"
+
+name: festo-dt
+
+services:
+  redis:
+    image: redis:7
+    container_name: festo-redis
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: festo-api
+    env_file:
+      - ./api/.env
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: ["uvicorn","api_ws:app","--host","0.0.0.0","--port","8000"]
+    restart: unless-stopped
+    # se o MySQL estiver em outra máquina/rede, garanta que o host está acessível via api/.env
+
+volumes:
+  redisdata:

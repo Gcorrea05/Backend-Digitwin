@@ -1,7 +1,6 @@
 # app.py — Coletor unificado (DUAL): OPC UA + MPU (ESP32 serial) simultâneos
 # Tabelas MySQL: festo_dt.opc_samples e festo_dt.mpu_samples
 # Modos: SIMULATE | OPCUA | SERIAL_MPU | DUAL
-
 import os
 import csv
 import json
@@ -13,12 +12,11 @@ from datetime import datetime, UTC
 from typing import List, Dict, Any, Iterable, Optional
 
 from dotenv import load_dotenv
+load_dotenv()
 
 # =========================
 # Utils & Config
 # =========================
-load_dotenv()
-
 def now_utc_iso() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -61,6 +59,17 @@ MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
 MYSQL_DB   = os.getenv("MYSQL_DB", "festo_dt")
 MYSQL_USER = os.getenv("MYSQL_USER", "root")
 MYSQL_PASS = os.getenv("MYSQL_PASS", "")
+
+# Live bus (Redis)
+REDIS_ENABLE = os.getenv("REDIS_ENABLE", "true").lower() in {"1", "true", "yes", "on"}
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+_rcli = None
+if REDIS_ENABLE:
+    try:
+        import redis
+        _rcli = redis.from_url(REDIS_URL, decode_responses=True)
+    except Exception:
+        _rcli = None
 
 # =========================
 # Leitura do nodes.csv
@@ -293,12 +302,47 @@ class MySqlMpuSink(MySqlBase):
 # Loops (threads) e controle
 # =========================
 STOP = threading.Event()
-
 def handle_stop(signum, frame):
     STOP.set()
-
 signal.signal(signal.SIGINT, handle_stop)
 signal.signal(signal.SIGTERM, handle_stop)
+
+def _publish_opc_events(ts_iso: str, values: Dict[str, Any]):
+    """Publica cada sinal individualmente no Redis (canal opc_samples) como opc_event."""
+    if not _rcli:
+        return
+    for name, v in values.items():
+        # se quiser ignorar INICIA no live principal, descomente:
+        # if name == "INICIA":
+        #     continue
+        evt = {
+            "type": "opc_event",
+            "ts_utc": ts_iso,
+            "name": name,
+            "value_bool": (None if v is None else int(bool(v))),
+        }
+        try:
+            _rcli.publish("opc_samples", json.dumps(evt))
+        except Exception:
+            pass
+
+def _publish_mpu_sample(sample: Dict[str, Any]):
+    """Publica amostra do MPU no Redis (canal mpu_samples) como mpu_sample."""
+    if not _rcli:
+        return
+    try:
+        id_str = "MPUA1" if int(sample["mpu_id"]) == 1 else "MPUA2"
+        msg = {
+            "type": "mpu_sample",
+            "ts_utc": sample["ts_utc"],
+            "id": id_str,
+            "ax_g": sample["ax_g"], "ay_g": sample["ay_g"], "az_g": sample["az_g"],
+            "gx_dps": sample.get("gx_dps"), "gy_dps": sample.get("gy_dps"),
+            "gz_dps": sample.get("gz_dps"), "temp_c": sample.get("temp_c"),
+        }
+        _rcli.publish("mpu_samples", json.dumps(msg))
+    except Exception:
+        pass
 
 def opc_loop():
     items = load_nodes(NODES_CSV)
@@ -320,8 +364,7 @@ def opc_loop():
                 try:
                     reader.connect()
                     connected = True
-                except Exception as e:
-                    # falhou conectar, espera um pouco e tenta de novo
+                except Exception:
                     time.sleep(2.0)
                     continue
 
@@ -329,7 +372,6 @@ def opc_loop():
             try:
                 values = reader.read_all()
             except Exception:
-                # erro de sessão: força reconexão
                 if isinstance(reader, OpcUaReader):
                     try:
                         reader.disconnect()
@@ -344,6 +386,9 @@ def opc_loop():
                 sink.write_many(ts, values)
             else:
                 sink.write_row({"ts_utc": ts, **values})
+
+            # LIVE: publica cada sinal no Redis
+            _publish_opc_events(ts, values)
 
             time.sleep(POLL_INTERVAL)
     finally:
@@ -384,6 +429,9 @@ def mpu_loop():
                 sink.write_sample(ts, sample)
             else:
                 sink.write_sample(sample)
+
+            # LIVE: publica amostra do MPU no Redis
+            _publish_mpu_sample(sample)
     finally:
         try:
             sink.close()

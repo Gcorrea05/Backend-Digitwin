@@ -1,0 +1,5 @@
+python-dotenv==1.0.1
+mysql-connector-python==9.0.0
+redis==5.0.8
+opcua==0.98.13       # cliente OPC UA (se for usar SIMULATE pode comentar)
+pyserial==3.5        # para leitura do ESP32/MPU via porta serial
