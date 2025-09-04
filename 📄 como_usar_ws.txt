@@ -4,6 +4,8 @@ CONSUMINDO A API WEBSOCKET NO SEU FRONTEND
 
 1. Endpoints disponíveis:
 -------------------------
+http://localhost:8000/docs
+
 - ws://<host>:8000/ws/opc?name=<NOME>
   → Stream de um sinal OPC específico (ex.: name=V1_12)
 
