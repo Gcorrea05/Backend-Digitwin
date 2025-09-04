@@ -1,0 +1,85 @@
+    // UNO + 2x MPU6050 (I2C único) -> JSON por linha em g
+// Baud: 115200 (comece assim) | 1 linha = 1 amostra | 100 Hz (suba depois)
+// Sensores: "MPUA1" (0x68), "MPUA2" (0x69)
+
+#include <Wire.h>
+
+// ---------- Config ----------
+constexpr uint32_t BAUD = 115200;          // use 250000 se for para 200 Hz
+constexpr uint8_t  MPU_ADDR1 = 0x68;       // AD0=GND
+constexpr uint8_t  MPU_ADDR2 = 0x69;       // AD0=VCC
+constexpr float    LSB_PER_G  = 16384.0f;  // ±2g
+constexpr uint32_t RATE_HZ    = 100;       // suba depois para 200
+constexpr uint32_t PERIOD_US  = 1000000UL / RATE_HZ;
+
+// Registradores
+constexpr uint8_t REG_PWR_MGMT_1  = 0x6B;
+constexpr uint8_t REG_ACCEL_CONFIG = 0x1C;
+constexpr uint8_t REG_ACCEL_XOUT_H = 0x3B;
+constexpr uint8_t REG_WHO_AM_I     = 0x75;
+
+// Helpers I2C
+bool i2cWrite8(uint8_t a, uint8_t r, uint8_t v) {
+  Wire.beginTransmission(a); Wire.write(r); Wire.write(v);
+  return Wire.endTransmission() == 0;
+}
+bool i2cReadN(uint8_t a, uint8_t r, uint8_t* b, size_t n) {
+  Wire.beginTransmission(a); Wire.write(r);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((int)a, (int)n) != (int)n) return false;
+  for (size_t i=0;i<n;i++) b[i]=Wire.read();
+  return true;
+}
+bool initMPU(uint8_t a) {
+  if (!i2cWrite8(a, REG_PWR_MGMT_1, 0x00)) return false; // acorda
+  delay(10);
+  if (!i2cWrite8(a, REG_ACCEL_CONFIG, 0x00)) return false; // ±2g
+  delay(10);
+  return true;
+}
+bool readAccelG(uint8_t a, float &ax, float &ay, float &az) {
+  uint8_t raw[6];
+  if (!i2cReadN(a, REG_ACCEL_XOUT_H, raw, 6)) return false;
+  int16_t x = (raw[0]<<8) | raw[1];
+  int16_t y = (raw[2]<<8) | raw[3];
+  int16_t z = (raw[4]<<8) | raw[5];
+  ax = (float)x / LSB_PER_G;
+  ay = (float)y / LSB_PER_G;
+  az = (float)z / LSB_PER_G;
+  return true;
+}
+inline void printJSON(const char *name, float ax, float ay, float az) {
+  Serial.print("{\"sensor\":\""); Serial.print(name);
+  Serial.print("\",\"ax\":"); Serial.print(ax,6);
+  Serial.print(",\"ay\":"); Serial.print(ay,6);
+  Serial.print(",\"az\":"); Serial.print(az,6);
+  Serial.println("}");
+}
+
+void setup() {
+  Serial.begin(BAUD);           // abra o Monitor Serial no mesmo baud
+  Wire.begin();                 // UNO: SDA=A4, SCL=A5
+  Wire.setClock(100000L);       // comece em 100 kHz; depois 400 kHz
+  delay(200);
+
+  // (Opcional) WHO_AM_I de debug
+  uint8_t id;
+  if (i2cReadN(MPU_ADDR1, REG_WHO_AM_I, &id, 1)) { Serial.print("MPUA1 WHO=0x"); Serial.println(id, HEX); }
+  if (i2cReadN(MPU_ADDR2, REG_WHO_AM_I, &id, 1)) { Serial.print("MPUA2 WHO=0x"); Serial.println(id, HEX); }
+
+  (void)initMPU(MPU_ADDR1);
+  (void)initMPU(MPU_ADDR2);
+}
+
+void loop() {
+  static uint32_t next_t = micros();
+  float ax, ay, az;
+
+  if (readAccelG(MPU_ADDR1, ax, ay, az)) printJSON("MPUA1", ax, ay, az);
+  if (readAccelG(MPU_ADDR2, ax, ay, az)) printJSON("MPUA2", ax, ay, az);
+
+  next_t += PERIOD_US;
+  int32_t wait = (int32_t)(next_t - micros());
+  if (wait > 0) delayMicroseconds((uint32_t)wait);
+  else next_t = micros(); // realinha se atrasar
+}

@@ -8,12 +8,25 @@ import time
 import signal
 import sys
 import threading
-from datetime import datetime, UTC
+from datetime import datetime
 from typing import List, Dict, Any, Iterable, Optional
 
 from dotenv import load_dotenv
 load_dotenv()
 
+# --- Compat UTC robusto (funciona em Py 3.9+)
+from datetime import datetime
+def _get_utc():
+    try:
+        # Python 3.11+
+        from datetime import UTC  # type: ignore
+        return UTC
+    except Exception:
+        # Python < 3.11
+        from datetime import timezone
+        return timezone.utc
+
+UTC = _get_utc()
 # =========================
 # Utils & Config
 # =========================
@@ -141,20 +154,39 @@ class SerialMpuReader:
         try:
             import serial
         except Exception as e:
-            print("Erro importando 'pyserial'. Rode 'pip install -r requirements.txt'.")
+            print("[MPU] Erro importando 'pyserial'. Rode: pip install pyserial")
             raise e
         self.serial_module = serial
-        self.port = port; self.baud = baud; self.timeout = timeout
+        self.port = port
+        self.baud = baud
+        self.timeout = timeout
         self.ser = None
+
     def connect(self):
+        print(f"[MPU] Abrindo {self.port} @ {self.baud}...")
         self.ser = self.serial_module.Serial(self.port, self.baud, timeout=self.timeout)
+        # descarta lixo inicial do buffer
+        self.ser.reset_input_buffer()
+        print("[MPU] Conectado.")
+
     def disconnect(self):
         if self.ser:
             try:
                 self.ser.close()
+                print("[MPU] Desconectado.")
             except Exception:
                 pass
             self.ser = None
+
+    def _extract_json(self, s: str) -> Optional[str]:
+        # Em alguns terminais aparecem prefixos (timestamps, “-> ”, etc.).
+        # Aqui pegamos o trecho entre o 1º '{' e o último '}'.
+        i = s.find("{")
+        j = s.rfind("}")
+        if i >= 0 and j > i:
+            return s[i:j+1]
+        return None
+
     def read_one(self) -> Optional[Dict[str, Any]]:
         if not self.ser:
             return None
@@ -165,17 +197,22 @@ class SerialMpuReader:
             s = line.decode("utf-8", errors="ignore").strip()
             if not s:
                 return None
-            obj = json.loads(s)
+            js = self._extract_json(s) or s  # tenta “limpar” a linha
+            obj = json.loads(js)
         except Exception:
+            # linha inválida; ignore silenciosamente (ou log se quiser)
             return None
+
         sensor = str(obj.get("id", obj.get("sensor", ""))).strip().upper()
         if sensor not in {"MPUA1", "MPUA2"}:
             return None
         mpu_id = 1 if sensor == "MPUA1" else 2
+
         try:
             ax = float(obj["ax"]); ay = float(obj["ay"]); az = float(obj["az"])
         except Exception:
             return None
+
         rec: Dict[str, Any] = {"mpu_id": mpu_id, "ax_g": ax, "ay_g": ay, "az_g": az}
         for k_src, k_dst in [("gx","gx_dps"), ("gy","gy_dps"), ("gz","gz_dps"),
                              ("gx_dps","gx_dps"), ("gy_dps","gy_dps"), ("gz_dps","gz_dps"),
@@ -186,6 +223,55 @@ class SerialMpuReader:
                 except Exception:
                     pass
         return rec
+
+
+def mpu_loop():
+    ser_reader = SerialMpuReader(SERIAL_PORT, SERIAL_BAUD, SERIAL_TIMEOUT)
+    sink = MySqlMpuSink() if SINK_MODE == "MYSQL" else CsvMpuSink(CSV_MPU_PATH)
+
+    try:
+        # tenta conectar/reconectar continuamente
+        while not STOP.is_set():
+            try:
+                ser_reader.connect()
+                break
+            except Exception as e:
+                print(f"[MPU] Falha ao abrir {SERIAL_PORT}: {e}. Tentando de novo em 2s...")
+                time.sleep(2.0)
+
+        # leitura contínua
+        while not STOP.is_set():
+            rec = ser_reader.read_one()
+            if rec is None:
+                time.sleep(0.002)  # evita loop a 100% CPU quando não há linha
+                continue
+
+            ts = now_utc_iso()
+            sample = {
+                "ts_utc": ts,
+                "mpu_id": rec["mpu_id"],
+                "ax_g": rec["ax_g"], "ay_g": rec["ay_g"], "az_g": rec["az_g"],
+                "gx_dps": rec.get("gx_dps"), "gy_dps": rec.get("gy_dps"),
+                "gz_dps": rec.get("gz_dps"), "temp_c": rec.get("temp_c")
+            }
+
+            try:
+                if isinstance(sink, MySqlMpuSink):
+                    sink.write_sample(ts, sample)
+                else:
+                    sink.write_sample(sample)
+            except Exception as e:
+                print(f"[MPU] Erro ao gravar amostra: {e}")
+
+            # LIVE: publica amostra do MPU no Redis
+            _publish_mpu_sample(sample)
+
+    finally:
+        try:
+            sink.close()
+        except Exception:
+            pass
+        ser_reader.disconnect()
 
 # =========================
 # Sinks (destinos)
@@ -218,10 +304,16 @@ class MySqlBase:
     def __init__(self):
         import mysql.connector
         self.mysql = mysql.connector
+        print(f"[MySQL] target={MYSQL_HOST}:{MYSQL_PORT} db={MYSQL_DB} user={MYSQL_USER}")
         self.conn = self.mysql.connect(
-            host=MYSQL_HOST, port=MYSQL_PORT,
-            database=MYSQL_DB, user=MYSQL_USER, password=MYSQL_PASS
+            host=MYSQL_HOST,
+            port=MYSQL_PORT,
+            database=MYSQL_DB,
+            user=MYSQL_USER,
+            password=MYSQL_PASS,
+            connection_timeout=5
         )
+        self.conn.autocommit = True
     def close(self):
         try:
             self.conn.close()
