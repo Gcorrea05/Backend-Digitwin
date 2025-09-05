@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8" />
+  <title>FESTO DT - History Player (by index)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root { --bg:#0f172a; --card:#111827; --border:#1f2937; --muted:#9ca3af; --ink:#e2e8f0; }
+    * { box-sizing:border-box }
+    body { background:var(--bg); color:var(--ink); font-family:system-ui,Arial; margin:0; padding:24px; }
+    h1 { margin:0 0 16px; font-size:20px; }
+    .grid { display:grid; gap:16px; grid-template-columns: repeat(auto-fit,minmax(280px,1fr)); }
+    .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:16px; }
+    .title { font-weight:700; margin-bottom:8px; }
+    .value { font-size:20px; font-weight:700; margin-top:6px; }
+    .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+    input, select, button { background:#0b1220; color:var(--ink); border:1px solid var(--border); padding:8px 10px; border-radius:8px; }
+    button { cursor:pointer; }
+    small { color:var(--muted); }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; font-weight:700; font-size:14px;}
+    .pill.gray{ background:#111827; border:1px solid #334155; color:#cbd5e1; }
+    .pill.green{ background:#052e16; border:1px solid #14532d; color:#22c55e; }
+    .pill.yellow{ background:#3b2f0b; border:1px solid #a16207; color:#f59e0b; }
+    .pill.red{ background:#3b0d0d; border:1px solid #7f1d1d; color:#ef4444; }
+    .log { margin-top:8px; max-height:140px; overflow:auto; font-family:ui-monospace,Consolas,monospace; font-size:12px; opacity:.9; }
+    .log div { border-bottom:1px dashed var(--border); padding:2px 0; }
+    .right { margin-left:auto }
+  </style>
+</head>
+<body>
+  <h1>FESTO Digital Twin — History Player (by index)</h1>
+
+  <div class="card" style="margin-bottom:16px">
+    <div class="row">
+      <label>API Base:</label>
+      <input id="apiBase" size="40" value="http://localhost:8000" />
+      <button id="btnReload">Reload history</button>
+      <span id="loadOut" style="color:#9ca3af"></span>
+      <label class="row right" style="gap:6px;">
+        <input type="checkbox" id="play2s" />
+        <span>Play (2s)</span>
+      </label>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <label>OPC sinal</label>
+      <input id="opcName" value="Recuado_1S1" />
+      <label>MPU id</label>
+      <select id="mpuId"><option>MPUA1</option><option>MPUA2</option></select>
+      <label>limit</label>
+      <input id="limit" type="number" value="5000" min="100" max="20000" style="width:92px"/>
+      <label>RMS window (amostras)</label>
+      <input id="nVib" type="number" value="50" min="1" max="2000" style="width:90px"/>
+      <label>Cycles window (amostras)</label>
+      <input id="nCyc" type="number" value="100" min="2" max="5000" style="width:90px"/>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <div class="title">Actuators State</div>
+      <div class="value" id="stateNow">—</div>
+      <small id="stateIdx" title="índice atual"></small>
+      <div id="stateLog" class="log"></div>
+    </div>
+
+    <div class="card">
+      <div class="title">Cycles (janela por AMOSTRAS)</div>
+      <div class="value" id="valCycles">—</div>
+      <small id="rawCycles"></small>
+      <div id="cyclesLog" class="log"></div>
+    </div>
+
+    <div class="card">
+      <div class="title">Vibration (RMS por AMOSTRAS)</div>
+      <div class="value" id="vibNow">—</div>
+      <small id="vibIdx"></small>
+      <div id="vibLog" class="log"></div>
+    </div>
+
+    <div class="card">
+      <div class="title">OPC (sinal selecionado)</div>
+      <div class="value" id="opcNow">—</div>
+      <small id="opcIdx"></small>
+      <div id="opcLog" class="log"></div>
+    </div>
+
+    <div class="card">
+      <div class="title">MPU Sample</div>
+      <div class="value" id="mpuNow">—</div>
+      <small id="mpuIdx"></small>
+      <div id="mpuLog" class="log"></div>
+    </div>
+  </div>
+  <script>
+    // ---------- helpers ----------
+    const $  = (id)=>document.getElementById(id);
+    const num= (x,d=3)=>Number(x??0).toFixed(d);
+
+    const setLog=(id,line,max=8)=>{
+      const el=$(id); if(!el) return;
+      const row=document.createElement('div'); row.textContent=line; el.prepend(row);
+      while(el.childElementCount>max) el.removeChild(el.lastChild);
+    };
+    const stateOf=(r,a)=> (r===1&&a===0)?'fechado':(a===1&&r===0)?'aberto':(a===1&&r===1)?'erro':'indef';
+    const clsFor=(s)=> (s==='aberto'||s==='fechado')?'green':(s==='indef')?'yellow':(s==='erro')?'red':'gray';
+    async function jget(url){ const r=await fetch(url); if(!r.ok) throw new Error(`${r.status} ${r.statusText}`); return r.json(); }
+    function rms(values){
+      if(!values.length) return 0;
+      const mean = values.reduce((a,b)=>a+b,0)/values.length;
+      const mse  = values.reduce((a,b)=> a+(b-mean)*(b-mean), 0)/values.length;
+      return Math.sqrt(mse);
+    }
+    function sliceLastN(arr, endIdx, n){
+      if(!arr.length) return [];
+      const idx = ((endIdx % arr.length) + arr.length) % arr.length;
+      const s = Math.max(0, idx - n + 1);
+      return arr.slice(s, idx+1);
+    }
+
+    // ---------- estado do player (por índice) ----------
+    const Hist = {
+      // séries indexadas
+      r1:[], a1:[], r2:[], a2:[],   // booleans dos fins de curso
+      inicia:[], para:[],           // eventos para cycles
+      opcSel:[],                    // série do sinal escolhido
+      mpu:[],                       // amostras do MPU
+      i:0,                          // índice global que avança
+      minLen:0,                     // tamanho comum para r1/a1/r2/a2
+      timer:null
+    };
+
+    async function loadHistory(){
+      const base = $('apiBase').value.trim();
+      const limit = Math.max(100, Math.min(20000, Number($('limit').value||5000)));
+      const name  = $('opcName').value.trim() || 'Recuado_1S1';
+      const mId   = $('mpuId').value;
+
+      $('loadOut').textContent='loading...';
+
+      const names = ['Recuado_1S1','Avancado_1S2','Recuado_2S1','Avancado_2S2','INICIA','PARA', name];
+      const uniq  = [...new Set(names)];
+
+      const store = {};
+      await Promise.all(uniq.map(async s=>{
+        try{
+          const j = await jget(`${base}/opc/history?name=${encodeURIComponent(s)}&limit=${limit}&asc=true`);
+          store[s] = (j.items||[]);
+        }catch(e){ store[s]=[]; }
+      }));
+      try{
+        const jm = await jget(`${base}/mpu/history?id=${encodeURIComponent(mId)}&limit=${limit}&asc=true`);
+        Hist.mpu = jm.items||[];
+      }catch(e){ Hist.mpu=[]; }
+
+      Hist.r1 = store['Recuado_1S1']||[];
+      Hist.a1 = store['Avancado_1S2']||[];
+      Hist.r2 = store['Recuado_2S1']||[];
+      Hist.a2 = store['Avancado_2S2']||[];
+      Hist.inicia = store['INICIA']||[];
+      Hist.para   = store['PARA']  ||[];
+      Hist.opcSel = store[name] || [];
+
+      Hist.minLen = Math.min(Hist.r1.length, Hist.a1.length, Hist.r2.length, Hist.a2.length);
+      Hist.i = 0;
+
+      $('loadOut').textContent = `ok (minLen=${Hist.minLen}, mpu=${Hist.mpu.length}, opcSel=${Hist.opcSel.length})`;
+    }
+
+    function renderFrame(){
+      if (Hist.minLen<=0){ 
+        $('stateNow').textContent='—'; $('stateIdx').textContent='sem dados';
+        return; 
+      }
+      const i = Hist.i % Hist.minLen;
+
+      // --- Actuators by index
+      const r1 = Number(!!Hist.r1[i]?.value_bool);
+      const a1 = Number(!!Hist.a1[i]?.value_bool);
+      const r2 = Number(!!Hist.r2[i]?.value_bool);
+      const a2 = Number(!!Hist.a2[i]?.value_bool);
+      const s1 = stateOf(r1,a1);
+      const s2 = stateOf(r2,a2);
+      $('stateNow').innerHTML =
+        `<span class="pill ${clsFor(s1)}">A1:${s1}</span> `+
+        `<span class="pill ${clsFor(s2)}">A2:${s2}</span>`;
+      $('stateIdx').textContent = `idx=${i}`;
+      setLog('stateLog',`[idx=${i}] A1 r=${r1} a=${a1} | A2 r=${r2} a=${a2}`);
+
+      // --- OPC selected (mesmo índice; se faltar, usa r1)
+      if (Hist.opcSel.length){
+        const o = Hist.opcSel[i % Hist.opcSel.length];
+        $('opcNow').textContent = String(Number(!!o.value_bool));
+        $('opcIdx').textContent = `idx=${i}`;
+        setLog('opcLog',`[idx=${i}] sel=${Number(!!o.value_bool)}`);
+      } else {
+        $('opcNow').textContent='—'; $('opcIdx').textContent='(sem série)';
+      }
+
+      // --- MPU sample (mesmo índice, se houver)
+      if (Hist.mpu.length){
+        const m = Hist.mpu[i % Hist.mpu.length];
+        $('mpuNow').textContent = `ax=${num(m.ax_g,2)} ay=${num(m.ay_g,2)} az=${num(m.az_g,2)}`;
+        $('mpuIdx').textContent = `idx=${i}`;
+        setLog('mpuLog',`[idx=${i}] ax=${num(m.ax_g,2)} ay=${num(m.ay_g,2)}`);
+        // RMS por AMOSTRAS (não por tempo)
+        const n = Math.max(1, Math.min(2000, Number($('nVib').value||50)));
+        const tail = sliceLastN(Hist.mpu, i, n);
+        const rx = rms(tail.map(s=>Number(s.ax_g)));
+        const ry = rms(tail.map(s=>Number(s.ay_g)));
+        const rz = rms(tail.map(s=>Number(s.az_g)));
+        const overall = Math.sqrt(rx*rx + ry*ry + rz*rz);
+        $('vibNow').textContent = `overall≈${num(overall,3)} g`;
+        $('vibIdx').textContent = `N=${tail.length}`;
+        setLog('vibLog',`[idx=${i}] overall≈${num(overall,3)} (N=${tail.length})`);
+      } else {
+        $('mpuNow').textContent='—'; $('mpuIdx').textContent='(sem série)';
+        $('vibNow').textContent='—'; $('vibIdx').textContent='';
+      }
+
+      // --- Cycles por AMOSTRAS (conta INICIA/PARA na cauda de N amostras)
+      const nC = Math.max(2, Math.min(5000, Number($('nCyc').value||100)));
+      const tailI = sliceLastN(Hist.inicia, i % Math.max(1,Hist.inicia.length), Math.min(nC, Math.max(1,Hist.inicia.length)));
+      const tailP = sliceLastN(Hist.para,   i % Math.max(1,Hist.para.length),   Math.min(nC, Math.max(1,Hist.para.length)));
+      const pairs  = Math.min(tailI.length, tailP.length);
+      const cycles = Math.floor(pairs/2);
+      $('valCycles').textContent = `${cycles} cycles (pairs=${pairs*2})`;
+      $('rawCycles').textContent = `janela N≈${Math.max(tailI.length,tailP.length)}`;
+      setLog('cyclesLog',`[idx=${i}] cycles=${cycles}`);
+
+      // avança
+      Hist.i++;
+    }
+    // ---------- controle ----------
+    async function startPlay(){
+      if(Hist.timer) return;
+      if(!Hist.minLen) await loadHistory();
+      renderFrame();
+      Hist.timer = setInterval(renderFrame, 2000);
+    }
+    function stopPlay(){ if(Hist.timer) clearInterval(Hist.timer); Hist.timer=null; }
+
+    // eventos
+    $('btnReload').onclick = async ()=>{
+      stopPlay();
+      await loadHistory();
+      if ($('play2s').checked) startPlay();
+    };
+    $('play2s').onchange = ()=> $('play2s').checked ? startPlay() : stopPlay();
+
+    // quando mudar filtros, recarrega série
+    ['opcName','mpuId','limit','nVib','nCyc'].forEach(id=>{
+      $(id).addEventListener('change', async ()=>{
+        stopPlay();
+        await loadHistory();
+        if ($('play2s').checked) startPlay();
+      });
+    });
+
+    // primeira carga (sem autoplay)
+    loadHistory().catch(()=>{ $('loadOut').textContent='erro ao carregar'; });
+    window.addEventListener('beforeunload', stopPlay);
+  </script>
+</body>
+</html>
