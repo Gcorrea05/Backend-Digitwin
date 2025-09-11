@@ -1,16 +1,15 @@
 # api/database.py
 import os
-from typing import Optional
+from typing import Optional, Iterable, Any, Tuple
 from dotenv import load_dotenv, find_dotenv
 from mysql.connector.pooling import MySQLConnectionPool
 import mysql.connector
 
 # Carrega .env do projeto (raiz ou api/.env)
 env_file = find_dotenv(usecwd=True) or os.path.join(os.path.dirname(__file__), ".env")
-load_dotenv(env_file, override=True)  # <<--- permite sobrescrever
+load_dotenv(env_file, override=True)
 
 def _env(name: str, default: Optional[str] = None) -> Optional[str]:
-    """Lê DB_*; se não existir, tenta MYSQL_*; senão usa default."""
     v = os.getenv(name)
     if v is None and name.startswith("DB_"):
         v = os.getenv("MYSQL_" + name[3:])
@@ -22,7 +21,6 @@ DB_NAME = _env("DB_NAME", "gmdigital")
 DB_USER = _env("DB_USER", "root")
 DB_PASS = _env("DB_PASS", "")
 
-# Log leve (remova depois)
 print(f"[DB] usando host={DB_HOST} port={DB_PORT} user={DB_USER} db={DB_NAME}")
 
 POOL = MySQLConnectionPool(
@@ -33,18 +31,30 @@ POOL = MySQLConnectionPool(
     database=DB_NAME,
     user=DB_USER,
     password=DB_PASS,
-    autocommit=False,
+    autocommit=False,  # <- manter false; commitamos via helpers
 )
 
 class DB:
     def __init__(self):
         self.conn = POOL.get_connection()
-        self.cur = self.conn.cursor(dictionary=True)  # retorna dicts
+        # dicionário=True => rows como dict; padronize o resto do código pra usar chaves
+        self.cur = self.conn.cursor(dictionary=True)
 
-    def execute(self, query: str, params=None):
+    # Context manager
+    def __enter__(self):
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if exc:
+                self.conn.rollback()
+            self.cur.close()
+        finally:
+            self.conn.close()
+
+    def execute(self, query: str, params: Tuple[Any, ...] | None = None):
         self.cur.execute(query, params or ())
 
-    def executemany(self, query: str, seq_params):
+    def executemany(self, query: str, seq_params: Iterable[Tuple[Any, ...]]):
         self.cur.executemany(query, seq_params)
 
     def fetchone(self):
@@ -59,11 +69,29 @@ class DB:
     def rollback(self):
         self.conn.rollback()
 
-    def close(self):
-        try:
-            self.cur.close()
-        finally:
-            self.conn.close()
-
 def get_db() -> DB:
     return DB()
+
+# --------- Helpers de ALTO NÍVEL (recomendado usar no projeto) ---------
+
+def fetch_one(sql: str, params: Tuple[Any, ...] | None = None):
+    with get_db() as db:
+        db.execute(sql, params)
+        return db.fetchone()
+
+def fetch_all(sql: str, params: Tuple[Any, ...] | None = None):
+    with get_db() as db:
+        db.execute(sql, params)
+        return db.fetchall()
+
+def execute(sql: str, params: Tuple[Any, ...] | None = None, commit: bool = True):
+    with get_db() as db:
+        db.execute(sql, params)
+        if commit:
+            db.commit()
+
+def executemany(sql: str, seq_params: Iterable[Tuple[Any, ...]], commit: bool = True):
+    with get_db() as db:
+        db.executemany(sql, seq_params)
+        if commit:
+            db.commit()

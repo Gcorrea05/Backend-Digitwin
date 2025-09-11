@@ -1,2 +1,40 @@
+# --- Ambientes virtuais ---
+venv/
 .env
-.venv
+
+# --- Cache do Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# --- Logs e temporários ---
+*.log
+*.pid
+*.gz
+*.swp
+*.bak
+*.tmp
+
+# --- Arquivos de build / dependências ---
+*.egg-info/
+dist/
+build/
+
+# --- Banco de dados local (se usar sqlite) ---
+*.db
+*.sqlite3
+
+# --- Configurações de IDE ---
+.vscode/
+.idea/
+*.code-workspace
+
+# --- Docker / Compose ---
+*.pid
+*.sock
+
+# --- Sistema operacional ---
+.DS_Store
+Thumbs.db
+desktop.ini
