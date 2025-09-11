@@ -1,8 +1,8 @@
 # routes/alerts.py
 from fastapi import APIRouter, Query
 from typing import List, Optional
-from services.alerts import register_alert
-from database import get_db
+from ..services.alerts import register_alert
+from ..database import get_db
 
 router = APIRouter()
 

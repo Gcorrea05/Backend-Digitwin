@@ -1,7 +1,8 @@
 # services/alerts.py
 from datetime import datetime
 from typing import Dict, Any
-from database import get_db
+from ..database import get_db
+import json
 
 
 def build_alert_payload(actuator_id: int, alert_type: str, severity: str, message: str, extra: dict = {}) -> Dict[str, Any]:

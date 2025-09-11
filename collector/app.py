@@ -1,5 +1,5 @@
 # app.py — Coletor unificado (DUAL): OPC UA + MPU (ESP32 serial) simultâneos
-# Tabelas MySQL: festo_dt.opc_samples e festo_dt.mpu_samples
+# Tabelas MySQL: festo_dt.opc_samples, festo_dt.mpu_samples, festo_dt.mpu_windows_200ms
 # Modos: SIMULATE | OPCUA | SERIAL_MPU | DUAL
 import os
 import csv
@@ -8,8 +8,9 @@ import time
 import signal
 import sys
 import threading
+import math
 from datetime import datetime
-from typing import List, Dict, Any, Iterable, Optional
+from typing import List, Dict, Any, Iterable, Optional, Tuple
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -27,11 +28,15 @@ def _get_utc():
         return timezone.utc
 
 UTC = _get_utc()
+
 # =========================
 # Utils & Config
 # =========================
+def now_utc() -> datetime:
+    return datetime.now(UTC)
+
 def now_utc_iso() -> str:
-    return datetime.now(UTC).isoformat()
+    return now_utc().isoformat()
 
 def iso_to_mysql_dt6(iso_str: str) -> str:
     s = iso_str.replace("T", " ")
@@ -47,11 +52,23 @@ def iso_to_mysql_dt6(iso_str: str) -> str:
         s = f"{head}.{frac}"
     return s
 
+def dt_to_mysql_dt6(dt: datetime) -> str:
+    iso_str = dt.isoformat()
+    return iso_to_mysql_dt6(iso_str)
+
+def floor_dt_window(dt: datetime, window_ms: int) -> datetime:
+    """Alinha dt para o início da janela (ex.: 200ms)."""
+    # dt deve ser timezone-aware em UTC
+    epoch_us = int(dt.timestamp() * 1_000_000)
+    win_us = window_ms * 1000
+    start_us = (epoch_us // win_us) * win_us
+    return datetime.fromtimestamp(start_us / 1_000_000, UTC)
+
 DATA_MODE = os.getenv("DATA_MODE", "DUAL").upper()      # SIMULATE | OPCUA | SERIAL_MPU | DUAL
 SINK_MODE = os.getenv("SINK_MODE", "MYSQL").upper()     # MYSQL | CSV
 
 # OPC UA
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "1"))
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "0.2"))  # 200ms por default
 OPCUA_ENDPOINT = os.getenv("OPCUA_ENDPOINT", "opc.tcp://192.168.0.40:4840")
 OPCUA_USER = os.getenv("OPCUA_USER", "")
 OPCUA_PASS = os.getenv("OPCUA_PASS", "")
@@ -61,6 +78,33 @@ NODES_CSV = os.getenv("OPCUA_NODEIDS_CSV", "nodes.csv")
 SERIAL_PORT = os.getenv("SERIAL_PORT", "COM3")
 SERIAL_BAUD = int(os.getenv("SERIAL_BAUD", "115200"))
 SERIAL_TIMEOUT = float(os.getenv("SERIAL_TIMEOUT", "0.2"))
+
+# Janela MPU (agregação)
+MPU_AGG_ENABLE = os.getenv("MPU_AGG_ENABLE", "true").lower() in {"1", "true", "yes", "on"}
+MPU_WINDOW_MS = int(os.getenv("MPU_WINDOW_MS", "200"))
+
+# Thresholds (ex.: RMS máximos). Se vazio, não valida.
+AX_RMS_MAX = os.getenv("AX_RMS_MAX", "")
+AY_RMS_MAX = os.getenv("AY_RMS_MAX", "")
+AZ_RMS_MAX = os.getenv("AZ_RMS_MAX", "")
+GX_RMS_MAX = os.getenv("GX_RMS_MAX", "")
+GY_RMS_MAX = os.getenv("GY_RMS_MAX", "")
+GZ_RMS_MAX = os.getenv("GZ_RMS_MAX", "")
+TEMP_MAX   = os.getenv("TEMP_MAX", "")
+
+def _opt_float(s: str) -> Optional[float]:
+    try:
+        return float(s) if s != "" else None
+    except Exception:
+        return None
+
+AX_RMS_MAX_F = _opt_float(AX_RMS_MAX)
+AY_RMS_MAX_F = _opt_float(AY_RMS_MAX)
+AZ_RMS_MAX_F = _opt_float(AZ_RMS_MAX)
+GX_RMS_MAX_F = _opt_float(GX_RMS_MAX)
+GY_RMS_MAX_F = _opt_float(GY_RMS_MAX)
+GZ_RMS_MAX_F = _opt_float(GZ_RMS_MAX)
+TEMP_MAX_F   = _opt_float(TEMP_MAX)
 
 # CSV (apoio)
 CSV_OPC_PATH = os.getenv("CSV_OPC_PATH", "bank_opc.csv")
@@ -99,7 +143,6 @@ def load_nodes(csv_path: str) -> List[Dict[str, str]]:
     if not items:
         raise RuntimeError(f"Nenhum node carregado de {csv_path}")
     return items
-
 # =========================
 # Fontes de dados
 # =========================
@@ -223,56 +266,6 @@ class SerialMpuReader:
                 except Exception:
                     pass
         return rec
-
-
-def mpu_loop():
-    ser_reader = SerialMpuReader(SERIAL_PORT, SERIAL_BAUD, SERIAL_TIMEOUT)
-    sink = MySqlMpuSink() if SINK_MODE == "MYSQL" else CsvMpuSink(CSV_MPU_PATH)
-
-    try:
-        # tenta conectar/reconectar continuamente
-        while not STOP.is_set():
-            try:
-                ser_reader.connect()
-                break
-            except Exception as e:
-                print(f"[MPU] Falha ao abrir {SERIAL_PORT}: {e}. Tentando de novo em 2s...")
-                time.sleep(2.0)
-
-        # leitura contínua
-        while not STOP.is_set():
-            rec = ser_reader.read_one()
-            if rec is None:
-                time.sleep(0.002)  # evita loop a 100% CPU quando não há linha
-                continue
-
-            ts = now_utc_iso()
-            sample = {
-                "ts_utc": ts,
-                "mpu_id": rec["mpu_id"],
-                "ax_g": rec["ax_g"], "ay_g": rec["ay_g"], "az_g": rec["az_g"],
-                "gx_dps": rec.get("gx_dps"), "gy_dps": rec.get("gy_dps"),
-                "gz_dps": rec.get("gz_dps"), "temp_c": rec.get("temp_c")
-            }
-
-            try:
-                if isinstance(sink, MySqlMpuSink):
-                    sink.write_sample(ts, sample)
-                else:
-                    sink.write_sample(sample)
-            except Exception as e:
-                print(f"[MPU] Erro ao gravar amostra: {e}")
-
-            # LIVE: publica amostra do MPU no Redis
-            _publish_mpu_sample(sample)
-
-    finally:
-        try:
-            sink.close()
-        except Exception:
-            pass
-        ser_reader.disconnect()
-
 # =========================
 # Sinks (destinos)
 # =========================
@@ -390,6 +383,67 @@ class MySqlMpuSink(MySqlBase):
         cur.close()
         self.conn.commit()
 
+class MySqlMpuWinSink(MySqlBase):
+    """Tabela agregada por janelas de MPU (ex.: 200ms)."""
+    def __init__(self):
+        super().__init__()
+        cur = self.conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS mpu_windows_200ms (
+              id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+              ts_utc DATETIME(6) NOT NULL,
+              mpu_id TINYINT UNSIGNED NOT NULL,
+              n INT NOT NULL,
+
+              ax_mean DOUBLE, ay_mean DOUBLE, az_mean DOUBLE,
+              ax_rms  DOUBLE, ay_rms  DOUBLE, az_rms  DOUBLE,
+              ax_min  DOUBLE, ay_min  DOUBLE, az_min  DOUBLE,
+              ax_max  DOUBLE, ay_max  DOUBLE, az_max  DOUBLE,
+
+              gx_mean DOUBLE, gy_mean DOUBLE, gz_mean DOUBLE,
+              gx_rms  DOUBLE, gy_rms  DOUBLE, gz_rms  DOUBLE,
+              gx_min  DOUBLE, gy_min  DOUBLE, gz_min  DOUBLE,
+              gx_max  DOUBLE, gy_max  DOUBLE, gz_max  DOUBLE,
+
+              temp_mean DOUBLE,
+              INDEX idx_mpuw_ts (ts_utc),
+              INDEX idx_mpuw_mpu_ts (mpu_id, ts_utc)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """)
+        cur.close()
+        self.conn.commit()
+
+    def insert_window(self, ts_start: datetime, mpu_id: int, n: int,
+                      stats: Dict[str, Dict[str, Optional[float]]]):
+        cur = self.conn.cursor()
+        cur.execute("""
+            INSERT INTO mpu_windows_200ms
+            (ts_utc, mpu_id, n,
+             ax_mean, ay_mean, az_mean, ax_rms, ay_rms, az_rms,
+             ax_min, ay_min, az_min, ax_max, ay_max, az_max,
+             gx_mean, gy_mean, gz_mean, gx_rms, gy_rms, gz_rms,
+             gx_min, gy_min, gz_min, gx_max, gy_max, gz_max,
+             temp_mean)
+            VALUES (%s,%s,%s,
+                    %s,%s,%s,%s,%s,%s,
+                    %s,%s,%s,%s,%s,%s,
+                    %s,%s,%s,%s,%s,%s,
+                    %s,%s,%s,%s,%s,%s,
+                    %s)
+        """, (
+            dt_to_mysql_dt6(ts_start), int(mpu_id), int(n),
+            stats["ax"]["mean"], stats["ay"]["mean"], stats["az"]["mean"],
+            stats["ax"]["rms"],  stats["ay"]["rms"],  stats["az"]["rms"],
+            stats["ax"]["min"],  stats["ay"]["min"],  stats["az"]["min"],
+            stats["ax"]["max"],  stats["ay"]["max"],  stats["az"]["max"],
+            stats["gx"]["mean"], stats["gy"]["mean"], stats["gz"]["mean"],
+            stats["gx"]["rms"],  stats["gy"]["rms"],  stats["gz"]["rms"],
+            stats["gx"]["min"],  stats["gy"]["min"],  stats["gz"]["min"],
+            stats["gx"]["max"],  stats["gy"]["max"],  stats["gz"]["max"],
+            stats["temp"]["mean"]
+        ))
+        cur.close()
+        self.conn.commit()
 # =========================
 # Loops (threads) e controle
 # =========================
@@ -404,9 +458,6 @@ def _publish_opc_events(ts_iso: str, values: Dict[str, Any]):
     if not _rcli:
         return
     for name, v in values.items():
-        # se quiser ignorar INICIA no live principal, descomente:
-        # if name == "INICIA":
-        #     continue
         evt = {
             "type": "opc_event",
             "ts_utc": ts_iso,
@@ -436,6 +487,111 @@ def _publish_mpu_sample(sample: Dict[str, Any]):
     except Exception:
         pass
 
+def _publish_mpu_alert(ts_start: datetime, mpu_id: int, kind: str, value: float, limit: float):
+    if not _rcli:
+        return
+    try:
+        msg = {
+            "type": "mpu_alert",
+            "ts_utc": ts_start.isoformat(),
+            "mpu_id": int(mpu_id),
+            "metric": kind,
+            "value": float(value),
+            "limit": float(limit)
+        }
+        _rcli.publish("alerts", json.dumps(msg))
+    except Exception:
+        pass
+
+# ---------- Agregador de janelas 200ms ----------
+class _Agg:
+    __slots__ = ("n",
+                 "sum_ax", "sum_ay", "sum_az", "sum_ax2", "sum_ay2", "sum_az2",
+                 "min_ax", "min_ay", "min_az", "max_ax", "max_ay", "max_az",
+                 "sum_gx", "sum_gy", "sum_gz", "sum_gx2", "sum_gy2", "sum_gz2",
+                 "min_gx", "min_gy", "min_gz", "max_gx", "max_gy", "max_gz",
+                 "sum_temp")
+
+    def __init__(self):
+        self.n = 0
+        self.sum_ax = self.sum_ay = self.sum_az = 0.0
+        self.sum_ax2 = self.sum_ay2 = self.sum_az2 = 0.0
+        self.min_ax = self.min_ay = self.min_az = float("inf")
+        self.max_ax = self.max_ay = self.max_az = float("-inf")
+
+        self.sum_gx = self.sum_gy = self.sum_gz = 0.0
+        self.sum_gx2 = self.sum_gy2 = self.sum_gz2 = 0.0
+        self.min_gx = self.min_gy = self.min_gz = float("inf")
+        self.max_gx = self.max_gy = self.max_gz = float("-inf")
+
+        self.sum_temp = 0.0
+
+    def add(self, ax, ay, az, gx=None, gy=None, gz=None, temp=None):
+        self.n += 1
+        self.sum_ax += ax; self.sum_ay += ay; self.sum_az += az
+        self.sum_ax2 += ax*ax; self.sum_ay2 += ay*ay; self.sum_az2 += az*az
+        self.min_ax = min(self.min_ax, ax); self.min_ay = min(self.min_ay, ay); self.min_az = min(self.min_az, az)
+        self.max_ax = max(self.max_ax, ax); self.max_ay = max(self.max_ay, ay); self.max_az = max(self.max_az, az)
+
+        if gx is not None:
+            self.sum_gx += gx; self.sum_gx2 += gx*gx
+            self.min_gx = min(self.min_gx, gx); self.max_gx = max(self.max_gx, gx)
+        if gy is not None:
+            self.sum_gy += gy; self.sum_gy2 += gy*gy
+            self.min_gy = min(self.min_gy, gy); self.max_gy = max(self.max_gy, gy)
+        if gz is not None:
+            self.sum_gz += gz; self.sum_gz2 += gz*gz
+            self.min_gz = min(self.min_gz, gz); self.max_gz = max(self.max_gz, gz)
+
+        if temp is not None:
+            self.sum_temp += temp
+
+    def stats(self) -> Dict[str, Dict[str, Optional[float]]]:
+        if self.n <= 0:
+            return {k: {m: None for m in ("mean","rms","min","max")} for k in ("ax","ay","az","gx","gy","gz","temp")}
+        n = float(self.n)
+        def mean_sum(s): return s / n
+        def rms_sum(ss): return math.sqrt(ss / n)
+
+        ax_mean = mean_sum(self.sum_ax); ay_mean = mean_sum(self.sum_ay); az_mean = mean_sum(self.sum_az)
+        ax_rms  = rms_sum(self.sum_ax2); ay_rms  = rms_sum(self.sum_ay2); az_rms  = rms_sum(self.sum_az2)
+
+        gx_mean = mean_sum(self.sum_gx) if self.sum_gx or self.n else None
+        gy_mean = mean_sum(self.sum_gy) if self.sum_gy or self.n else None
+        gz_mean = mean_sum(self.sum_gz) if self.sum_gz or self.n else None
+        gx_rms  = rms_sum(self.sum_gx2) if self.sum_gx2 or self.n else None
+        gy_rms  = rms_sum(self.sum_gy2) if self.sum_gy2 or self.n else None
+        gz_rms  = rms_sum(self.sum_gz2) if self.sum_gz2 or self.n else None
+
+        temp_mean = (self.sum_temp / n) if self.sum_temp else None
+
+        return {
+            "ax": {"mean": ax_mean, "rms": ax_rms, "min": self.min_ax, "max": self.max_ax},
+            "ay": {"mean": ay_mean, "rms": ay_rms, "min": self.min_ay, "max": self.max_ay},
+            "az": {"mean": az_mean, "rms": az_rms, "min": self.min_az, "max": self.max_az},
+            "gx": {"mean": gx_mean, "rms": gx_rms, "min": (None if self.min_gx==float('inf') else self.min_gx), "max": (None if self.max_gx==float('-inf') else self.max_gx)},
+            "gy": {"mean": gy_mean, "rms": gy_rms, "min": (None if self.min_gy==float('inf') else self.min_gy), "max": (None if self.max_gy==float('-inf') else self.max_gy)},
+            "gz": {"mean": gz_mean, "rms": gz_rms, "min": (None if self.min_gz==float('inf') else self.min_gz), "max": (None if self.max_gz==float('-inf') else self.max_gz)},
+            "temp": {"mean": temp_mean, "rms": None, "min": None, "max": None},
+        }
+
+def _check_thresholds_and_alert(ts_start: datetime, mpu_id: int, stats: Dict[str, Dict[str, Optional[float]]]):
+    # Checa RMS contra limites (se definidos) e publica alerta
+    checks: List[Tuple[str, Optional[float], Optional[float]]] = [
+        ("ax_rms", stats["ax"]["rms"], AX_RMS_MAX_F),
+        ("ay_rms", stats["ay"]["rms"], AY_RMS_MAX_F),
+        ("az_rms", stats["az"]["rms"], AZ_RMS_MAX_F),
+        ("gx_rms", stats["gx"]["rms"], GX_RMS_MAX_F),
+        ("gy_rms", stats["gy"]["rms"], GY_RMS_MAX_F),
+        ("gz_rms", stats["gz"]["rms"], GZ_RMS_MAX_F),
+    ]
+    for name, val, lim in checks:
+        if val is not None and lim is not None and val > lim:
+            _publish_mpu_alert(ts_start, mpu_id, name, val, lim)
+    if TEMP_MAX_F is not None:
+        tmean = stats["temp"]["mean"]
+        if tmean is not None and tmean > TEMP_MAX_F:
+            _publish_mpu_alert(ts_start, mpu_id, "temp_mean", tmean, TEMP_MAX_F)
 def opc_loop():
     items = load_nodes(NODES_CSV)
     names = [i["name"] for i in items]
@@ -457,7 +613,7 @@ def opc_loop():
                     reader.connect()
                     connected = True
                 except Exception:
-                    time.sleep(2.0)
+                    time.sleep(0.5)
                     continue
 
             # lê e grava
@@ -470,7 +626,7 @@ def opc_loop():
                     except Exception:
                         pass
                     connected = False
-                time.sleep(1.0)
+                time.sleep(0.5)
                 continue
 
             ts = now_utc_iso()
@@ -493,7 +649,25 @@ def opc_loop():
 
 def mpu_loop():
     ser_reader = SerialMpuReader(SERIAL_PORT, SERIAL_BAUD, SERIAL_TIMEOUT)
-    sink = MySqlMpuSink() if SINK_MODE == "MYSQL" else CsvMpuSink(CSV_MPU_PATH)
+    raw_sink = MySqlMpuSink() if SINK_MODE == "MYSQL" else CsvMpuSink(CSV_MPU_PATH)
+    win_sink = MySqlMpuWinSink() if (SINK_MODE == "MYSQL" and MPU_AGG_ENABLE) else None
+
+    # buffers por mpu_id
+    buffers: Dict[int, Dict[str, Any]] = {
+        1: {"bucket": None, "agg": _Agg()},
+        2: {"bucket": None, "agg": _Agg()},
+    }
+
+    def flush_bucket(mpu_id: int, bucket_start: datetime, agg: _Agg):
+        if not MPU_AGG_ENABLE or agg.n <= 0:
+            return
+        stats = agg.stats()
+        if win_sink:
+            try:
+                win_sink.insert_window(bucket_start, mpu_id, agg.n, stats)
+            except Exception as e:
+                print(f"[MPU] Erro ao gravar janela: {e}")
+        _check_thresholds_and_alert(bucket_start, mpu_id, stats)
 
     try:
         # tenta conectar/reconectar continuamente
@@ -501,34 +675,80 @@ def mpu_loop():
             try:
                 ser_reader.connect()
                 break
-            except Exception:
+            except Exception as e:
+                print(f"[MPU] Falha ao abrir {SERIAL_PORT}: {e}. Tentando de novo em 2s...")
                 time.sleep(2.0)
 
         # leitura contínua
         while not STOP.is_set():
             rec = ser_reader.read_one()
             if rec is None:
+                time.sleep(0.002)
                 continue
-            ts = now_utc_iso()
+
+            ts = now_utc()                # dt
+            ts_iso = ts.isoformat()       # iso para raw
             sample = {
-                "ts_utc": ts,
+                "ts_utc": ts_iso,
                 "mpu_id": rec["mpu_id"],
                 "ax_g": rec["ax_g"], "ay_g": rec["ay_g"], "az_g": rec["az_g"],
                 "gx_dps": rec.get("gx_dps"), "gy_dps": rec.get("gy_dps"),
                 "gz_dps": rec.get("gz_dps"), "temp_c": rec.get("temp_c")
             }
-            if isinstance(sink, MySqlMpuSink):
-                sink.write_sample(ts, sample)
-            else:
-                sink.write_sample(sample)
+
+            # RAW -> grava
+            try:
+                if isinstance(raw_sink, MySqlMpuSink):
+                    raw_sink.write_sample(ts_iso, sample)
+                else:
+                    raw_sink.write_sample(sample)
+            except Exception as e:
+                print(f"[MPU] Erro ao gravar amostra: {e}")
 
             # LIVE: publica amostra do MPU no Redis
             _publish_mpu_sample(sample)
+
+            # AGG -> janela 200ms (ou valor de MPU_WINDOW_MS)
+            mpu_id = int(rec["mpu_id"])
+            bucket_start = floor_dt_window(ts, MPU_WINDOW_MS)
+            buf = buffers[mpu_id]
+            if buf["bucket"] is None:
+                buf["bucket"] = bucket_start
+
+            # se mudou de janela, fecha a anterior
+            if bucket_start != buf["bucket"]:
+                try:
+                    flush_bucket(mpu_id, buf["bucket"], buf["agg"])
+                finally:
+                    buf["bucket"] = bucket_start
+                    buf["agg"] = _Agg()
+
+            # acumula na janela atual
+            buf["agg"].add(
+                rec["ax_g"], rec["ay_g"], rec["az_g"],
+                rec.get("gx_dps"), rec.get("gy_dps"), rec.get("gz_dps"),
+                rec.get("temp_c")
+            )
+
     finally:
+        # flush final de qualquer janela aberta
+        for mpu_id in (1, 2):
+            b = buffers[mpu_id]
+            if b["bucket"] is not None and isinstance(b["agg"], _Agg):
+                try:
+                    flush_bucket(mpu_id, b["bucket"], b["agg"])
+                except Exception:
+                    pass
         try:
-            sink.close()
+            if hasattr(raw_sink, "close"):
+                raw_sink.close()
         except Exception:
             pass
+        if win_sink:
+            try:
+                win_sink.close()
+            except Exception:
+                pass
         ser_reader.disconnect()
 
 def run_dual():
