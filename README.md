@@ -28,6 +28,9 @@ Porta Serial para o ESP32 (apenas se usar SERIAL_MPU ou DUAL com ESP conectado)
 
 Instale as dependências:
 
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process
+.\.venv\Scripts\Activate.ps1
+ou
 python -m venv .venv
 # Windows
 . .venv\Scripts\activate

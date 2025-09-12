@@ -11,6 +11,7 @@ from dotenv import load_dotenv, find_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import redis.asyncio as redis
+import anyio  # para chamar redis.ping() de rota síncrona com segurança
 
 # Carrega .env da raiz (se existir) e também api/.env
 load_dotenv(find_dotenv())
@@ -19,6 +20,9 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 # ------------ Config vindas do .env ------------
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",")]
 REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
+
+# Intervalo de ping em WS (segundos)
+WS_PING_INTERVAL = int(os.getenv("WS_PING_INTERVAL", "15"))
 
 # Redis client (decodificação já em str)
 rcli: redis.Redis = redis.from_url(
@@ -38,11 +42,48 @@ from .database import get_db
 
 
 # ------------ Helpers gerais ------------
-def dt_to_iso_utc(dt: datetime) -> str:
+def _coerce_to_datetime(value: Any) -> Optional[datetime]:
+    """Aceita datetime | str | int/float (epoch) e devolve datetime tz-aware em UTC."""
+    if value is None:
+        return None
+
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, (int, float)):
+        dt = datetime.fromtimestamp(value, tz=timezone.utc)
+    elif isinstance(value, str):
+        s = value.strip()
+        # Tenta ISO (aceita Z)
+        try:
+            s2 = s.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(s2)
+        except Exception:
+            # Tenta formatos MySQL comuns
+            dt = None
+            for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+                try:
+                    dt = datetime.strptime(s, fmt)
+                    break
+                except Exception:
+                    continue
+            if dt is None:
+                return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        return None
+
+    return dt.astimezone(timezone.utc)
+
+
+def dt_to_iso_utc(value: Any) -> Optional[str]:
+    """
+    Converte datetime/str/epoch para ISO-8601 UTC: 'YYYY-MM-DDTHH:MM:SS(.ffffff)Z'.
+    Retorna None se não conseguir converter.
+    """
+    dt = _coerce_to_datetime(value)
     if dt is None:
         return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
     return dt.isoformat().replace("+00:00", "Z")
 
 
@@ -64,6 +105,34 @@ def fetch_all(q: str, params: Tuple[Any, ...] = ()):
         db.close()
 
 
+def first_col(row: Any) -> Any:
+    """Retorna a primeira coluna, independente de tupla/dict."""
+    if row is None:
+        return None
+    if isinstance(row, (list, tuple)):
+        return row[0]
+    if isinstance(row, dict):
+        # pega o primeiro valor do dict
+        for _, v in row.items():
+            return v
+    return row
+
+def col(row: Any, key_or_index: Any) -> Any:
+    """Acessa linha retornada como dict/tupla de forma uniforme."""
+    if row is None:
+        return None
+    if isinstance(row, dict):
+        return row.get(key_or_index)
+    if isinstance(key_or_index, int):
+        return row[key_or_index]
+    return None  # chave em tupla não existe
+
+
+def cols(row: Any, *keys_or_idx: Any) -> Tuple[Any, ...]:
+    """Extrai múltiplas colunas de um row dict/tupla."""
+    return tuple(col(row, k) for k in keys_or_idx)
+
+
 def mpu_id_from_str(s: str) -> int:
     s = (s or "").strip().upper()
     if s == "MPUA1":
@@ -74,7 +143,7 @@ def mpu_id_from_str(s: str) -> int:
 
 
 # ------------ FastAPI / CORS ------------
-app = FastAPI(title="Festo DT API+WS (live)", version="1.3.0")
+app = FastAPI(title="Festo DT API+WS (live)", version="1.3.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"] if ALLOWED_ORIGINS == ["*"] else ALLOWED_ORIGINS,
@@ -83,13 +152,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 # ------------ Registries p/ WS OPC/MPU ------------
 subs_opc: Dict[str, set] = {}   # name -> set(WebSocket)
 subs_mpu: Dict[str, set] = {}   # id   -> set(WebSocket)
 clients_all_opc: set = set()    # ouvintes de todos OPC
 clients_all_mpu: set = set()    # ouvintes de todos MPU
-
 
 # ------------ Redis listeners (low-level streams) ------------
 async def _pubsub_listen(channel: str) -> AsyncIterator[Dict[str, Any]]:
@@ -157,32 +224,50 @@ async def _startup():
     # listeners background p/ streams low-level (OPC/MPU)
     asyncio.create_task(listen_opc())
     asyncio.create_task(listen_mpu())
+
+
 # ------------ HTTP básicos ------------
 @app.get("/health")
 def health():
-    # DB ping
-    row = fetch_one("SELECT NOW(6)")
-    # Redis ping
+    # Melhor dar um alias para evitar ambiguidade
+    row = fetch_one("SELECT NOW(6) AS now6")
+
+    # Redis ping (forma segura em rota síncrona)
     try:
-        ok_redis = asyncio.get_event_loop().run_until_complete(rcli.ping())
+        ok_redis = anyio.from_thread.run(rcli.ping)
     except Exception:
         ok_redis = False
+
+    # Usa o helper que lida com tupla/dict
+    db_time_val = first_col(row)  # se for dict -> primeiro valor; se tupla -> index 0
+
     return {
         "status": "ok",
-        "db_time": (str(row[0]) if row else None),
+        "db_time": (str(db_time_val) if db_time_val is not None else None),
         "redis": bool(ok_redis),
     }
+
 
 
 @app.get("/opc/latest")
 def opc_latest(name: str):
     row = fetch_one(
-        "SELECT ts_utc,name,value_bool FROM opc_samples WHERE name=%s ORDER BY ts_utc DESC LIMIT 1",
+        """
+        SELECT
+          ts_utc   AS ts_utc,
+          name     AS name,
+          value_bool AS value_bool
+        FROM opc_samples
+        WHERE name=%s
+        ORDER BY ts_utc DESC
+        LIMIT 1
+        """,
         (name,),
     )
     if not row:
         raise HTTPException(404, "sem dados")
-    ts, n, vb = row
+
+    ts, n, vb = cols(row, "ts_utc", "name", "value_bool")
     return {
         "ts_utc": dt_to_iso_utc(ts),
         "name": n,
@@ -195,39 +280,56 @@ def mpu_latest(id: str):
     mid = mpu_id_from_str(id)
     row = fetch_one(
         """
-        SELECT ts_utc, mpu_id, ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps
-        FROM mpu_samples WHERE mpu_id=%s ORDER BY ts_utc DESC LIMIT 1
+        SELECT
+          ts_utc AS ts_utc,
+          mpu_id AS mpu_id,
+          ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps
+        FROM mpu_samples
+        WHERE mpu_id=%s
+        ORDER BY ts_utc DESC
+        LIMIT 1
         """,
         (mid,),
     )
     if not row:
         raise HTTPException(404, "sem dados")
-    ts, mpu_id, ax, ay, az, gx, gy, gz = row
+
+    ts = col(row, "ts_utc")
+    mpu_id = col(row, "mpu_id") or col(row, 1)
+    ax, ay, az = col(row, "ax_g"), col(row, "ay_g"), col(row, "az_g")
+    gx, gy, gz = col(row, "gx_dps"), col(row, "gy_dps"), col(row, "gz_dps")
+
     return {
         "ts_utc": dt_to_iso_utc(ts),
-        "id": ("MPUA1" if mpu_id == 1 else "MPUA2"),
-        "ax_g": ax,
-        "ay_g": ay,
-        "az_g": az,
-        "gx_dps": gx,
-        "gy_dps": gy,
-        "gz_dps": gz,
+        "id": ("MPUA1" if int(mpu_id) == 1 else "MPUA2"),
+        "ax_g": ax, "ay_g": ay, "az_g": az,
+        "gx_dps": gx, "gy_dps": gy, "gz_dps": gz,
     }
 
 
 # ------------ WS low-level (OPC/MPU via Redis) ------------
 @app.websocket("/ws/opc")
-async def ws_opc(ws: WebSocket, name: Optional[str] = None, all: Optional[bool] = False):
+async def ws_opc(ws: WebSocket):
     await ws.accept()
+    qp = ws.query_params
+    name = qp.get("name")
+    all_flag = str(qp.get("all", "false")).lower() == "true"
 
-    # snapshot inicial por nome (se fornecido)
     if name:
         row = fetch_one(
-            "SELECT ts_utc,value_bool FROM opc_samples WHERE name=%s ORDER BY ts_utc DESC LIMIT 1",
+            """
+            SELECT
+              ts_utc AS ts_utc,
+              value_bool AS value_bool
+            FROM opc_samples
+            WHERE name=%s
+            ORDER BY ts_utc DESC
+            LIMIT 1
+            """,
             (name,),
         )
         if row:
-            ts, vb = row
+            ts, vb = cols(row, "ts_utc", "value_bool")
             await ws.send_json(
                 {
                     "type": "hello",
@@ -240,67 +342,81 @@ async def ws_opc(ws: WebSocket, name: Optional[str] = None, all: Optional[bool] 
                 }
             )
 
-    # registrar assinatura
     if name:
         subs_opc.setdefault(name, set()).add(ws)
-    elif all:
+    elif all_flag:
         clients_all_opc.add(ws)
 
     try:
         while True:
-            # envia ping a cada intervalo para manter conexão viva
             await ws.send_json({"type": "ping", "ts": datetime.utcnow().isoformat() + "Z"})
             await asyncio.sleep(WS_PING_INTERVAL)
-    except Exception:
-        # cliente fechou ou erro na conexão → encerra
+    except WebSocketDisconnect:
         pass
+    finally:
+        if name and ws in subs_opc.get(name, set()):
+            subs_opc[name].discard(ws)
+            if not subs_opc[name]:
+                subs_opc.pop(name, None)
+        clients_all_opc.discard(ws)
+
 
 @app.websocket("/ws/mpu")
-async def ws_mpu(ws: WebSocket, id: Optional[str] = None, all: Optional[bool] = False):
+async def ws_mpu(ws: WebSocket):
     await ws.accept()
+    qp = ws.query_params
+    id_str = qp.get("id")
+    all_flag = str(qp.get("all", "false")).lower() == "true"
 
-    # snapshot inicial por id (se fornecido)
-    if id:
-        mid = mpu_id_from_str(id)
+    if id_str:
+        mid = mpu_id_from_str(id_str)
         row = fetch_one(
             """
-            SELECT ts_utc, ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps
-            FROM mpu_samples WHERE mpu_id=%s ORDER BY ts_utc DESC LIMIT 1
+            SELECT
+              ts_utc AS ts_utc,
+              ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps
+            FROM mpu_samples
+            WHERE mpu_id=%s
+            ORDER BY ts_utc DESC
+            LIMIT 1
             """,
             (mid,),
         )
         if row:
-            ts, ax, ay, az, gx, gy, gz = row
+            ts = col(row, "ts_utc")
+            ax, ay, az = col(row, "ax_g"), col(row, "ay_g"), col(row, "az_g")
+            gx, gy, gz = col(row, "gx_dps"), col(row, "gy_dps"), col(row, "gz_dps")
             await ws.send_json(
                 {
                     "type": "hello",
                     "kind": "mpu",
-                    "id": id,
+                    "id": id_str,
                     "last": {
                         "ts_utc": dt_to_iso_utc(ts),
-                        "ax_g": ax,
-                        "ay_g": ay,
-                        "az_g": az,
-                        "gx_dps": gx,
-                        "gy_dps": gy,
-                        "gz_dps": gz,
-                        "temp_c": tc,
+                        "ax_g": ax, "ay_g": ay, "az_g": az,
+                        "gx_dps": gx, "gy_dps": gy, "gz_dps": gz,
                     },
                 }
             )
 
-    # registrar assinatura
-    if id:
-        subs_mpu.setdefault(id, set()).add(ws)
-    elif all:
+    if id_str:
+        subs_mpu.setdefault(id_str, set()).add(ws)
+    elif all_flag:
         clients_all_mpu.add(ws)
 
     try:
         while True:
             await ws.send_json({"type": "ping", "ts": datetime.utcnow().isoformat() + "Z"})
             await asyncio.sleep(WS_PING_INTERVAL)
-    except Exception:
+    except WebSocketDisconnect:
         pass
+    finally:
+        if id_str and ws in subs_mpu.get(id_str, set()):
+            subs_mpu[id_str].discard(ws)
+            if not subs_mpu[id_str]:
+                subs_mpu.pop(id_str, None)
+        clients_all_mpu.discard(ws)
+
 
 # ------------ Parse de time window ------------
 def _parse_since(s: Optional[str]) -> Optional[datetime]:
@@ -333,11 +449,11 @@ def _parse_since(s: Optional[str]) -> Optional[datetime]:
 
 
 # ------------ HTTP de histórico/listas ------------
+
 @app.get("/opc/names")
 def opc_names():
     rows = fetch_all("SELECT DISTINCT name FROM opc_samples ORDER BY name ASC")
     return {"names": [first_col(r) for r in rows]}
-
 
 @app.get("/opc/history")
 def opc_history(
@@ -348,7 +464,13 @@ def opc_history(
     asc: bool = Query(False, description="Ordena crescente se true"),
 ):
     dt = _parse_since(since)
-    sql = "SELECT ts_utc,value_bool FROM opc_samples WHERE name=%s"
+    sql = """
+        SELECT
+          ts_utc AS ts_utc,
+          value_bool AS value_bool
+        FROM opc_samples
+        WHERE name=%s
+    """
     params: Tuple[Any, ...] = (name,)
     if dt:
         sql += " AND ts_utc >= %s"
@@ -356,21 +478,31 @@ def opc_history(
     sql += f" ORDER BY ts_utc {'ASC' if asc else 'DESC'} LIMIT %s OFFSET %s"
     params += (limit, offset)
     rows = fetch_all(sql, params)
-    data = [
-        {"ts_utc": dt_to_iso_utc(r[0]), "value_bool": (None if r[1] is None else bool(r[1]))}
-        for r in rows
-    ]
-    return {"name": name, "count": len(data), "items": data}
-
+    items = []
+    for r in rows:
+        ts, vb = cols(r, "ts_utc", "value_bool")
+        items.append(
+            {
+                "ts_utc": dt_to_iso_utc(ts),
+                "value_bool": (None if vb is None else bool(vb)),
+            }
+        )
+    return {"name": name, "count": len(items), "items": items}
 
 @app.get("/mpu/ids")
 def mpu_ids():
-    rows = fetch_all("SELECT DISTINCT mpu_id FROM mpu_samples ORDER BY mpu_id ASC")
+    rows = fetch_all("SELECT DISTINCT mpu_id AS mid FROM mpu_samples ORDER BY mpu_id ASC")
 
     def id_to_str(i: int) -> str:
         return "MPUA1" if i == 1 else "MPUA2" if i == 2 else f"MPU{i}"
 
-    return {"ids": [id_to_str(r[0]) for r in rows]}
+    ids = []
+    for r in rows:
+        mid = col(r, "mid")
+        if mid is None:
+            mid = col(r, 0)
+        ids.append(id_to_str(int(mid)))
+    return {"ids": ids}
 
 
 @app.get("/mpu/history")
@@ -384,7 +516,9 @@ def mpu_history(
     mid = mpu_id_from_str(id)
     dt = _parse_since(since)
     sql = """
-        SELECT ts_utc, ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps
+        SELECT
+          ts_utc AS ts_utc,
+          ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps
         FROM mpu_samples
         WHERE mpu_id=%s
     """
@@ -395,18 +529,18 @@ def mpu_history(
     sql += f" ORDER BY ts_utc {'ASC' if asc else 'DESC'} LIMIT %s OFFSET %s"
     params += (limit, offset)
     rows = fetch_all(sql, params)
-    items = [
-        {
-            "ts_utc": dt_to_iso_utc(r[0]),
-            "ax_g": r[1],
-            "ay_g": r[2],
-            "az_g": r[3],
-            "gx_dps": r[4],
-            "gy_dps": r[5],
-            "gz_dps": r[6]
-        }
-        for r in rows
-    ]
+    items = []
+    for r in rows:
+        ts = col(r, "ts_utc")
+        ax, ay, az = col(r, "ax_g"), col(r, "ay_g"), col(r, "az_g")
+        gx, gy, gz = col(r, "gx_dps"), col(r, "gy_dps"), col(r, "gz_dps")
+        items.append(
+            {
+                "ts_utc": dt_to_iso_utc(ts),
+                "ax_g": ax, "ay_g": ay, "az_g": az,
+                "gx_dps": gx, "gy_dps": gy, "gz_dps": gz,
+            }
+        )
     return {"id": id, "count": len(items), "items": items}
 # =========================
 # LIVE DASHBOARD (HTTP)
@@ -432,7 +566,15 @@ def _decide_state(bit_recuado: Optional[int], bit_avancado: Optional[int]) -> st
 
 def _fetch_last_bool_row(name: str):
     return fetch_one(
-        "SELECT ts_utc, value_bool FROM opc_samples WHERE name=%s ORDER BY ts_utc DESC LIMIT 1",
+        """
+        SELECT
+          ts_utc AS ts_utc,
+          value_bool AS value_bool
+        FROM opc_samples
+        WHERE name=%s
+        ORDER BY ts_utc DESC
+        LIMIT 1
+        """,
         (name,),
     )
 
@@ -443,10 +585,10 @@ def live_actuators_state():
     for aid, m in _SENSORS.items():
         r = _fetch_last_bool_row(m["recuado"])
         a = _fetch_last_bool_row(m["avancado"])
-        ts_r = r[0] if r else None
-        ts_a = a[0] if a else None
-        vb_r = (None if not r or r[1] is None else int(r[1]))
-        vb_a = (None if not a or a[1] is None else int(a[1]))
+        ts_r = col(r, "ts_utc") if r else None
+        ts_a = col(a, "ts_utc") if a else None
+        vb_r = None if not r else (None if col(r, "value_bool") is None else int(col(r, "value_bool")))
+        vb_a = None if not a else (None if col(a, "value_bool") is None else int(col(a, "value_bool")))
         ts = max([t for t in (ts_r, ts_a) if t is not None], default=None)
         out.append(
             {
@@ -460,30 +602,13 @@ def live_actuators_state():
     return {"actuators": out}
 
 
-def _clean_rms(values: List[float], max_g: float = 4.0) -> float:
-    if not values:
-        return 0.0
-    a = np.array(values, dtype=float)
-    a = a[np.isfinite(a)]
-    if a.size == 0:
-        return 0.0
-    a = a[np.abs(a) <= max_g]
-    if a.size == 0:
-        return 0.0
-    a = a - np.median(a)
-    if a.size == 0:
-        return 0.0
-    return float((a**2).mean() ** 0.5)
-
-
 @app.get("/api/live/cycles/rate", tags=["Live Dashboard"])
 def live_cycles_rate(window_s: int = Query(5, ge=1, le=300)):
     now = datetime.now(timezone.utc)
     start = now - timedelta(seconds=window_s)
-    # conta INICIA/PARA e infere ciclos
     rows = fetch_all(
         """
-        SELECT name, COUNT(*)
+        SELECT name AS name, COUNT(*) AS cnt
         FROM opc_samples
         WHERE ts_utc >= %s
           AND name IN (%s, %s)
@@ -493,10 +618,11 @@ def live_cycles_rate(window_s: int = Query(5, ge=1, le=300)):
     )
     c_inicia = 0
     c_para = 0
-    for name, cnt in rows:
-        if name == _INICIA:
+    for r in rows:
+        nm, cnt = cols(r, "name", "cnt")
+        if nm == _INICIA:
             c_inicia = int(cnt)
-        elif name == _PARA:
+        elif nm == _PARA:
             c_para = int(cnt)
     pairs = min(c_inicia, c_para)
     cycles = pairs // 2
@@ -510,7 +636,10 @@ def live_vibration(window_s: int = Query(2, ge=1, le=60)):
     start = now - timedelta(seconds=window_s)
     rows = fetch_all(
         """
-        SELECT mpu_id, ts_utc, ax_g, ay_g, az_g
+        SELECT
+          mpu_id AS mpu_id,
+          ts_utc AS ts_utc,
+          ax_g, ay_g, az_g
         FROM mpu_samples
         WHERE ts_utc >= %s AND ts_utc < %s
         """,
@@ -519,8 +648,11 @@ def live_vibration(window_s: int = Query(2, ge=1, le=60)):
     if not rows:
         return {"items": []}
     by: Dict[int, Dict[str, List[Any]]] = {}
-    for mpu_id, ts, ax, ay, az in rows:
-        d = by.setdefault(int(mpu_id), {"ax": [], "ay": [], "az": [], "ts": []})
+    for r in rows:
+        mpu_id = int(col(r, "mpu_id") or col(r, 0))
+        ts = col(r, "ts_utc") or col(r, 1)
+        ax = col(r, "ax_g"); ay = col(r, "ay_g"); az = col(r, "az_g")
+        d = by.setdefault(mpu_id, {"ax": [], "ay": [], "az": [], "ts": []})
         d["ax"].append(0.0 if ax is None else float(ax))
         d["ay"].append(0.0 if ay is None else float(ay))
         d["az"].append(0.0 if az is None else float(az))
@@ -596,7 +728,7 @@ async def ws_cycles(ws: WebSocket):
 
 
 @app.websocket("/ws/vibration")
-async def ws_vibration(ws: WebSocket):
+async def ws_vibration_ws(ws: WebSocket):
     await ws.accept()
     try:
         while True:
@@ -609,6 +741,8 @@ async def ws_vibration(ws: WebSocket):
             await asyncio.sleep(2)
     except WebSocketDisconnect:
         pass
+
+
 @app.websocket("/api/ws/snapshot")
 async def ws_snapshot(ws: WebSocket):
     # aceita todas as origens; se precisar, valide ws.headers.get("origin")
