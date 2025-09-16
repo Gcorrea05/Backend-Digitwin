@@ -1,0 +1,13 @@
+version: "3.9"
+services:
+  telegram-bot:
+    build: .
+    container_name: bigkenji-telegram-bot
+    env_file:
+      - .env
+    restart: unless-stopped
+    # Se seu backend for outro serviço neste compose, ajuste BACKEND_BASE para o hostname do serviço
+    # environment:
+    #   - BACKEND_BASE=http://backend:8000
+    # depends_on:
+    #   - backend
