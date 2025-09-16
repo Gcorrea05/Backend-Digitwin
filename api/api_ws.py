@@ -34,7 +34,7 @@ rcli: redis.Redis = redis.from_url(
 )
 
 # ------------ Imports locais de serviços ------------
-from .routes import alerts
+from .routes import alerts,metrics
 from .services.analytics import get_kpis
 from .services.cycle import get_cycle_rate
 from .services.analytics_graphs import get_vibration_data
@@ -153,6 +153,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(metrics.router)  # <--- ADICIONAR AQUI
 
 # ------------ Registries p/ WS OPC/MPU ------------
 subs_opc: Dict[str, set] = {}   # name -> set(WebSocket)
