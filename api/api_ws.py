@@ -11,19 +11,15 @@ from dotenv import load_dotenv, find_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import redis.asyncio as redis
-import anyio  # para chamar redis.ping() de rota síncrona com segurança
+import anyio  # para chamar redis.ping() em rota síncrona com segurança
 
 # Carrega .env da raiz (se existir) e também api/.env
 load_dotenv(find_dotenv())
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
-WS_PING_INTERVAL = int(os.getenv("WS_PING_INTERVAL", "20"))  # default 15s se não definido
-rcli = redis.from_url(os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0"),
-                      decode_responses=True, health_check_interval=30)
+
 # ------------ Config vindas do .env ------------
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",")]
 REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
-
-# Intervalo de ping em WS (segundos)
 WS_PING_INTERVAL = int(os.getenv("WS_PING_INTERVAL", "15"))
 
 # Redis client (decodificação já em str)
@@ -33,8 +29,11 @@ rcli: redis.Redis = redis.from_url(
     health_check_interval=30,
 )
 
+# Flag global de disponibilidade do Redis
+HAS_REDIS = False
+
 # ------------ Imports locais de serviços ------------
-from .routes import alerts,metrics
+from .routes import alerts
 from .services.analytics import get_kpis
 from .services.cycle import get_cycle_rate
 from .services.analytics_graphs import get_vibration_data
@@ -55,12 +54,11 @@ def _coerce_to_datetime(value: Any) -> Optional[datetime]:
         dt = datetime.fromtimestamp(value, tz=timezone.utc)
     elif isinstance(value, str):
         s = value.strip()
-        # Tenta ISO (aceita Z)
+        # tenta ISO (aceita 'Z')
         try:
             s2 = s.replace("Z", "+00:00")
             dt = datetime.fromisoformat(s2)
         except Exception:
-            # Tenta formatos MySQL comuns
             dt = None
             for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
                 try:
@@ -79,10 +77,7 @@ def _coerce_to_datetime(value: Any) -> Optional[datetime]:
 
 
 def dt_to_iso_utc(value: Any) -> Optional[str]:
-    """
-    Converte datetime/str/epoch para ISO-8601 UTC: 'YYYY-MM-DDTHH:MM:SS(.ffffff)Z'.
-    Retorna None se não conseguir converter.
-    """
+    """Converte datetime/str/epoch para ISO-8601 UTC (sufixo 'Z')."""
     dt = _coerce_to_datetime(value)
     if dt is None:
         return None
@@ -114,10 +109,10 @@ def first_col(row: Any) -> Any:
     if isinstance(row, (list, tuple)):
         return row[0]
     if isinstance(row, dict):
-        # pega o primeiro valor do dict
         for _, v in row.items():
             return v
     return row
+
 
 def col(row: Any, key_or_index: Any) -> Any:
     """Acessa linha retornada como dict/tupla de forma uniforme."""
@@ -144,8 +139,22 @@ def mpu_id_from_str(s: str) -> int:
     raise HTTPException(status_code=400, detail="id deve ser MPUA1 ou MPUA2")
 
 
+def table_exists(schema: str, table: str) -> bool:
+    q = """
+    SELECT COUNT(*) AS c
+    FROM information_schema.tables
+    WHERE table_schema=%s AND table_name=%s
+    """
+    row = fetch_one(q, (schema, table))
+    v = first_col(row)
+    try:
+        return int(v) > 0
+    except Exception:
+        return False
+
+
 # ------------ FastAPI / CORS ------------
-app = FastAPI(title="Festo DT API+WS (live)", version="1.3.1")
+app = FastAPI(title="Festo DT API+WS (live)", version="1.5.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"] if ALLOWED_ORIGINS == ["*"] else ALLOWED_ORIGINS,
@@ -153,156 +162,109 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.include_router(metrics.router)  # <--- ADICIONAR AQUI
 
 # ------------ Registries p/ WS OPC/MPU ------------
 subs_opc: Dict[str, set] = {}   # name -> set(WebSocket)
 subs_mpu: Dict[str, set] = {}   # id   -> set(WebSocket)
 clients_all_opc: set = set()    # ouvintes de todos OPC
 clients_all_mpu: set = set()    # ouvintes de todos MPU
-
-# ------------ Redis listeners (low-level streams) ------------
+# ------------ Redis listeners (com backoff e tolerância) ------------
 async def _pubsub_listen(channel: str) -> AsyncIterator[Dict[str, Any]]:
-    pubsub = rcli.pubsub()
-    await pubsub.subscribe(channel)
-    try:
-        async for msg in pubsub.listen():
-            if msg.get("type") != "message":
-                continue
-            data = msg.get("data")
-            # já deve ser str por decode_responses=True; ainda assim garantimos
-            if isinstance(data, (bytes, bytearray)):
-                try:
-                    data = data.decode("utf-8")
-                except Exception:
-                    continue
-            try:
-                payload = json.loads(data)
-            except Exception:
-                payload = {"type": channel, "data": data}
-            yield payload
-    finally:
-        try:
-            await pubsub.unsubscribe(channel)
-        finally:
-            await pubsub.close()
-
-
-async def listen_opc():
-    async for ev in _pubsub_listen("opc_samples"):
-        try:
-            if ev.get("type") != "opc_event":
-                continue
-            ts = ev.get("ts_utc")
-            name = ev.get("name")
-            vb = ev.get("value_bool")
-
-            # 1) Persistir
-            execute(
-                "INSERT INTO opc_samples (ts_utc, name, value_bool) VALUES (%s,%s,%s)",
-                (coerce_dt(ts), name, _bool_to_int_or_none(vb)),
-                commit=True,                 # <-- MUITO IMPORTANTE
-            )
-
-            # 2) Broadcast (como você já fazia)
-            payload = {"type": "opc_event", **ev}
-            for ws in list(subs_opc.get(name, set())):
-                try: await ws.send_json(payload)
-                except Exception: pass
-            for ws in list(clients_all_opc):
-                try: await ws.send_json(payload)
-                except Exception: pass
-
-        except Exception as e:
-            # logue, se tiver logger
-            print("[OPC] erro:", e)
-
-async def _pubsub_listen(channel: str):
+    backoff = 1.0
     while True:
         try:
             pubsub = rcli.pubsub()
             await pubsub.subscribe(channel)
-            async for msg in pubsub.listen():
-                if msg and msg.get("type") == "message":
+            try:
+                async for msg in pubsub.listen():
+                    if msg.get("type") != "message":
+                        continue
+                    data = msg.get("data")
+                    if isinstance(data, (bytes, bytearray)):
+                        try:
+                            data = data.decode("utf-8")
+                        except Exception:
+                            continue
                     try:
-                        yield json.loads(msg["data"])
+                        payload = json.loads(data)
                     except Exception:
-                        # se vier um payload não-JSON, ignore
-                        pass
+                        payload = {"type": channel, "data": data}
+                    yield payload
+            finally:
+                try:
+                    await pubsub.unsubscribe(channel)
+                finally:
+                    await pubsub.close()
+            backoff = 1.0  # reset
         except Exception:
-            await asyncio.sleep(2)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2.0, 30.0)
+
+
+async def listen_opc():
+    if not HAS_REDIS:
+        return
+    async for ev in _pubsub_listen("opc_samples"):
+        name = ev.get("name")
+        payload = {"type": "opc_event", **ev}
+        for ws in list(subs_opc.get(name, set())):
+            try:
+                await ws.send_json(payload)
+            except Exception:
+                pass
+        for ws in list(clients_all_opc):
+            try:
+                await ws.send_json(payload)
+            except Exception:
+                pass
+
 
 async def listen_mpu():
+    if not HAS_REDIS:
+        return
     async for ev in _pubsub_listen("mpu_samples"):
-        try:
-            if ev.get("type") != "mpu_sample":
-                continue
-            ts = ev.get("ts_utc")
-            mid = mpu_id_from_str(ev.get("id"))   # "MPUA1"/"MPUA2" -> 1/2
-            ax, ay, az = ev.get("ax_g"), ev.get("ay_g"), ev.get("az_g")
-            gx, gy, gz = ev.get("gx_dps"), ev.get("gy_dps"), ev.get("gz_dps")
+        id_str = ev.get("id")  # "MPUA1"/"MPUA2"
+        payload = {"type": "mpu_sample", **ev}
+        for ws in list(subs_mpu.get(id_str, set())):
+            try:
+                await ws.send_json(payload)
+            except Exception:
+                pass
+        for ws in list(clients_all_mpu):
+            try:
+                await ws.send_json(payload)
+            except Exception:
+                pass
 
-            # 1) Persistir
-            execute(
-                """INSERT INTO mpu_samples
-                   (ts_utc, mpu_id, ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
-                (coerce_dt(ts), mid, ax, ay, az, gx, gy, gz),
-                commit=True,                 # <-- MUITO IMPORTANTE
-            )
-
-            # 2) Broadcast (se você tiver WS para MPU)
-            payload = {"type": "mpu_sample", **ev}
-            for ws in list(subs_mpu.get(ev.get("id"), set())):
-                try: await ws.send_json(payload)
-                except Exception: pass
-            for ws in list(clients_all_mpu):
-                try: await ws.send_json(payload)
-                except Exception: pass
-
-        except Exception as e:
-            print("[MPU] erro:", e)
-
-async def _supervise(coro_fn, name: str):
-    while True:
-        try:
-            print(f"[TASK] iniciando {name}...")
-            await coro_fn()
-        except asyncio.CancelledError:
-            print(f"[TASK] {name} cancelada")
-            raise
-        except Exception as e:
-            print(f"[TASK] {name} crashou:", e, "(reiniciando em 2s)")
-            await asyncio.sleep(2)
 
 @app.on_event("startup")
 async def _startup():
-    # listeners background p/ streams low-level (OPC/MPU)
-    asyncio.create_task(listen_opc())
-    asyncio.create_task(listen_mpu())
+    global HAS_REDIS
+    try:
+        HAS_REDIS = await rcli.ping()
+    except Exception:
+        HAS_REDIS = False
+
+    if HAS_REDIS:
+        asyncio.create_task(listen_opc())
+        asyncio.create_task(listen_mpu())
 
 
 # ------------ HTTP básicos ------------
 @app.get("/health")
 def health():
-    # Melhor dar um alias para evitar ambiguidade
     row = fetch_one("SELECT NOW(6) AS now6")
-
-    # Redis ping (forma segura em rota síncrona)
     try:
         ok_redis = anyio.from_thread.run(rcli.ping)
     except Exception:
         ok_redis = False
 
-    # Usa o helper que lida com tupla/dict
-    db_time_val = first_col(row)  # se for dict -> primeiro valor; se tupla -> index 0
-
+    db_time_val = first_col(row) if row is not None else None
     return {
         "status": "ok",
         "db_time": (str(db_time_val) if db_time_val is not None else None),
         "redis": bool(ok_redis),
     }
-
 
 
 @app.get("/opc/latest")
@@ -367,10 +329,12 @@ def mpu_latest(id: str):
 @app.websocket("/ws/opc")
 async def ws_opc(ws: WebSocket):
     await ws.accept()
+
     qp = ws.query_params
     name = qp.get("name")
     all_flag = str(qp.get("all", "false")).lower() == "true"
 
+    # snapshot inicial por nome
     if name:
         row = fetch_one(
             """
@@ -398,14 +362,12 @@ async def ws_opc(ws: WebSocket):
                 }
             )
 
+    # registrar assinatura
     if name:
         subs_opc.setdefault(name, set()).add(ws)
     elif all_flag:
         clients_all_opc.add(ws)
-        subscribed_all = True
-        print(f"[WS OPC] subscribed ALL total={len(clients_all_opc)}")
 
-    # --- keepalive/ping ---
     try:
         while True:
             await ws.send_json({"type": "ping", "ts": datetime.utcnow().isoformat() + "Z"})
@@ -423,6 +385,7 @@ async def ws_opc(ws: WebSocket):
 @app.websocket("/ws/mpu")
 async def ws_mpu(ws: WebSocket):
     await ws.accept()
+
     qp = ws.query_params
     id_str = qp.get("id")
     all_flag = str(qp.get("all", "false")).lower() == "true"
@@ -475,8 +438,6 @@ async def ws_mpu(ws: WebSocket):
             if not subs_mpu[id_str]:
                 subs_mpu.pop(id_str, None)
         clients_all_mpu.discard(ws)
-
-
 # ------------ Parse de time window ------------
 def _parse_since(s: Optional[str]) -> Optional[datetime]:
     if not s:
@@ -508,11 +469,11 @@ def _parse_since(s: Optional[str]) -> Optional[datetime]:
 
 
 # ------------ HTTP de histórico/listas ------------
-
 @app.get("/opc/names")
 def opc_names():
     rows = fetch_all("SELECT DISTINCT name FROM opc_samples ORDER BY name ASC")
     return {"names": [first_col(r) for r in rows]}
+
 
 @app.get("/opc/history")
 def opc_history(
@@ -548,6 +509,7 @@ def opc_history(
         )
     return {"name": name, "count": len(items), "items": items}
 
+
 @app.get("/mpu/ids")
 def mpu_ids():
     rows = fetch_all("SELECT DISTINCT mpu_id AS mid FROM mpu_samples ORDER BY mpu_id ASC")
@@ -567,7 +529,7 @@ def mpu_ids():
 @app.get("/mpu/history")
 def mpu_history(
     id: str = Query(..., description="MPUA1 ou MPUA2"),
-    since: Optional[str] = Query(None, description="ISO8601 ou relativo (-1h, -24h, -15m, -7d)"),
+    since: Optional[str] = Query(None, description="ISO8601 ou relativo (-1h, -24h)"),
     limit: int = Query(1000, ge=1, le=20000),
     offset: int = Query(0, ge=0),
     asc: bool = Query(False),
@@ -580,12 +542,13 @@ def mpu_history(
           ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps
         FROM mpu_samples
         WHERE mpu_id=%s
-        {"AND ts_utc >= %s" if dt else ""}
-        ORDER BY ts_utc {order_dir}
-        LIMIT %s OFFSET %s
     """
-
-    params: Tuple[Any, ...] = (mid,) + ((dt,) if dt else tuple()) + (limit, offset)
+    params: Tuple[Any, ...] = (mid,)
+    if dt:
+        sql += " AND ts_utc >= %s"
+        params = (mid, dt)
+    sql += f" ORDER BY ts_utc {'ASC' if asc else 'DESC'} LIMIT %s OFFSET %s"
+    params += (limit, offset)
     rows = fetch_all(sql, params)
     items = []
     for r in rows:
@@ -600,6 +563,11 @@ def mpu_history(
             }
         )
     return {"id": id, "count": len(items), "items": items}
+
+
+# =========================
+# LIVE DASHBOARD (HTTP)
+# =========================
 
 _SENSORS = {
     1: {"recuado": "Recuado_1S1", "avancado": "Avancado_1S2"},
@@ -632,13 +600,11 @@ def _fetch_last_bool_row(name: str):
         """,
         (name,),
     )
-
-
 @app.get("/api/live/actuators/state", tags=["Live Dashboard"])
 def live_actuators_state():
     out = []
     for aid, m in _SENSORS.items():
-        r = _fetch_last_bool_row(m["recuado"])   # esperado: ts_utc, value_bool
+        r = _fetch_last_bool_row(m["recuado"])
         a = _fetch_last_bool_row(m["avancado"])
         ts_r = col(r, "ts_utc") if r else None
         ts_a = col(a, "ts_utc") if a else None
@@ -655,6 +621,22 @@ def live_actuators_state():
             }
         )
     return {"actuators": out}
+
+
+def _clean_rms(values: List[float], max_g: float = 4.0) -> float:
+    if not values:
+        return 0.0
+    a = np.array(values, dtype=float)
+    a = a[np.isfinite(a)]
+    if a.size == 0:
+        return 0.0
+    a = a[np.abs(a) <= max_g]
+    if a.size == 0:
+        return 0.0
+    a = a - np.median(a)
+    if a.size == 0:
+        return 0.0
+    return float((a**2).mean() ** 0.5)
 
 
 @app.get("/api/live/cycles/rate", tags=["Live Dashboard"])
@@ -683,6 +665,88 @@ def live_cycles_rate(window_s: int = Query(5, ge=1, le=300)):
     cycles = pairs // 2
     cps = cycles / float(window_s)
     return {"window_seconds": window_s, "pairs_count": pairs, "cycles": cycles, "cycles_per_second": cps}
+
+
+# ---------- NOVOS: CPM por atuador (A1/A2) ----------
+def _last_bool_before(name: str, before: datetime):
+    """Último value_bool antes de 'before' para inicializar estado."""
+    row = fetch_one(
+        """
+        SELECT value_bool AS vb
+        FROM opc_samples
+        WHERE name=%s AND ts_utc < %s
+        ORDER BY ts_utc DESC
+        LIMIT 1
+        """,
+        (name, before),
+    )
+    if not row:
+        return None
+    vb = row.get("vb")
+    return (None if vb is None else int(vb))
+
+
+@app.get("/api/live/cycles/rate_by_actuator", tags=["Live Dashboard"])
+def live_cycles_rate_by_actuator(
+    actuator_id: int = Query(..., ge=1, le=2),
+    window_s: int = Query(60, ge=1, le=3600),
+):
+    """
+    CPM por atuador (A1/A2) medido por transições de estado:
+      'fechado' -> 'aberto' -> 'fechado' = 1 ciclo.
+    Usa os dois sinais booleanos do atuador (recuado/avancado).
+    """
+    names = _SENSORS.get(int(actuator_id))
+    if not names:
+        raise HTTPException(400, "actuator_id inválido (use 1 ou 2)")
+
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(seconds=window_s)
+
+    # Inicializa estado com o último valor ANTES da janela
+    vb_recuado = _last_bool_before(names["recuado"], start)
+    vb_avancado = _last_bool_before(names["avancado"], start)
+    state = _decide_state(vb_recuado, vb_avancado)
+
+    # Busca eventos da janela (ordenados)
+    rows = fetch_all(
+        """
+        SELECT ts_utc AS ts, name AS name, value_bool AS vb
+        FROM opc_samples
+        WHERE ts_utc >= %s AND ts_utc < %s
+          AND name IN (%s, %s)
+        ORDER BY ts_utc ASC
+        """,
+        (start, now, names["recuado"], names["avancado"]),
+    )
+
+    cycles = 0
+    in_open = (state == "aberto")
+    for r in rows:
+        nm, vb = cols(r, "name", "vb")
+        if vb is not None:
+            if nm == names["recuado"]:
+                vb_recuado = int(vb)
+            elif nm == names["avancado"]:
+                vb_avancado = int(vb)
+        new_state = _decide_state(vb_recuado, vb_avancado)
+
+        # conta ciclo quando fechamos após ter aberto
+        if state != new_state:
+            if new_state == "aberto":
+                in_open = True
+            elif new_state == "fechado" and in_open:
+                cycles += 1
+                in_open = False
+            state = new_state
+
+    cpm = cycles / (window_s / 60.0)
+    return {
+        "actuator_id": actuator_id,
+        "window_seconds": window_s,
+        "cycles": cycles,
+        "cpm": cpm,
+    }
 
 
 @app.get("/api/live/vibration", tags=["Live Dashboard"])
@@ -733,7 +797,84 @@ def live_vibration(window_s: int = Query(2, ge=1, le=60)):
 
 
 # =========================
-# WS de alto nível (polling em serviços reais, ritmo 2s)
+# ENDPOINTS NOVOS — Monitoring
+# =========================
+
+@app.get("/api/live/runtime", tags=["Live Dashboard"])
+def live_runtime():
+    """
+    Retorna tempo em execução (segundos) desde o último INICIA se ele for mais recente que o último PARA.
+    Caso contrário, runtime = 0.
+    """
+    row_i = fetch_one("SELECT MAX(ts_utc) AS ts FROM opc_samples WHERE name=%s", (_INICIA,))
+    row_p = fetch_one("SELECT MAX(ts_utc) AS ts FROM opc_samples WHERE name=%s", (_PARA,))
+    ts_i = first_col(row_i)
+    ts_p = first_col(row_p)
+
+    if not ts_i:
+        return {"runtime_seconds": 0, "since": None}
+
+    if ts_p and _coerce_to_datetime(ts_p) >= _coerce_to_datetime(ts_i):
+        return {"runtime_seconds": 0, "since": dt_to_iso_utc(ts_p)}
+
+    now = datetime.now(timezone.utc)
+    dt_i = _coerce_to_datetime(ts_i) or now
+    runtime = max(0.0, (now - dt_i).total_seconds())
+    return {"runtime_seconds": int(runtime), "since": dt_to_iso_utc(dt_i)}
+
+
+@app.get("/api/live/actuators/timings", tags=["Live Dashboard"])
+def live_actuator_timings():
+    """
+    Retorna, por atuador, as últimas durações:
+      - dt_abre_s   (DTabre)
+      - dt_fecha_s  (DTfecha)
+      - dt_ciclo_s  (DTciclo)
+    Se as tabelas de ciclos não existirem, retorna None nesses campos.
+    """
+    DB_NAME = os.getenv("MYSQL_DB") or os.getenv("DB_NAME") or ""
+
+    def last_from_table(tname: str):
+        if not DB_NAME or not table_exists(DB_NAME, tname):
+            return None
+        row = fetch_one(
+            f"""
+            SELECT
+              ts_utc AS ts_utc,
+              dt_abre_s AS dt_abre_s,
+              dt_fecha_s AS dt_fecha_s,
+              dt_ciclo_s AS dt_ciclo_s
+            FROM {tname}
+            ORDER BY ts_utc DESC
+            LIMIT 1
+            """
+        )
+        if not row:
+            return None
+        return {
+            "ts_utc": dt_to_iso_utc(col(row, "ts_utc") or col(row, 0)),
+            "dt_abre_s": col(row, "dt_abre_s"),
+            "dt_fecha_s": col(row, "dt_fecha_s"),
+            "dt_ciclo_s": col(row, "dt_ciclo_s"),
+        }
+
+    out = []
+    r1 = last_from_table("cycles_atuador1")
+    out.append({
+        "actuator_id": 1,
+        "last": (r1 or {"ts_utc": None, "dt_abre_s": None, "dt_fecha_s": None, "dt_ciclo_s": None})
+    })
+    r2 = last_from_table("cycles_atuador2")
+    out.append({
+        "actuator_id": 2,
+        "last": (r2 or {"ts_utc": None, "dt_abre_s": None, "dt_fecha_s": None, "dt_ciclo_s": None})
+    })
+
+    return {"actuators": out}
+
+
+# =========================
+# WS de alto nível (snapshot/analytics/cycles/vibration)
 # =========================
 
 @app.websocket("/ws/alerts")
@@ -772,7 +913,6 @@ async def ws_cycles(ws: WebSocket):
     try:
         while True:
             try:
-                # a função espera minutos; usamos 1 min como janela padrão do WS
                 result = {"cpm": get_cycle_rate(window_minutes=1)}
             except Exception:
                 result = {}
@@ -788,8 +928,7 @@ async def ws_vibration_ws(ws: WebSocket):
     try:
         while True:
             try:
-                # serviço dedicado para gráfico/agregado
-                result = get_vibration_data(hours=0.01)  # ~36s de janela
+                result = get_vibration_data(hours=0.01)  # ~36s
             except Exception:
                 result = {}
             await ws.send_json({"type": "vibration", **result})
@@ -800,25 +939,19 @@ async def ws_vibration_ws(ws: WebSocket):
 
 @app.websocket("/api/ws/snapshot")
 async def ws_snapshot(ws: WebSocket):
-    # aceita todas as origens; se precisar, valide ws.headers.get("origin")
     await ws.accept()
     try:
         while True:
             snap = {}
-            # KPIs agregados
             try:
                 snap.update({"analytics": get_kpis()})
             except Exception:
                 snap.update({"analytics": {}})
-
-            # taxa de ciclos (CPM ~ janela 1 min)
             try:
                 cpm = get_cycle_rate(window_minutes=1)
                 snap.update({"cycles": {"cpm": cpm}})
             except Exception:
                 snap.update({"cycles": {}})
-
-            # vibração (janela curtinha)
             try:
                 vib = get_vibration_data(hours=0.01)  # ~36s
                 snap.update({"vibration": vib})
