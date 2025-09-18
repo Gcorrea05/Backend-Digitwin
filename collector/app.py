@@ -72,7 +72,9 @@ POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "0.2"))  # 200ms por default
 OPCUA_ENDPOINT = os.getenv("OPCUA_ENDPOINT", "opc.tcp://192.168.0.40:4840")
 OPCUA_USER = os.getenv("OPCUA_USER", "")
 OPCUA_PASS = os.getenv("OPCUA_PASS", "")
-NODES_CSV = os.getenv("OPCUA_NODEIDS_CSV", "nodes.csv")
+# Ajuste a definição de NODES_CSV para evitar o caminho duplicado
+NODES_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'nodes.csv')
+
 
 # Serial MPU
 SERIAL_PORT = os.getenv("SERIAL_PORT", "COM3")
@@ -131,18 +133,33 @@ if REDIS_ENABLE:
 # =========================
 # Leitura do nodes.csv
 # =========================
+import os
+import csv
+from typing import List, Dict
+
 def load_nodes(csv_path: str) -> List[Dict[str, str]]:
+    # Garantir que o caminho do arquivo está correto
+    full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), csv_path)
+    
+    print(f"[DEBUG] Procurando arquivo nodes.csv em: {full_path}")  # Debug: Verifica o caminho
+
+    if not os.path.exists(full_path):
+        raise FileNotFoundError(f"O arquivo {full_path} não foi encontrado.")
+    
     items: List[Dict[str, str]] = []
-    with open(csv_path, newline="", encoding="utf-8") as f:
+    with open(full_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             name = row["name"].strip()
             nodeid = row.get("nodeid", "").strip()
             dtype = row.get("datatype", "Boolean").strip()
             items.append({"name": name, "nodeid": nodeid, "datatype": dtype})
+    
     if not items:
-        raise RuntimeError(f"Nenhum node carregado de {csv_path}")
+        raise RuntimeError(f"Nenhum node carregado de {full_path}")
+    
     return items
+
 # =========================
 # Fontes de dados
 # =========================
@@ -222,7 +239,7 @@ class SerialMpuReader:
             self.ser = None
 
     def _extract_json(self, s: str) -> Optional[str]:
-        # Em alguns terminais aparecem prefixos (timestamps, “-> ”, etc.).
+        # Em alguns terminais aparecem prefixos (timestamps, “-> ”, etc.). 
         # Aqui pegamos o trecho entre o 1º '{' e o último '}'.
         i = s.find("{")
         j = s.rfind("}")
@@ -252,20 +269,22 @@ class SerialMpuReader:
         mpu_id = 1 if sensor == "MPUA1" else 2
 
         try:
-            ax = float(obj["ax"]); ay = float(obj["ay"]); az = float(obj["az"])
+            ax = float(obj["ax"])
+            ay = float(obj["ay"])
+            az = float(obj["az"])
         except Exception:
             return None
 
         rec: Dict[str, Any] = {"mpu_id": mpu_id, "ax_g": ax, "ay_g": ay, "az_g": az}
         for k_src, k_dst in [("gx","gx_dps"), ("gy","gy_dps"), ("gz","gz_dps"),
-                             ("gx_dps","gx_dps"), ("gy_dps","gy_dps"), ("gz_dps","gz_dps"),
-                             ("temp","temp_c"), ("temp_c","temp_c")]:
+                             ("gx_dps","gx_dps"), ("gy_dps","gy_dps"), ("gz_dps","gz_dps")]:
             if k_src in obj:
                 try:
                     rec[k_dst] = float(obj[k_src])
                 except Exception:
                     pass
         return rec
+
 # =========================
 # Sinks (destinos)
 # =========================
@@ -357,28 +376,27 @@ class MySqlMpuSink(MySqlBase):
               gx_dps DOUBLE NULL,
               gy_dps DOUBLE NULL,
               gz_dps DOUBLE NULL,
-              temp_c DOUBLE NULL,
               INDEX idx_mpu_id_ts (mpu_id, ts_utc),
               INDEX idx_mpu_ts (ts_utc)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """)
         cur.close()
         self.conn.commit()
+
     def write_sample(self, ts_iso: str, rec: Dict[str, Any]):
         ts_mysql = iso_to_mysql_dt6(ts_iso)
         cur = self.conn.cursor()
         cur.execute("""
             INSERT INTO mpu_samples
-              (ts_utc, mpu_id, ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps, temp_c)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+              (ts_utc, mpu_id, ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
         """, (
             ts_mysql,
             int(rec["mpu_id"]),
             float(rec["ax_g"]), float(rec["ay_g"]), float(rec["az_g"]),
             (None if rec.get("gx_dps") is None else float(rec["gx_dps"])),
             (None if rec.get("gy_dps") is None else float(rec["gy_dps"])),
-            (None if rec.get("gz_dps") is None else float(rec["gz_dps"])),
-            (None if rec.get("temp_c") is None else float(rec["temp_c"]))
+            (None if rec.get("gz_dps") is None else float(rec["gz_dps"]))
         ))
         cur.close()
         self.conn.commit()
@@ -509,8 +527,7 @@ class _Agg:
                  "sum_ax", "sum_ay", "sum_az", "sum_ax2", "sum_ay2", "sum_az2",
                  "min_ax", "min_ay", "min_az", "max_ax", "max_ay", "max_az",
                  "sum_gx", "sum_gy", "sum_gz", "sum_gx2", "sum_gy2", "sum_gz2",
-                 "min_gx", "min_gy", "min_gz", "max_gx", "max_gy", "max_gz",
-                 "sum_temp")
+                 "min_gx", "min_gy", "min_gz", "max_gx", "max_gy", "max_gz")
 
     def __init__(self):
         self.n = 0
@@ -524,9 +541,7 @@ class _Agg:
         self.min_gx = self.min_gy = self.min_gz = float("inf")
         self.max_gx = self.max_gy = self.max_gz = float("-inf")
 
-        self.sum_temp = 0.0
-
-    def add(self, ax, ay, az, gx=None, gy=None, gz=None, temp=None):
+    def add(self, ax, ay, az, gx=None, gy=None, gz=None):
         self.n += 1
         self.sum_ax += ax; self.sum_ay += ay; self.sum_az += az
         self.sum_ax2 += ax*ax; self.sum_ay2 += ay*ay; self.sum_az2 += az*az
@@ -543,12 +558,9 @@ class _Agg:
             self.sum_gz += gz; self.sum_gz2 += gz*gz
             self.min_gz = min(self.min_gz, gz); self.max_gz = max(self.max_gz, gz)
 
-        if temp is not None:
-            self.sum_temp += temp
-
     def stats(self) -> Dict[str, Dict[str, Optional[float]]]:
         if self.n <= 0:
-            return {k: {m: None for m in ("mean","rms","min","max")} for k in ("ax","ay","az","gx","gy","gz","temp")}
+            return {k: {m: None for m in ("mean","rms","min","max")} for k in ("ax","ay","az","gx","gy","gz")}
         n = float(self.n)
         def mean_sum(s): return s / n
         def rms_sum(ss): return math.sqrt(ss / n)
@@ -563,8 +575,6 @@ class _Agg:
         gy_rms  = rms_sum(self.sum_gy2) if self.sum_gy2 or self.n else None
         gz_rms  = rms_sum(self.sum_gz2) if self.sum_gz2 or self.n else None
 
-        temp_mean = (self.sum_temp / n) if self.sum_temp else None
-
         return {
             "ax": {"mean": ax_mean, "rms": ax_rms, "min": self.min_ax, "max": self.max_ax},
             "ay": {"mean": ay_mean, "rms": ay_rms, "min": self.min_ay, "max": self.max_ay},
@@ -572,8 +582,8 @@ class _Agg:
             "gx": {"mean": gx_mean, "rms": gx_rms, "min": (None if self.min_gx==float('inf') else self.min_gx), "max": (None if self.max_gx==float('-inf') else self.max_gx)},
             "gy": {"mean": gy_mean, "rms": gy_rms, "min": (None if self.min_gy==float('inf') else self.min_gy), "max": (None if self.max_gy==float('-inf') else self.max_gy)},
             "gz": {"mean": gz_mean, "rms": gz_rms, "min": (None if self.min_gz==float('inf') else self.min_gz), "max": (None if self.max_gz==float('-inf') else self.max_gz)},
-            "temp": {"mean": temp_mean, "rms": None, "min": None, "max": None},
         }
+
 
 def _check_thresholds_and_alert(ts_start: datetime, mpu_id: int, stats: Dict[str, Dict[str, Optional[float]]]):
     # Checa RMS contra limites (se definidos) e publica alerta
@@ -727,7 +737,6 @@ def mpu_loop():
             buf["agg"].add(
                 rec["ax_g"], rec["ay_g"], rec["az_g"],
                 rec.get("gx_dps"), rec.get("gy_dps"), rec.get("gz_dps"),
-                rec.get("temp_c")
             )
 
     finally:
