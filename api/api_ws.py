@@ -323,8 +323,6 @@ def mpu_latest(id: str):
         "ax_g": ax, "ay_g": ay, "az_g": az,
         "gx_dps": gx, "gy_dps": gy, "gz_dps": gz,
     }
-
-
 # ------------ WS low-level (OPC/MPU via Redis) ------------
 @app.websocket("/ws/opc")
 async def ws_opc(ws: WebSocket):
@@ -438,6 +436,8 @@ async def ws_mpu(ws: WebSocket):
             if not subs_mpu[id_str]:
                 subs_mpu.pop(id_str, None)
         clients_all_mpu.discard(ws)
+
+
 # ------------ Parse de time window ------------
 def _parse_since(s: Optional[str]) -> Optional[datetime]:
     if not s:
@@ -466,8 +466,6 @@ def _parse_since(s: Optional[str]) -> Optional[datetime]:
             400,
             detail="since inválido. Use '-60s', '-15m', '-1h', '-7d' ou ISO8601.",
         )
-
-
 # ------------ HTTP de histórico/listas ------------
 @app.get("/opc/names")
 def opc_names():
@@ -600,6 +598,8 @@ def _fetch_last_bool_row(name: str):
         """,
         (name,),
     )
+
+
 @app.get("/api/live/actuators/state", tags=["Live Dashboard"])
 def live_actuators_state():
     out = []
@@ -621,8 +621,6 @@ def live_actuators_state():
             }
         )
     return {"actuators": out}
-
-
 def _clean_rms(values: List[float], max_g: float = 4.0) -> float:
     if not values:
         return 0.0
@@ -665,88 +663,6 @@ def live_cycles_rate(window_s: int = Query(5, ge=1, le=300)):
     cycles = pairs // 2
     cps = cycles / float(window_s)
     return {"window_seconds": window_s, "pairs_count": pairs, "cycles": cycles, "cycles_per_second": cps}
-
-
-# ---------- NOVOS: CPM por atuador (A1/A2) ----------
-def _last_bool_before(name: str, before: datetime):
-    """Último value_bool antes de 'before' para inicializar estado."""
-    row = fetch_one(
-        """
-        SELECT value_bool AS vb
-        FROM opc_samples
-        WHERE name=%s AND ts_utc < %s
-        ORDER BY ts_utc DESC
-        LIMIT 1
-        """,
-        (name, before),
-    )
-    if not row:
-        return None
-    vb = row.get("vb")
-    return (None if vb is None else int(vb))
-
-
-@app.get("/api/live/cycles/rate_by_actuator", tags=["Live Dashboard"])
-def live_cycles_rate_by_actuator(
-    actuator_id: int = Query(..., ge=1, le=2),
-    window_s: int = Query(60, ge=1, le=3600),
-):
-    """
-    CPM por atuador (A1/A2) medido por transições de estado:
-      'fechado' -> 'aberto' -> 'fechado' = 1 ciclo.
-    Usa os dois sinais booleanos do atuador (recuado/avancado).
-    """
-    names = _SENSORS.get(int(actuator_id))
-    if not names:
-        raise HTTPException(400, "actuator_id inválido (use 1 ou 2)")
-
-    now = datetime.now(timezone.utc)
-    start = now - timedelta(seconds=window_s)
-
-    # Inicializa estado com o último valor ANTES da janela
-    vb_recuado = _last_bool_before(names["recuado"], start)
-    vb_avancado = _last_bool_before(names["avancado"], start)
-    state = _decide_state(vb_recuado, vb_avancado)
-
-    # Busca eventos da janela (ordenados)
-    rows = fetch_all(
-        """
-        SELECT ts_utc AS ts, name AS name, value_bool AS vb
-        FROM opc_samples
-        WHERE ts_utc >= %s AND ts_utc < %s
-          AND name IN (%s, %s)
-        ORDER BY ts_utc ASC
-        """,
-        (start, now, names["recuado"], names["avancado"]),
-    )
-
-    cycles = 0
-    in_open = (state == "aberto")
-    for r in rows:
-        nm, vb = cols(r, "name", "vb")
-        if vb is not None:
-            if nm == names["recuado"]:
-                vb_recuado = int(vb)
-            elif nm == names["avancado"]:
-                vb_avancado = int(vb)
-        new_state = _decide_state(vb_recuado, vb_avancado)
-
-        # conta ciclo quando fechamos após ter aberto
-        if state != new_state:
-            if new_state == "aberto":
-                in_open = True
-            elif new_state == "fechado" and in_open:
-                cycles += 1
-                in_open = False
-            state = new_state
-
-    cpm = cycles / (window_s / 60.0)
-    return {
-        "actuator_id": actuator_id,
-        "window_seconds": window_s,
-        "cycles": cycles,
-        "cpm": cpm,
-    }
 
 
 @app.get("/api/live/vibration", tags=["Live Dashboard"])
@@ -871,10 +787,87 @@ def live_actuator_timings():
     })
 
     return {"actuators": out}
+# =========================
+# SYSTEM STATUS para snapshot
+# =========================
+
+def _sev_from_ok(ok: bool) -> str:
+    return "operational" if ok else "down"
+
+
+def get_system_status() -> dict:
+    """
+    Monta um bloco 'system' para o snapshot:
+      {
+        "components": {
+          "actuators": "operational|warning|down|unknown",
+          "sensors":   "...",
+          "transmission": "...",
+          "control":   "..."
+        }
+      }
+    """
+    # --- Control (usa health: db + redis)
+    try:
+        row = fetch_one("SELECT NOW(6) AS now6")
+        db_ok = (row is not None and first_col(row) is not None)
+    except Exception:
+        db_ok = False
+
+    try:
+        import anyio
+        redis_ok = anyio.from_thread.run(rcli.ping)
+    except Exception:
+        redis_ok = False
+
+    control_sev = _sev_from_ok(db_ok and redis_ok)
+
+    # --- Actuators (usa fins-de-curso recentes)
+    try:
+        states = live_actuators_state().get("actuators", [])
+        any_valid = any(
+            (it.get("recuado") in (0, 1)) or (it.get("avancado") in (0, 1))
+            for it in states
+        )
+        actuators_sev = "operational" if any_valid else "unknown"
+    except Exception:
+        actuators_sev = "unknown"
+
+    # --- Sensors (heurística simples: existem nomes em opc/names?)
+    try:
+        names = opc_names().get("names", [])
+        sensors_sev = "operational" if len(names) > 0 else "unknown"
+    except Exception:
+        sensors_sev = "unknown"
+
+    # --- Transmission (atividade recente de INICIA/PARA)
+    try:
+        now = datetime.now(timezone.utc)
+        rows = fetch_all(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM opc_samples
+            WHERE ts_utc >= %s AND name IN (%s, %s)
+            """,
+            (now - timedelta(seconds=10), _INICIA, _PARA),
+        )
+        cnt = int(first_col(rows[0]) if rows else 0)
+        transmission_sev = "operational" if cnt > 0 else "warning"
+    except Exception:
+        transmission_sev = "unknown"
+
+    return {
+        "components": {
+            "actuators": actuators_sev,
+            "sensors": sensors_sev,
+            "transmission": transmission_sev,
+            "control": control_sev,
+        }
+    }
 
 
 # =========================
-# WS de alto nível (snapshot/analytics/cycles/vibration)
+# WS de alto nível (snapshot/analytics/cycles/vibration + system)
 # =========================
 
 @app.websocket("/ws/alerts")
@@ -957,6 +950,13 @@ async def ws_snapshot(ws: WebSocket):
                 snap.update({"vibration": vib})
             except Exception:
                 snap.update({"vibration": {}})
+
+            # >>> NOVO BLOCO: system status enviado ao front
+            try:
+                sysblk = get_system_status()
+                snap.update({"system": sysblk})
+            except Exception:
+                snap.update({"system": {"components": {}}})
 
             await ws.send_json({"type": "snapshot", **snap})
             await asyncio.sleep(2)
