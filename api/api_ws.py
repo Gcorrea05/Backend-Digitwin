@@ -308,48 +308,51 @@ def opc_names():
 
 @app.get("/opc/history")
 def opc_history(
-    name: Optional[str] = Query(None, description="Nome do sinal OPC"),
-    act: Optional[int] = Query(None, ge=1, le=2, description="Atuador (1|2)"),
-    facet: Optional[str] = Query(None, description="S1|S2"),
-    since: Optional[str] = Query(None, description="ISO8601 ou relativo (-24h, -7d)"),
-    last: Optional[int] = Query(None),
-    seconds: Optional[str] = Query(None),
-    window: Optional[str] = Query(None),
-    duration: Optional[str] = Query(None),
-    limit: int = Query(20000, ge=1, le=20000),
-    offset: int = Query(0, ge=0),
-    asc: bool = Query(False),
+request: Request, # para acesso direto aos query_params
+name: Optional[str] = Query(None, description="Nome do sinal OPC"),
+act: Optional[int] = Query(None, ge=1, le=2, description="Atuador (1|2)"),
+facet: Optional[str] = Query(None, description="S1|S2"),
+since: Optional[str] = Query(None, description="ISO8601 ou relativo (-24h, -7d)"),
+last: Optional[int] = Query(None),
+seconds: Optional[str] = Query(None),
+window: Optional[str] = Query(None),
+duration: Optional[str] = Query(None),
+limit: int = Query(20000, ge=1, le=20000),
+offset: int = Query(0, ge=0),
+asc: bool = Query(False),
+latest: bool = Query(False, description="Se true, retorna o valor mais recente para cada nome"),
+names: Optional[str] = Query(None, description="Lista separada por vírgula com nomes de sinais OPC")
 ):
-    # act/facet -> name
-    if not name and act and facet:
-        f = facet.strip().upper()
-        if f not in ("S1", "S2"):
-            raise HTTPException(400, "facet inválido (use S1 ou S2)")
-        name = f"Recuado_{act}S1" if f == "S1" else f"Avancado_{act}S2"
+    if latest:
+        raw_names = (names or "").split(",")
+        name_list = [n.strip() for n in raw_names if n.strip()]
+        if not name_list:
+            raise HTTPException(400, "Parâmetro 'names' é obrigatório quando latest=1")
 
-    if not name:
-        raise HTTPException(400, "Informe name=... ou act=..&facet=..")
 
-    norm = _normalize_since(since, last, seconds, window, duration)
-    dt = _parse_since(norm) if norm else None
-
-    sql = """
-        SELECT ts_utc AS ts_utc, value_bool AS value_bool
-        FROM opc_samples
-        WHERE name=%s
-    """
-    params: Tuple[Any, ...] = (name,)
-    if dt:
-        sql += " AND ts_utc >= %s"
-        params = (name, dt)
-    sql += f" ORDER BY ts_utc {'ASC' if asc else 'DESC'} LIMIT %s OFFSET %s"
-    params += (limit, offset)
-
-    rows = fetch_all(sql, params)
-    items = [{"ts_utc": dt_to_iso_utc(r["ts_utc"]),
-              "value_bool": (None if r["value_bool"] is None else int(r["value_bool"]))}
-             for r in rows]
-    return {"name": name, "count": len(items), "items": items}
+        placeholders = ", ".join(["%s"] * len(name_list))
+        sql = f"""
+        WITH latest AS (
+            SELECT name, value_bool, facet, ts_utc,
+                ROW_NUMBER() OVER (PARTITION BY name ORDER BY ts_utc DESC) AS rn
+            FROM opc_samples
+             WHERE name IN ({placeholders})
+        )
+        SELECT name, value_bool, facet, ts_utc
+        FROM latest
+        WHERE rn = 1
+        """
+        rows = fetch_all(sql, tuple(name_list))
+        items = [
+        {
+            "name": r["name"],
+            "value_bool": int(r["value_bool"]) if r["value_bool"] is not None else None,
+            "facet": r["facet"],
+            "ts_utc": dt_to_iso_utc(r["ts_utc"]),
+         }
+        for r in rows
+    ]
+    return {"mode": "latest", "count": len(items), "items": items}
 
 # alias compat
 @app.get("/api/opc/history")
