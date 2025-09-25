@@ -1,17 +1,14 @@
-# api/api_ws.py
+# api/api_ws.py  —  Versão 100% HTTP (sem WebSockets / sem Redis)
 import os
 import re
 import json
-import asyncio
 from datetime import datetime, timezone, timedelta
-from typing import Optional, List, Any, Dict, Tuple, AsyncIterator
+from typing import Optional, List, Any, Dict, Tuple
 
 import numpy as np
 from dotenv import load_dotenv, find_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import redis.asyncio as redis
-import anyio  # para chamar redis.ping() em rota síncrona com segurança
 
 # Carrega .env da raiz (se existir) e também api/.env
 load_dotenv(find_dotenv())
@@ -19,18 +16,6 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 # ------------ Config vindas do .env ------------
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",")]
-REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
-WS_PING_INTERVAL = int(os.getenv("WS_PING_INTERVAL", "15"))
-
-# Redis client (decodificação já em str)
-rcli: redis.Redis = redis.from_url(
-    REDIS_URL,
-    decode_responses=True,
-    health_check_interval=30,
-)
-
-# Flag global de disponibilidade do Redis
-HAS_REDIS = False
 
 # ------------ Imports locais de serviços ------------
 from .routes import alerts
@@ -154,7 +139,7 @@ def table_exists(schema: str, table: str) -> bool:
 
 
 # ------------ FastAPI / CORS ------------
-app = FastAPI(title="Festo DT API+WS (live)", version="1.5.0")
+app = FastAPI(title="Festo DT API (HTTP only)", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"] if ALLOWED_ORIGINS == ["*"] else ALLOWED_ORIGINS,
@@ -163,107 +148,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ------------ Registries p/ WS OPC/MPU ------------
-subs_opc: Dict[str, set] = {}   # name -> set(WebSocket)
-subs_mpu: Dict[str, set] = {}   # id   -> set(WebSocket)
-clients_all_opc: set = set()    # ouvintes de todos OPC
-clients_all_mpu: set = set()    # ouvintes de todos MPU
-# ------------ Redis listeners (com backoff e tolerância) ------------
-async def _pubsub_listen(channel: str) -> AsyncIterator[Dict[str, Any]]:
-    backoff = 1.0
-    while True:
-        try:
-            pubsub = rcli.pubsub()
-            await pubsub.subscribe(channel)
-            try:
-                async for msg in pubsub.listen():
-                    if msg.get("type") != "message":
-                        continue
-                    data = msg.get("data")
-                    if isinstance(data, (bytes, bytearray)):
-                        try:
-                            data = data.decode("utf-8")
-                        except Exception:
-                            continue
-                    try:
-                        payload = json.loads(data)
-                    except Exception:
-                        payload = {"type": channel, "data": data}
-                    yield payload
-            finally:
-                try:
-                    await pubsub.unsubscribe(channel)
-                finally:
-                    await pubsub.close()
-            backoff = 1.0  # reset
-        except Exception:
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2.0, 30.0)
-
-
-async def listen_opc():
-    if not HAS_REDIS:
-        return
-    async for ev in _pubsub_listen("opc_samples"):
-        name = ev.get("name")
-        payload = {"type": "opc_event", **ev}
-        for ws in list(subs_opc.get(name, set())):
-            try:
-                await ws.send_json(payload)
-            except Exception:
-                pass
-        for ws in list(clients_all_opc):
-            try:
-                await ws.send_json(payload)
-            except Exception:
-                pass
-
-
-async def listen_mpu():
-    if not HAS_REDIS:
-        return
-    async for ev in _pubsub_listen("mpu_samples"):
-        id_str = ev.get("id")  # "MPUA1"/"MPUA2"
-        payload = {"type": "mpu_sample", **ev}
-        for ws in list(subs_mpu.get(id_str, set())):
-            try:
-                await ws.send_json(payload)
-            except Exception:
-                pass
-        for ws in list(clients_all_mpu):
-            try:
-                await ws.send_json(payload)
-            except Exception:
-                pass
-
-
-@app.on_event("startup")
-async def _startup():
-    global HAS_REDIS
-    try:
-        HAS_REDIS = await rcli.ping()
-    except Exception:
-        HAS_REDIS = False
-
-    if HAS_REDIS:
-        asyncio.create_task(listen_opc())
-        asyncio.create_task(listen_mpu())
-
 
 # ------------ HTTP básicos ------------
 @app.get("/health")
 def health():
     row = fetch_one("SELECT NOW(6) AS now6")
-    try:
-        ok_redis = anyio.from_thread.run(rcli.ping)
-    except Exception:
-        ok_redis = False
-
     db_time_val = first_col(row) if row is not None else None
     return {
         "status": "ok",
         "db_time": (str(db_time_val) if db_time_val is not None else None),
-        "redis": bool(ok_redis),
     }
 
 
@@ -323,119 +216,6 @@ def mpu_latest(id: str):
         "ax_g": ax, "ay_g": ay, "az_g": az,
         "gx_dps": gx, "gy_dps": gy, "gz_dps": gz,
     }
-# ------------ WS low-level (OPC/MPU via Redis) ------------
-@app.websocket("/ws/opc")
-async def ws_opc(ws: WebSocket):
-    await ws.accept()
-
-    qp = ws.query_params
-    name = qp.get("name")
-    all_flag = str(qp.get("all", "false")).lower() == "true"
-
-    # snapshot inicial por nome
-    if name:
-        row = fetch_one(
-            """
-            SELECT
-              ts_utc AS ts_utc,
-              value_bool AS value_bool
-            FROM opc_samples
-            WHERE name=%s
-            ORDER BY ts_utc DESC
-            LIMIT 1
-            """,
-            (name,),
-        )
-        if row:
-            ts, vb = cols(row, "ts_utc", "value_bool")
-            await ws.send_json(
-                {
-                    "type": "hello",
-                    "kind": "opc",
-                    "name": name,
-                    "last": {
-                        "ts_utc": dt_to_iso_utc(ts),
-                        "value_bool": (None if vb is None else bool(vb)),
-                    },
-                }
-            )
-
-    # registrar assinatura
-    if name:
-        subs_opc.setdefault(name, set()).add(ws)
-    elif all_flag:
-        clients_all_opc.add(ws)
-
-    try:
-        while True:
-            await ws.send_json({"type": "ping", "ts": datetime.utcnow().isoformat() + "Z"})
-            await asyncio.sleep(WS_PING_INTERVAL)
-    except WebSocketDisconnect:
-        pass
-    finally:
-        if name and ws in subs_opc.get(name, set()):
-            subs_opc[name].discard(ws)
-            if not subs_opc[name]:
-                subs_opc.pop(name, None)
-        clients_all_opc.discard(ws)
-
-
-@app.websocket("/ws/mpu")
-async def ws_mpu(ws: WebSocket):
-    await ws.accept()
-
-    qp = ws.query_params
-    id_str = qp.get("id")
-    all_flag = str(qp.get("all", "false")).lower() == "true"
-
-    if id_str:
-        mid = mpu_id_from_str(id_str)
-        row = fetch_one(
-            """
-            SELECT
-              ts_utc AS ts_utc,
-              ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps
-            FROM mpu_samples
-            WHERE mpu_id=%s
-            ORDER BY ts_utc DESC
-            LIMIT 1
-            """,
-            (mid,),
-        )
-        if row:
-            ts = col(row, "ts_utc")
-            ax, ay, az = col(row, "ax_g"), col(row, "ay_g"), col(row, "az_g")
-            gx, gy, gz = col(row, "gx_dps"), col(row, "gy_dps"), col(row, "gz_dps")
-            await ws.send_json(
-                {
-                    "type": "hello",
-                    "kind": "mpu",
-                    "id": id_str,
-                    "last": {
-                        "ts_utc": dt_to_iso_utc(ts),
-                        "ax_g": ax, "ay_g": ay, "az_g": az,
-                        "gx_dps": gx, "gy_dps": gy, "gz_dps": gz,
-                    },
-                }
-            )
-
-    if id_str:
-        subs_mpu.setdefault(id_str, set()).add(ws)
-    elif all_flag:
-        clients_all_mpu.add(ws)
-
-    try:
-        while True:
-            await ws.send_json({"type": "ping", "ts": datetime.utcnow().isoformat() + "Z"})
-            await asyncio.sleep(WS_PING_INTERVAL)
-    except WebSocketDisconnect:
-        pass
-    finally:
-        if id_str and ws in subs_mpu.get(id_str, set()):
-            subs_mpu[id_str].discard(ws)
-            if not subs_mpu[id_str]:
-                subs_mpu.pop(id_str, None)
-        clients_all_mpu.discard(ws)
 
 
 # ------------ Parse de time window ------------
@@ -466,6 +246,8 @@ def _parse_since(s: Optional[str]) -> Optional[datetime]:
             400,
             detail="since inválido. Use '-60s', '-15m', '-1h', '-7d' ou ISO8601.",
         )
+
+
 # ------------ HTTP de histórico/listas ------------
 @app.get("/opc/names")
 def opc_names():
@@ -621,6 +403,8 @@ def live_actuators_state():
             }
         )
     return {"actuators": out}
+
+
 def _clean_rms(values: List[float], max_g: float = 4.0) -> float:
     if not values:
         return 0.0
@@ -713,7 +497,7 @@ def live_vibration(window_s: int = Query(2, ge=1, le=60)):
 
 
 # =========================
-# ENDPOINTS NOVOS — Monitoring
+# ENDPOINTS — Monitoring (HTTP)
 # =========================
 
 @app.get("/api/live/runtime", tags=["Live Dashboard"])
@@ -787,6 +571,8 @@ def live_actuator_timings():
     })
 
     return {"actuators": out}
+
+
 # =========================
 # SYSTEM STATUS para snapshot
 # =========================
@@ -807,20 +593,13 @@ def get_system_status() -> dict:
         }
       }
     """
-    # --- Control (usa health: db + redis)
+    # --- Control (usa health: db)
     try:
         row = fetch_one("SELECT NOW(6) AS now6")
         db_ok = (row is not None and first_col(row) is not None)
     except Exception:
         db_ok = False
-
-    try:
-        import anyio
-        redis_ok = anyio.from_thread.run(rcli.ping)
-    except Exception:
-        redis_ok = False
-
-    control_sev = _sev_from_ok(db_ok and redis_ok)
+    control_sev = _sev_from_ok(db_ok)
 
     # --- Actuators (usa fins-de-curso recentes)
     try:
@@ -867,98 +646,80 @@ def get_system_status() -> dict:
 
 
 # =========================
-# WS de alto nível (snapshot/analytics/cycles/vibration + system)
+# NOVAS ROTAS HTTP (equivalentes aos antigos WS)
 # =========================
 
-@app.websocket("/ws/alerts")
-async def ws_alerts(ws: WebSocket):
-    await ws.accept()
+@app.get("/api/alerts")
+def http_alerts(limit: int = Query(10, ge=1, le=100)):
     try:
-        while True:
-            try:
-                items = alerts.fetch_latest_alerts(limit=10)
-            except Exception:
-                items = []
-            await ws.send_json({"type": "alerts", "items": items})
-            await asyncio.sleep(2)
-    except WebSocketDisconnect:
-        pass
+        items = alerts.fetch_latest_alerts(limit=limit)
+    except Exception:
+        items = []
+    return {"type": "alerts", "items": items}
 
 
-@app.websocket("/ws/analytics")
-async def ws_analytics(ws: WebSocket):
-    await ws.accept()
+@app.get("/api/analytics")
+def http_analytics():
     try:
-        while True:
-            try:
-                result = get_kpis()  # deve retornar dict serializável
-            except Exception:
-                result = {}
-            await ws.send_json({"type": "analytics", **result})
-            await asyncio.sleep(2)
-    except WebSocketDisconnect:
-        pass
+        result = get_kpis()  # dict serializável
+    except Exception:
+        result = {}
+    return {"type": "analytics", **result}
 
 
-@app.websocket("/ws/cycles")
-async def ws_cycles(ws: WebSocket):
-    await ws.accept()
+@app.get("/api/cycles")
+def http_cycles():
+    """Atalho para cpm em janela de 1 minuto (mesma info que ws/cycles enviava)."""
     try:
-        while True:
-            try:
-                result = {"cpm": get_cycle_rate(window_minutes=1)}
-            except Exception:
-                result = {}
-            await ws.send_json({"type": "cycles", **result})
-            await asyncio.sleep(2)
-    except WebSocketDisconnect:
-        pass
+        result = {"cpm": get_cycle_rate(window_minutes=1)}
+    except Exception:
+        result = {}
+    return {"type": "cycles", **result}
 
 
-@app.websocket("/ws/vibration")
-async def ws_vibration_ws(ws: WebSocket):
-    await ws.accept()
+@app.get("/api/vibration/window")
+def http_vibration_window(seconds: float = Query(36.0, ge=1.0, le=300.0)):
+    """Janela curta de vibração, equivalente ao ws que usava hours=0.01 (~36s)."""
     try:
-        while True:
-            try:
-                result = get_vibration_data(hours=0.01)  # ~36s
-            except Exception:
-                result = {}
-            await ws.send_json({"type": "vibration", **result})
-            await asyncio.sleep(2)
-    except WebSocketDisconnect:
-        pass
+        hours = seconds / 3600.0
+        result = get_vibration_data(hours=hours)
+    except Exception:
+        result = {}
+    return {"type": "vibration", **result}
 
 
-@app.websocket("/api/ws/snapshot")
-async def ws_snapshot(ws: WebSocket):
-    await ws.accept()
+@app.get("/api/snapshot")
+def http_snapshot():
+    """
+    Agrega o 'snapshot' que o WS /api/ws/snapshot mandava periodicamente,
+    para consumo via polling no front.
+    """
+    snap = {}
     try:
-        while True:
-            snap = {}
-            try:
-                snap.update({"analytics": get_kpis()})
-            except Exception:
-                snap.update({"analytics": {}})
-            try:
-                cpm = get_cycle_rate(window_minutes=1)
-                snap.update({"cycles": {"cpm": cpm}})
-            except Exception:
-                snap.update({"cycles": {}})
-            try:
-                vib = get_vibration_data(hours=0.01)  # ~36s
-                snap.update({"vibration": vib})
-            except Exception:
-                snap.update({"vibration": {}})
+        snap.update({"analytics": get_kpis()})
+    except Exception:
+        snap.update({"analytics": {}})
 
-            # >>> NOVO BLOCO: system status enviado ao front
-            try:
-                sysblk = get_system_status()
-                snap.update({"system": sysblk})
-            except Exception:
-                snap.update({"system": {"components": {}}})
+    try:
+        cpm = get_cycle_rate(window_minutes=1)
+        snap.update({"cycles": {"cpm": cpm}})
+    except Exception:
+        snap.update({"cycles": {}})
 
-            await ws.send_json({"type": "snapshot", **snap})
-            await asyncio.sleep(2)
-    except WebSocketDisconnect:
-        pass
+    try:
+        vib = get_vibration_data(hours=0.01)  # ~36s
+        snap.update({"vibration": vib})
+    except Exception:
+        snap.update({"vibration": {}})
+
+    try:
+        sysblk = get_system_status()
+        snap.update({"system": sysblk})
+    except Exception:
+        snap.update({"system": {"components": {}}})
+
+    return {"type": "snapshot", **snap}
+
+@app.get("/api/system/status", tags=["Live Dashboard"])
+def system_status_http():
+    return get_system_status()
