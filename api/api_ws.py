@@ -3,11 +3,11 @@ import os
 import re
 import time
 from datetime import datetime, timezone, timedelta
-from typing import Optional, List, Any, Dict, Tuple
+from typing import Optional, List, Any, Dict, Tuple, TypedDict
 
 import numpy as np
 from dotenv import load_dotenv, find_dotenv
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException,Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from mysql.connector.errors import PoolError
@@ -308,53 +308,139 @@ def opc_names():
 
 @app.get("/opc/history")
 def opc_history(
-request: Request, # para acesso direto aos query_params
-name: Optional[str] = Query(None, description="Nome do sinal OPC"),
-act: Optional[int] = Query(None, ge=1, le=2, description="Atuador (1|2)"),
-facet: Optional[str] = Query(None, description="S1|S2"),
-since: Optional[str] = Query(None, description="ISO8601 ou relativo (-24h, -7d)"),
-last: Optional[int] = Query(None),
-seconds: Optional[str] = Query(None),
-window: Optional[str] = Query(None),
-duration: Optional[str] = Query(None),
-limit: int = Query(20000, ge=1, le=20000),
-offset: int = Query(0, ge=0),
-asc: bool = Query(False),
-latest: bool = Query(False, description="Se true, retorna o valor mais recente para cada nome"),
-names: Optional[str] = Query(None, description="Lista separada por vírgula com nomes de sinais OPC")
+    request: Request,
+    name: Optional[str] = Query(None, description="Nome do sinal OPC"),
+    # <<< mudança: aceitar act como string (permite A1/A2) >>>
+    act: Optional[str] = Query(None, description="Atuador (1|2|A1|A2)"),
+    facet: Optional[str] = Query(None, description="S1|S2"),
+    # <<< já tínhamos trocado last para string >>>
+    last: Optional[str] = Query(None),
+    since: Optional[str] = Query(None, description="ISO8601 ou relativo (-24h, -7d)"),
+    seconds: Optional[str] = Query(None),
+    window: Optional[str] = Query(None),
+    duration: Optional[str] = Query(None),
+    limit: int = Query(20000, ge=1, le=20000),
+    offset: int = Query(0, ge=0),
+    asc: bool = Query(False),
 ):
-    if latest:
-        raw_names = (names or "").split(",")
-        name_list = [n.strip() for n in raw_names if n.strip()]
-        if not name_list:
-            raise HTTPException(400, "Parâmetro 'names' é obrigatório quando latest=1")
+    """
+    Histórico OPC robusto: aceita act/facet ou name, e várias formas de janela.
+    Suporta act="1"|"2"|"A1"|"A2".
+    """
+    # ---------- normalização act/facet ----------
+    act_int: Optional[int] = None
+    facet_norm: Optional[str] = None
 
+    if act is not None:
+        # usa o mesmo coercer da variante por path
+        act_int = _coerce_act_from_path(str(act))
 
-        placeholders = ", ".join(["%s"] * len(name_list))
-        sql = f"""
-        WITH latest AS (
-            SELECT name, value_bool, facet, ts_utc,
-                ROW_NUMBER() OVER (PARTITION BY name ORDER BY ts_utc DESC) AS rn
-            FROM opc_samples
-             WHERE name IN ({placeholders})
-        )
-        SELECT name, value_bool, facet, ts_utc
-        FROM latest
-        WHERE rn = 1
-        """
-        rows = fetch_all(sql, tuple(name_list))
-        items = [
+    if facet is not None:
+        facet_norm = _coerce_facet_from_path(str(facet))
+
+    # act/facet -> name (se name não veio)
+    if not name and act_int and facet_norm:
+        name = f"Recuado_{act_int}S1" if facet_norm == "S1" else f"Avancado_{act_int}S2"
+
+    if not name:
+        raise HTTPException(400, "Informe name=... ou act=..&facet=..")
+
+    # ---------- variantes adicionais vindas da query ----------
+    qp = request.query_params
+    alt_since = qp.get("from") or qp.get("start") or qp.get("begin") or None
+    alt_scalar = qp.get("period") or qp.get("seconds") or qp.get("duration") or None
+
+    # Converter last (string) para int quando for numérico (ex.: "-600" | "600s")
+    last_int: Optional[int] = None
+    if last is not None:
+        s = str(last).strip().lower()
+        if s.endswith("s"):
+            s = s[:-1]
+        try:
+            last_int = int(s)
+        except Exception:
+            last_int = None
+
+    # ---------- normalização de janela ----------
+    norm = _normalize_since(
+        since=since or alt_since,
+        last=last_int,
+        seconds=seconds or alt_scalar,
+        window=window,
+        duration=duration,
+    )
+    dt = _parse_since(norm) if norm else None
+
+    # ---------- query no banco ----------
+    sql = """
+        SELECT ts_utc AS ts_utc, value_bool AS value_bool
+        FROM opc_samples
+        WHERE name=%s
+    """
+    params: Tuple[Any, ...] = (name,)
+    if dt:
+        sql += " AND ts_utc >= %s"
+        params = (name, dt)
+    sql += f" ORDER BY ts_utc {'ASC' if asc else 'DESC'} LIMIT %s OFFSET %s"
+    params += (limit, offset)
+
+    rows = fetch_all(sql, params)
+    items: List[Dict[str, Any]] = [
         {
-            "name": r["name"],
-            "value_bool": int(r["value_bool"]) if r["value_bool"] is not None else None,
-            "facet": r["facet"],
-            "ts_utc": dt_to_iso_utc(r["ts_utc"]),
-         }
-        for r in rows
-    ]
-    return {"mode": "latest", "count": len(items), "items": items}
+            "ts_utc": dt_to_iso_utc(col(r, "ts_utc") if isinstance(r, dict) else r[0]),
+            "value_bool": (None if (col(r, "value_bool") if isinstance(r, dict) else r[1]) is None
+                           else int(col(r, "value_bool") if isinstance(r, dict) else r[1])),
+        }
+    for r in rows]
 
-# alias compat
+    return {"name": name, "count": len(items), "items": items}
+def _coerce_act_from_path(act_raw: str) -> int:
+    s = (act_raw or "").strip().upper()
+    if s in ("1", "A1", "MPUA1", "MPU1"):
+        return 1
+    if s in ("2", "A2", "MPUA2", "MPU2"):
+        return 2
+    raise HTTPException(400, "act inválido (use 1|2|A1|A2)")
+
+def _coerce_facet_from_path(facet_raw: str) -> str:
+    s = (facet_raw or "").strip().upper()
+    if s not in ("S1", "S2"):
+        raise HTTPException(400, "facet inválido (use S1|S2)")
+    return s
+
+@app.get("/opc/history/{act}/{facet}")
+def opc_history_by_path(
+    request: Request,
+    act: str,
+    facet: str,
+    # manter mesmos parâmetros opcionais que a rota base
+    last: Optional[str] = Query(None),
+    since: Optional[str] = Query(None, description="ISO8601 ou relativo (-24h, -7d)"),
+    seconds: Optional[str] = Query(None),
+    window: Optional[str] = Query(None),
+    duration: Optional[str] = Query(None),
+    limit: int = Query(20000, ge=1, le=20000),
+    offset: int = Query(0, ge=0),
+    asc: bool = Query(False),
+):
+    act_int = _coerce_act_from_path(act)
+    facet_str = _coerce_facet_from_path(facet)
+    # Reencaminha para a rota principal reaproveitando a lógica consolidada
+    return opc_history(
+        request=request,
+        name=None,
+        act=act_int,
+        facet=facet_str,
+        last=last,
+        since=since,
+        seconds=seconds,
+        window=window,
+        duration=duration,
+        limit=limit,
+        offset=offset,
+        asc=asc,
+    )
+
 @app.get("/api/opc/history")
 def api_opc_history(
     name: Optional[str] = None,
@@ -481,13 +567,17 @@ _PARA = "PARA"
 
 
 def _decide_state(bit_recuado: Optional[int], bit_avancado: Optional[int]) -> str:
+    """
+    Regra desejada:
+      - 1/0  -> RECUADO
+      - 0/1  -> AVANÇADO
+      - outros (0/0, 1/1, None, mix) -> DESCONHECIDO
+    """
     if bit_recuado == 1 and bit_avancado == 0:
-        return "fechado"
+        return "RECUADO"
     if bit_avancado == 1 and bit_recuado == 0:
-        return "aberto"
-    if bit_recuado == 1 and bit_avancado == 1:
-        return "erro"
-    return "indef"
+        return "AVANÇADO"
+    return "DESCONHECIDO"
 
 
 def _fetch_last_bool_row(name: str):
@@ -506,26 +596,72 @@ def _fetch_last_bool_row(name: str):
 @app.get("/api/live/actuators/state", tags=["Live Dashboard"])
 def live_actuators_state():
     def _impl():
-        out = []
-        for aid, m in _SENSORS.items():
-            r = _fetch_last_bool_row(m["recuado"])
-            a = _fetch_last_bool_row(m["avancado"])
-            ts_r = col(r, "ts_utc") if r else None
-            ts_a = col(a, "ts_utc") if a else None
-            vb_r = None if not r else (None if col(r, "value_bool") is None else int(col(r, "value_bool")))
-            vb_a = None if not a else (None if col(a, "value_bool") is None else int(col(a, "value_bool")))
-            ts = max([t for t in (ts_r, ts_a) if t is not None], default=None)
-            out.append({
-                "actuator_id": aid,
-                "state": _decide_state(vb_r, vb_a),
-                "ts": (dt_to_iso_utc(ts) if ts else None),
-                "recuado": vb_r,
-                "avancado": vb_a,
-            })
+        # 1) pegar os 4 últimos valores em 1 query
+        rows = fetch_all(
+            """
+            WITH latest AS (
+              SELECT name, value_bool, ts_utc,
+                     ROW_NUMBER() OVER (PARTITION BY name ORDER BY ts_utc DESC) AS rn
+              FROM opc_samples
+              WHERE name IN (
+                'Avancado_1S2','Recuado_1S1',
+                'Avancado_2S2','Recuado_2S1'
+              )
+            )
+            SELECT name, value_bool, ts_utc
+            FROM latest
+            WHERE rn = 1
+            """
+        )
+
+        # 2) organizar por nome
+        byname = { col(r, "name") or col(r, 0): r for r in rows }
+
+        def v(name: str) -> Tuple[Optional[int], Optional[datetime]]:
+            r = byname.get(name)
+            if not r:
+                return None, None
+            vb = col(r, "value_bool") if isinstance(r, dict) else r[1]
+            ts = col(r, "ts_utc") if isinstance(r, dict) else r[2]
+            return (None if vb is None else int(vb)), ts
+
+        # AT1 => S1 (recuado) e S2 (avançado)
+        at1_rec, ts_r1 = v("Recuado_1S1")
+        at1_adv, ts_a1 = v("Avancado_1S2")
+        at1_ts = max([t for t in (ts_r1, ts_a1) if t is not None], default=None)
+
+        # AT2 => S1 (recuado) e S2 (avançado)
+        at2_rec, ts_r2 = v("Recuado_2S1")
+        at2_adv, ts_a2 = v("Avancado_2S2")
+        at2_ts = max([t for t in (ts_r2, ts_a2) if t is not None], default=None)
+
+        def decide(bit_recuado: Optional[int], bit_avancado: Optional[int]) -> str:
+            if bit_recuado == 1 and bit_avancado == 0:
+                return "RECUADO"
+            if bit_avancado == 1 and bit_recuado == 0:
+                return "AVANÇADO"
+            return "DESCONHECIDO"
+
+        out = [
+            {
+                "actuator_id": 1,
+                "state": decide(at1_rec, at1_adv),
+                "ts": (dt_to_iso_utc(at1_ts) if at1_ts else None),
+                "recuado": at1_rec,
+                "avancado": at1_adv,
+            },
+            {
+                "actuator_id": 2,
+                "state": decide(at2_rec, at2_adv),
+                "ts": (dt_to_iso_utc(at2_ts) if at2_ts else None),
+                "recuado": at2_rec,
+                "avancado": at2_adv,
+            },
+        ]
         return {"actuators": out}
+
+    # mantém seu cache leve
     return cached("live_actuators_state", 0.5, _impl)
-
-
 def _clean_rms(values: List[float], max_g: float = 4.0) -> float:
     if not values:
         return 0.0
@@ -540,6 +676,94 @@ def _clean_rms(values: List[float], max_g: float = 4.0) -> float:
     if a.size == 0:
         return 0.0
     return float((a**2).mean() ** 0.5)
+
+class _Fsm(TypedDict, total=False):
+    baseline: str     # estado inicial corrente: "RECUADO" | "AVANÇADO" | None
+    seen_other: bool  # já vimos um estado != baseline desde a última vez
+    last: str         # último estado observado (para telemetria)
+    count: int        # ciclos acumulados
+    since_ts: float   # epoch de quando começamos a contar
+
+_cycle_fsm: Dict[int, _Fsm] = {
+    1: {"baseline": None, "seen_other": False, "last": "DESCONHECIDO", "count": 0, "since_ts": time.time()},
+    2: {"baseline": None, "seen_other": False, "last": "DESCONHECIDO", "count": 0, "since_ts": time.time()},
+}
+
+def _normalize_state(s: Optional[str]) -> str:
+    s2 = (s or "DESCONHECIDO").upper()
+    return s2 if s2 in ("RECUADO", "AVANÇADO") else "DESCONHECIDO"
+
+def _update_cycle_fsm_from_state(aid: int, logical_state_raw: str):
+    """
+    Regra:
+      - baseline é o estado 'inicial' atual (RECUADO ou AVANÇADO).
+      - Quando saímos do baseline (vemos o 'outro' estado), marcamos seen_other=True.
+      - Quando voltamos ao baseline e seen_other=True, incrementamos 1 ciclo e zeramos seen_other.
+      - Estados DESCONHECIDO não mudam baseline nem contam.
+    """
+    s = _normalize_state(logical_state_raw)
+    f = _cycle_fsm[aid]
+    f["last"] = s
+
+    if s == "DESCONHECIDO":
+        return  # ignora ruído/indefinição
+
+    # Se ainda não temos baseline e o estado é válido, define baseline
+    if f.get("baseline") is None:
+        f["baseline"] = s
+        f["seen_other"] = False
+        return
+
+    baseline = f.get("baseline")
+    if s == baseline:
+        # Voltou para o inicial: se já vimos 'outro', fechou ciclo
+        if f.get("seen_other", False):
+            f["count"] = int(f.get("count", 0)) + 1
+            f["seen_other"] = False
+        # baseline continua o mesmo
+    else:
+        # Está no 'outro' estado -> marca que houve movimento
+        f["seen_other"] = True
+        # Opcionalmente, poderíamos trocar baseline depois de longos períodos,
+        # mas pela sua definição, mantemos o baseline (estado inicial) fixo.
+        # Se quiser "aprender" novo baseline após X segundos, dá pra estender aqui.
+        return
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+@app.get("/api/live/cycles/total", tags=["Live Dashboard"])
+def live_cycles_total():
+    """
+    Total de ciclos desde que a API iniciou (contador em memória).
+    Conta um ciclo ao detectar: baseline(RECUADO|AVANÇADO) -> outro -> baseline.
+    """
+    def _impl():
+        states = live_actuators_state().get("actuators", [])
+        # Avança FSM de cada atuador usando o estado lógico atual
+        for it in states:
+            aid = int(it.get("actuator_id") or it.get("id"))
+            s = _normalize_state(it.get("state"))
+            if aid in (1, 2):
+                _update_cycle_fsm_from_state(aid, s)
+
+        out = []
+        total = 0
+        for aid in (1, 2):
+            f = _cycle_fsm[aid]
+            c = int(f.get("count", 0))
+            total += c
+            out.append({
+                "actuator_id": aid,
+                "cycles": c,
+                "baseline": f.get("baseline"),      # RECUADO | AVANÇADO | None
+                "last_state": f.get("last"),        # telemetria
+                "seen_other": f.get("seen_other"),  # telemetria
+                "since": dt_to_iso_utc(datetime.fromtimestamp(f.get("since_ts", time.time()), tz=timezone.utc)),
+            })
+        return {"total": total, "actuators": out, "ts": _now_iso()}
+
+    return cached("live_cycles_total", 0.3, _impl)  # refresh rapidinho
 
 
 @app.get("/api/live/cycles/rate", tags=["Live Dashboard"])
