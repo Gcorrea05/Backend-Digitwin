@@ -187,8 +187,12 @@ class OpcUaReader:
             self.client.set_user(OPCUA_USER)
             self.client.set_password(OPCUA_PASS)
         self.client.application_uri = "opcua-py-runner"
-        self.client.secure_channel_timeout = 60000
-        self.client.session_timeout = 60000
+        self.client.secure_channel_timeout = 600000  # 600s em ms
+        self.client.session_timeout = 600000
+        try:
+            self.client.set_keepalive(20000)  # 20s; ajuda a detectar quedas
+        except Exception:
+            pass
         self.client.connect()
     def disconnect(self):
         if self.client:

@@ -27,9 +27,37 @@ from .services.cycle import get_cycle_rate
 from .services.analytics_graphs import get_vibration_data
 from .database import get_db
 
+from dataclasses import dataclass
+from typing import Optional, List, Tuple
+from datetime import datetime, timezone
+from fastapi.responses import JSONResponse
+
+StableState = str  # "RECUADO" | "AVANÇADO"
+FaultState  = str  # "NONE" | "FAULT_TIMEOUT" | "FAULT_SENSORS_CONFLICT"
+
 # -----------------------------------------------------------------------------
 # Helpers gerais
 # -----------------------------------------------------------------------------
+
+@dataclass
+class _LatchCfg:
+    id: str
+    expected_ms: int
+    debounce_ms: int
+    timeout_factor: float
+    v_av: str      # nome da válvula que AVANÇA/ABRE
+    v_rec: str     # nome da válvula que RECUA/FECHA
+    s_adv: str     # sensor avançado
+    s_rec: str     # sensor recuado
+
+@dataclass
+class _LatchState:
+    displayed: StableState = "RECUADO"
+    pending_target: Optional[str] = None  # "AV"|"REC"|None
+    fault: FaultState = "NONE"
+    started_at: Optional[datetime] = None
+    elapsed_ms: int = 0
+
 def _coerce_to_datetime(value: Any) -> Optional[datetime]:
     """Aceita datetime | str | int/float (epoch) e devolve datetime tz-aware em UTC."""
     if value is None:
@@ -554,6 +582,105 @@ def mpu_history(
 def api_mpu_history(**kwargs):
     return mpu_history(**kwargs)
 
+# ------------------ LATCH: válvula define alvo, sensor confirma ------------------
+from dataclasses import dataclass
+from typing import Optional, List, Tuple
+from datetime import datetime
+
+StableState = str  # "RECUADO" | "AVANÇADO"
+FaultState  = str  # "NONE" | "FAULT_TIMEOUT" | "FAULT_SENSORS_CONFLICT"
+
+@dataclass
+class _LatchCfg:
+    id: str
+    expected_ms: int
+    debounce_ms: int
+    timeout_factor: float
+    v_av: str      # nome da válvula que AVANÇA/ABRE
+    v_rec: str     # nome da válvula que RECUA/FECHA
+    s_adv: str     # sensor avançado
+    s_rec: str     # sensor recuado
+
+@dataclass
+class _LatchState:
+    displayed: StableState = "RECUADO"
+    pending_target: Optional[str] = None  # "AV"|"REC"|None
+    fault: FaultState = "NONE"
+    started_at: Optional[datetime] = None
+    elapsed_ms: int = 0
+
+class _Deb:
+    __slots__ = ("v","t")
+    def __init__(self): self.v=False; self.t=datetime.min
+
+def _stable(prev:_Deb, now_v:bool, ts:datetime, debounce_ms:int):
+    if now_v != prev.v:
+        prev.v = now_v
+        prev.t = ts
+        return False, now_v
+    return ((ts - prev.t).total_seconds()*1000 >= debounce_ms), prev.v
+
+def _compute_latched_state(
+    cfg: _LatchCfg,
+    rows: List[Tuple[datetime,str,Optional[int]]],
+    initial_displayed: StableState = "RECUADO",
+) -> _LatchState:
+    st = _LatchState(displayed=initial_displayed)
+    rec = _Deb(); adv = _Deb()
+
+    for ts, name, vb in rows:
+        if vb is None:
+            continue
+        v = bool(vb)
+
+        # atualiza estabilidade dos sensores
+        if name == cfg.s_rec: _stable(rec, v, ts, cfg.debounce_ms)
+        if name == cfg.s_adv: _stable(adv, v, ts, cfg.debounce_ms)
+
+        rec_st, rec_val = _stable(rec, rec.v, ts, cfg.debounce_ms)
+        adv_st, adv_val = _stable(adv, adv.v, ts, cfg.debounce_ms)
+
+        # conflito de sensores (ambos true e estáveis)
+        if rec_st and adv_st and rec_val and adv_val:
+            st.fault = "FAULT_SENSORS_CONFLICT"
+
+        # comandos definem alvo
+        if name == cfg.v_av and v:
+            st.pending_target = "AV";  st.started_at = ts; st.fault = "NONE"
+        elif name == cfg.v_rec and v:
+            st.pending_target = "REC"; st.started_at = ts; st.fault = "NONE"
+
+        # sem pendência: derive pelo sensor estável
+        if not st.pending_target:
+            if rec_st and rec_val and not (adv_st and adv_val): st.displayed = "RECUADO"
+            elif adv_st and adv_val and not (rec_st and rec_val): st.displayed = "AVANÇADO"
+
+        # com pendência: confirma por sensor de destino
+        if st.pending_target:
+            if st.started_at:
+                st.elapsed_ms = int((ts - st.started_at).total_seconds()*1000)
+                if st.elapsed_ms > int(cfg.expected_ms * cfg.timeout_factor):
+                    st.fault = "FAULT_TIMEOUT"
+
+            if st.pending_target == "AV" and adv_st and adv_val:
+                st.displayed = "AVANCADO"; st.pending_target = None; st.started_at = None; st.elapsed_ms = 0; st.fault = "NONE"
+            elif st.pending_target == "REC" and rec_st and rec_val:
+                st.displayed = "RECUADO";  st.pending_target = None; st.started_at = None; st.elapsed_ms = 0; st.fault = "NONE"
+
+    return st
+
+# Configs com os TEUS nomes:
+_CFG_A1 = _LatchCfg(
+    id="A1", expected_ms=3000, debounce_ms=150, timeout_factor=1.5,
+    v_av="V1_12", v_rec="V1_14", s_adv="Avancado_1S2", s_rec="Recuado_1S1"
+)
+_CFG_A2 = _LatchCfg(
+    id="A2", expected_ms=2000, debounce_ms=150, timeout_factor=1.5,
+    v_av="V2_12", v_rec="V2_14", s_adv="Avancado_2S2", s_rec="Recuado_2S1"
+)
+_NAMES_LATCH = (_CFG_A1.v_av, _CFG_A1.v_rec, _CFG_A1.s_adv, _CFG_A1.s_rec,
+                _CFG_A2.v_av, _CFG_A2.v_rec, _CFG_A2.s_adv, _CFG_A2.s_rec)
+
 
 # -----------------------------------------------------------------------------
 # LIVE DASHBOARD (com cache curto)
@@ -592,90 +719,59 @@ def _fetch_last_bool_row(name: str):
         (name,),
     )
 
-
 @app.get("/api/live/actuators/state", tags=["Live Dashboard"])
-def live_actuators_state():
+def live_actuators_state(since_ms: int = 8000):
     def _impl():
-        # 1) pegar os 4 últimos valores em 1 query
+        # carrega eventos recentes apenas dos sinais relevantes
         rows = fetch_all(
             """
-            WITH latest AS (
-              SELECT name, value_bool, ts_utc,
-                     ROW_NUMBER() OVER (PARTITION BY name ORDER BY ts_utc DESC) AS rn
-              FROM opc_samples
-              WHERE name IN (
-                'Avancado_1S2','Recuado_1S1',
-                'Avancado_2S2','Recuado_2S1'
-              )
-            )
-            SELECT name, value_bool, ts_utc
-            FROM latest
-            WHERE rn = 1
-            """
+            SELECT ts_utc, name, value_bool
+            FROM opc_samples
+            WHERE name IN (%s,%s,%s,%s,%s,%s,%s,%s)
+              AND ts_utc >= NOW(6) - INTERVAL %s MICROSECOND
+            ORDER BY ts_utc ASC, id ASC
+            """,
+            (*_NAMES_LATCH, since_ms * 1000)
         )
+        # separa por atuador
+        a1_rows = [(r["ts_utc"] if isinstance(r,dict) else r[0],
+                    r["name"]   if isinstance(r,dict) else r[1],
+                    r["value_bool"] if isinstance(r,dict) else r[2])
+                   for r in rows if (r["name"] if isinstance(r,dict) else r[1]) in
+                   (_CFG_A1.v_av, _CFG_A1.v_rec, _CFG_A1.s_adv, _CFG_A1.s_rec)]
+        a2_rows = [(r["ts_utc"] if isinstance(r,dict) else r[0],
+                    r["name"]   if isinstance(r,dict) else r[1],
+                    r["value_bool"] if isinstance(r,dict) else r[2])
+                   for r in rows if (r["name"] if isinstance(r,dict) else r[1]) in
+                   (_CFG_A2.v_av, _CFG_A2.v_rec, _CFG_A2.s_adv, _CFG_A2.s_rec)]
 
-        # 2) organizar por nome
-        byname = { col(r, "name") or col(r, 0): r for r in rows }
+        st1 = _compute_latched_state(_CFG_A1, a1_rows, initial_displayed="RECUADO")
+        st2 = _compute_latched_state(_CFG_A2, a2_rows, initial_displayed="RECUADO")
 
-        def v(name: str) -> Tuple[Optional[int], Optional[datetime]]:
-            r = byname.get(name)
-            if not r:
-                return None, None
-            vb = col(r, "value_bool") if isinstance(r, dict) else r[1]
-            ts = col(r, "ts_utc") if isinstance(r, dict) else r[2]
-            return (None if vb is None else int(vb)), ts
+        return {
+            "ts": datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
+            "actuators": [
+                {
+                    "actuator_id": 1,
+                    "state": st1.displayed,          # "RECUADO" | "AVANÇADO"
+                    "pending": st1.pending_target,   # "AV" | "REC" | None
+                    "fault": st1.fault,
+                    "elapsed_ms": st1.elapsed_ms,
+                    "started_at": (st1.started_at.isoformat() if st1.started_at else None),
+                },
+                {
+                    "actuator_id": 2,
+                    "state": st2.displayed,
+                    "pending": st2.pending_target,
+                    "fault": st2.fault,
+                    "elapsed_ms": st2.elapsed_ms,
+                    "started_at": (st2.started_at.isoformat() if st2.started_at else None),
+                },
+            ]
+        }
 
-        # AT1 => S1 (recuado) e S2 (avançado)
-        at1_rec, ts_r1 = v("Recuado_1S1")
-        at1_adv, ts_a1 = v("Avancado_1S2")
-        at1_ts = max([t for t in (ts_r1, ts_a1) if t is not None], default=None)
-
-        # AT2 => S1 (recuado) e S2 (avançado)
-        at2_rec, ts_r2 = v("Recuado_2S1")
-        at2_adv, ts_a2 = v("Avancado_2S2")
-        at2_ts = max([t for t in (ts_r2, ts_a2) if t is not None], default=None)
-
-        def decide(bit_recuado: Optional[int], bit_avancado: Optional[int]) -> str:
-            if bit_recuado == 1 and bit_avancado == 0:
-                return "RECUADO"
-            if bit_avancado == 1 and bit_recuado == 0:
-                return "AVANÇADO"
-            return "DESCONHECIDO"
-
-        out = [
-            {
-                "actuator_id": 1,
-                "state": decide(at1_rec, at1_adv),
-                "ts": (dt_to_iso_utc(at1_ts) if at1_ts else None),
-                "recuado": at1_rec,
-                "avancado": at1_adv,
-            },
-            {
-                "actuator_id": 2,
-                "state": decide(at2_rec, at2_adv),
-                "ts": (dt_to_iso_utc(at2_ts) if at2_ts else None),
-                "recuado": at2_rec,
-                "avancado": at2_adv,
-            },
-        ]
-        return {"actuators": out}
-
-    # mantém seu cache leve
-    return cached("live_actuators_state", 0.5, _impl)
-def _clean_rms(values: List[float], max_g: float = 4.0) -> float:
-    if not values:
-        return 0.0
-    a = np.array(values, dtype=float)
-    a = a[np.isfinite(a)]
-    if a.size == 0:
-        return 0.0
-    a = a[np.abs(a) <= max_g]
-    if a.size == 0:
-        return 0.0
-    a = a - np.median(a)
-    if a.size == 0:
-        return 0.0
-    return float((a**2).mean() ** 0.5)
+    # cache leve (igual ao teu padrão)
+    return cached("live_actuators_state_latched", 0.25, _impl)
 
 class _Fsm(TypedDict, total=False):
     baseline: str     # estado inicial corrente: "RECUADO" | "AVANÇADO" | None
@@ -763,7 +859,7 @@ def live_cycles_total():
             })
         return {"total": total, "actuators": out, "ts": _now_iso()}
 
-    return cached("live_cycles_total", 0.3, _impl)  # refresh rapidinho
+    return cached("live_cycles_total", 0.05, _impl)  # refresh rapidinho
 
 
 @app.get("/api/live/cycles/rate", tags=["Live Dashboard"])
@@ -835,7 +931,7 @@ def live_vibration(window_s: int = Query(2, ge=1, le=60)):
                 "overall": overall,
             })
         return {"items": items}
-    return cached(f"live_vibration:{window_s}", 0.5, _impl)
+    return cached(f"live_vibration:{window_s}", 0.05, _impl)
 
 
 # -----------------------------------------------------------------------------
@@ -1019,3 +1115,4 @@ def http_snapshot():
         snap.update({"system": {"components": {}}})
 
     return {"type": "snapshot", **snap}
+
