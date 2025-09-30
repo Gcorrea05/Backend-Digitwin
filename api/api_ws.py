@@ -807,3 +807,12 @@ def metrics_minute_agg(act: str = Query("A1"), since: str = Query("-60m")):
         return []
     except Exception:
         return []
+
+# --- ADD: router Simulation ---------------------------------------------------
+try:
+    from .routes import simulation  # novo arquivo abaixo
+    app.include_router(simulation.router)
+except Exception as e:
+    print(f"[simulation] router não carregado: {e}")
+# -----------------------------------------------------------------------------
+
