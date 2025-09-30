@@ -7,7 +7,7 @@ __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
-
+*.pyc
 # --- Logs e temporários ---
 *.log
 *.pid
