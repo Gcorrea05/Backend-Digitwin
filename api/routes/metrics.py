@@ -104,8 +104,6 @@ def _reconstruct_cycles(s1: List[Dict[str, Any]], s2: List[Dict[str, Any]],
                 cycle_start = ts
         elif kind == "OPEN_END" and open_start:
             t_open = (ts - open_start).total_seconds() * 1000.0
-            # aguarda fechamento pra formar ciclo completo
-            # guardamos parcial no dict e finalizamos no close_end
             cycles.append({"open_start": open_start, "open_end": ts,
                            "t_open_ms": t_open, "close_start": None,
                            "close_end": None, "t_close_ms": None,
@@ -117,7 +115,6 @@ def _reconstruct_cycles(s1: List[Dict[str, Any]], s2: List[Dict[str, Any]],
                 cycle_start = ts
         elif kind == "CLOSE_END" and close_start:
             t_close = (ts - close_start).total_seconds() * 1000.0
-            # fecho o último item aberto (se houver)
             target = None
             for c in reversed(cycles):
                 if c["close_end"] is None:
@@ -130,7 +127,6 @@ def _reconstruct_cycles(s1: List[Dict[str, Any]], s2: List[Dict[str, Any]],
             target["close_start"] = close_start
             target["close_end"] = ts
             target["t_close_ms"] = t_close
-            # ciclo finaliza ao voltar pro S1=1
             target["ts_end"] = ts
             if target["ts_start"] and target["ts_end"]:
                 target["t_cycle_ms"] = (target["ts_end"] - target["ts_start"]).total_seconds() * 1000.0
@@ -139,7 +135,6 @@ def _reconstruct_cycles(s1: List[Dict[str, Any]], s2: List[Dict[str, Any]],
 
     # filtra só ciclos completos
     return [c for c in cycles if c.get("t_open_ms") is not None and c.get("t_close_ms") is not None and c.get("t_cycle_ms") is not None]
-# routes/metrics.py (continuação)
 
 def _group_minute(cycles: List[Dict[str, Any]]) -> Dict[datetime, Dict[str, Any]]:
     agg = {}
@@ -154,7 +149,7 @@ def _group_minute(cycles: List[Dict[str, Any]]) -> Dict[datetime, Dict[str, Any]
         a["t_open_ms_sum"] += c["t_open_ms"]; a["t_open_n"] += 1
         a["t_close_ms_sum"] += c["t_close_ms"]; a["t_close_n"] += 1
         a["t_cycle_ms_sum"] += c["t_cycle_ms"]; a["t_cycle_n"] += 1
-        a["runtime_s"] += (c["t_open_ms"] + c["t_close_ms"]) / 1000.0  # runtime ~ tempo em movimento
+        a["runtime_s"] += (c["t_open_ms"] + c["t_close_ms"]) / 1000.0
         a["cpm"] += 1
     return agg
 
@@ -164,7 +159,6 @@ def _fetch_mpu_minute_avg(act: str, since_dt: datetime) -> Dict[datetime, float]
     Adapte o ID conforme seu mapeamento: 'MPUA1' / 'MPUA2', etc.
     """
     mpu_id = f"MPU{act}"  # ex.: A1 -> MPUA1
-    # Supondo tabela mpu_samples(id, ts_utc, ax, ay, az, ...)
     sql = """
       SELECT ts_utc, az
       FROM mpu_samples
@@ -182,6 +176,38 @@ def _fetch_mpu_minute_avg(act: str, since_dt: datetime) -> Dict[datetime, float]
     return {k: (v["sum"] / v["n"]) for k, v in out.items() if v["n"] > 0}
 # routes/metrics.py (final)
 
+def _compute_minute_agg(act: str, since: str) -> List[Dict[str, Any]]:
+    """
+    Helper reutilizável: devolve a lista 'minute-agg' completa
+    (minute, t_*_ms_avg, runtime_s, cpm, vib_avg).
+    """
+    if act not in SIGNALS:
+        raise HTTPException(400, "act inválido (A1|A2).")
+    since_dt = datetime.now(timezone.utc) - _parse_since(since)
+
+    s1 = _fetch_signal(SIGNALS[act]["S1"], since_dt)
+    s2 = _fetch_signal(SIGNALS[act]["S2"], since_dt)
+    cycles = _reconstruct_cycles(s1, s2)
+
+    agg = _group_minute(cycles)
+    vib = _fetch_mpu_minute_avg(act, since_dt)
+
+    keys = sorted(set(agg.keys()) | set(vib.keys()))
+    out: List[Dict[str, Any]] = []
+    for k in keys:
+        a = agg.get(k, {})
+        v_avg = vib.get(k)
+        out.append({
+            "minute": k.isoformat(),
+            "t_open_ms_avg": (a.get("t_open_ms_sum", 0.0) / a.get("t_open_n", 1)) if a else None,
+            "t_close_ms_avg": (a.get("t_close_ms_sum", 0.0) / a.get("t_close_n", 1)) if a else None,
+            "t_cycle_ms_avg": (a.get("t_cycle_ms_sum", 0.0) / a.get("t_cycle_n", 1)) if a else None,
+            "runtime_s": a.get("runtime_s", 0.0) if a else 0.0,
+            "cpm": a.get("cpm", 0) if a else 0,
+            "vib_avg": v_avg,
+        })
+    return out
+
 @router.get("/cycles")
 def get_cycles(act: str = Query(..., pattern="^(A1|A2)$"),
                since: str = Query("-2h"),
@@ -193,7 +219,6 @@ def get_cycles(act: str = Query(..., pattern="^(A1|A2)$"),
     s1 = _fetch_signal(SIGNALS[act]["S1"], since_dt)
     s2 = _fetch_signal(SIGNALS[act]["S2"], since_dt)
 
-    # válvulas são opcionais; se não existem, ignore
     try:
         v_open = _fetch_signal(SIGNALS[act]["V_AVANCO"], since_dt)
     except Exception:
@@ -209,30 +234,18 @@ def get_cycles(act: str = Query(..., pattern="^(A1|A2)$"),
 @router.get("/minute-agg")
 def get_minute_agg(act: str = Query(..., pattern="^(A1|A2)$"),
                    since: str = Query("-2h")):
-    if act not in SIGNALS:
-        raise HTTPException(400, "act inválido (A1|A2).")
-    since_dt = datetime.now(timezone.utc) - _parse_since(since)
+    # mantém compat: retorna LISTA (sem wrapper)
+    return _compute_minute_agg(act=act, since=since)
 
-    s1 = _fetch_signal(SIGNALS[act]["S1"], since_dt)
-    s2 = _fetch_signal(SIGNALS[act]["S2"], since_dt)
-    cycles = _reconstruct_cycles(s1, s2)
-
-    agg = _group_minute(cycles)
-    vib = _fetch_mpu_minute_avg(act, since_dt)
-
-    # monta saída alinhada no tempo
-    keys = sorted(set(agg.keys()) | set(vib.keys()))
-    out = []
-    for k in keys:
-        a = agg.get(k, {})
-        v_avg = vib.get(k)
-        out.append({
-            "minute": k.isoformat(),
-            "t_open_ms_avg": (a.get("t_open_ms_sum", 0.0) / a.get("t_open_n", 1)) if a else None,
-            "t_close_ms_avg": (a.get("t_close_ms_sum", 0.0) / a.get("t_close_n", 1)) if a else None,
-            "t_cycle_ms_avg": (a.get("t_cycle_ms_sum", 0.0) / a.get("t_cycle_n", 1)) if a else None,
-            "runtime_s": a.get("runtime_s", 0.0) if a else 0.0,
-            "cpm": a.get("cpm", 0) if a else 0,
-            "vib_avg": v_avg,
-        })
-    return out
+@router.get("/cpm-runtime-minute")
+def get_cpm_runtime_minute(act: str = Query(..., pattern="^(A1|A2)$"),
+                           since: str = Query("-2h")) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Série por minuto contendo somente CPM e Runtime para o atuador.
+    Retorna {"data":[{"minute": ISO, "cpm": n, "runtime_s": n}]}
+    """
+    rows = _compute_minute_agg(act=act, since=since)
+    out = [{"minute": r["minute"], "cpm": r.get("cpm"), "runtime_s": r.get("runtime_s")} for r in rows]
+    # garante ordenação crescente por minute
+    out.sort(key=lambda x: x["minute"])
+    return {"data": out}
