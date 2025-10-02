@@ -326,14 +326,29 @@ def _compute_latched_state(
                 st.displayed = "RECUADO";  st.pending_target = None; st.started_at = None; st.elapsed_ms = 0; st.fault = "NONE"
     return st
 
+# --- Latch config (corrigido: V*_14 = AVANÇAR, V*_12 = RECUAR) ----------------
 _CFG_A1 = _LatchCfg(
-    id="A1", expected_ms=3000, debounce_ms=80, timeout_factor=1.5,
-    v_av="V1_12", v_rec="V1_14", s_adv="Avancado_1S2", s_rec="Recuado_1S1"
+    id="A1",
+    expected_ms=1500,
+    debounce_ms=80,
+    timeout_factor=1.5,
+    v_av="V1_14",             # <-- era V1_12; AGORA correto: abrir/avançar
+    v_rec="V1_12",            # <-- era V1_14; AGORA correto: fechar/recuar
+    s_adv="Recuado_1S1",
+    s_rec="Avancado_1S2",
 )
+
 _CFG_A2 = _LatchCfg(
-    id="A2", expected_ms=500, debounce_ms=80, timeout_factor=1.5,
-    v_av="V2_12", v_rec="V2_14", s_adv="Avancado_2S2", s_rec="Recuado_2S1"
+    id="A2",
+    expected_ms=500,
+    debounce_ms=80,
+    timeout_factor=1.5,
+    v_av="V2_14",             # <-- era V2_12
+    v_rec="V2_12",            # <-- era V2_14
+    s_adv="Recuado_2S1",
+    s_rec="Avancado_2S2",
 )
+
 _NAMES_LATCH = (_CFG_A1.v_av, _CFG_A1.v_rec, _CFG_A1.s_adv, _CFG_A1.s_rec,
                 _CFG_A2.v_av, _CFG_A2.v_rec, _CFG_A2.s_adv, _CFG_A2.s_rec)
 
@@ -807,3 +822,20 @@ def metrics_minute_agg(act: str = Query("A1"), since: str = Query("-60m")):
         return []
     except Exception:
         return []
+
+# --- ADD: router Simulation ---------------------------------------------------
+try:
+    from .routes import simulation  # novo arquivo abaixo
+    app.include_router(simulation.router)
+except Exception as e:
+    print(f"[simulation] router não carregado: {e}")
+# -----------------------------------------------------------------------------
+
+# --- ADD: router Alerts -------------------------------------------------------
+try:
+    from .routes import alerts as alerts_route
+    app.include_router(alerts_route.router)
+except Exception as e:
+    print(f"[alerts] router não carregado: {e}")
+# -----------------------------------------------------------------------------
+

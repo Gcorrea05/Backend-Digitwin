@@ -7,7 +7,7 @@ __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
-
+*.pyc
 # --- Logs e temporários ---
 *.log
 *.pid
@@ -38,3 +38,14 @@ build/
 .DS_Store
 Thumbs.db
 desktop.ini
+__pycache__/
+*.pyc
+git/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Python cache
+__pycache__/
+*.pyc
