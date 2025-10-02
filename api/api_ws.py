@@ -4,6 +4,7 @@ import re
 import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Any, Dict, Tuple
+from dataclasses import dataclass
 
 from dotenv import load_dotenv, find_dotenv
 from fastapi import FastAPI, Query, HTTPException, Request
@@ -20,7 +21,7 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 # -----------------------------------------------------------------------------
 # FastAPI + CORS
 # -----------------------------------------------------------------------------
-app = FastAPI(title="Festo DT API (HTTP only)", version="3.0.0")
+app = FastAPI(title="Festo DT API (HTTP only)", version="3.1.0")
 
 ALLOWED_ORIGINS = [
     o.strip()
@@ -245,10 +246,8 @@ def _coerce_facet_from_path(facet_raw: str) -> str:
     return s
 
 # -----------------------------------------------------------------------------
-# Latch config (nomes reais dos teus sinais)
+# Latch config (mantidas EXATAMENTE como você pediu)
 # -----------------------------------------------------------------------------
-from dataclasses import dataclass
-
 StableState = str  # "RECUADO" | "AVANÇADO"
 
 @dataclass
@@ -326,14 +325,14 @@ def _compute_latched_state(
                 st.displayed = "RECUADO";  st.pending_target = None; st.started_at = None; st.elapsed_ms = 0; st.fault = "NONE"
     return st
 
-# --- Latch config (corrigido: V*_14 = AVANÇAR, V*_12 = RECUAR) ----------------
+# --- Latch config (mantido EXATAMENTE como tinha) -----------------------------
 _CFG_A1 = _LatchCfg(
     id="A1",
     expected_ms=1500,
     debounce_ms=80,
     timeout_factor=1.5,
-    v_av="V1_14",             # <-- era V1_12; AGORA correto: abrir/avançar
-    v_rec="V1_12",            # <-- era V1_14; AGORA correto: fechar/recuar
+    v_av="V1_14",
+    v_rec="V1_12",
     s_adv="Recuado_1S1",
     s_rec="Avancado_1S2",
 )
@@ -343,8 +342,8 @@ _CFG_A2 = _LatchCfg(
     expected_ms=500,
     debounce_ms=80,
     timeout_factor=1.5,
-    v_av="V2_14",             # <-- era V2_12
-    v_rec="V2_12",            # <-- era V2_14
+    v_av="V2_14",
+    v_rec="V2_12",
     s_adv="Recuado_2S1",
     s_rec="Avancado_2S2",
 )
@@ -358,32 +357,21 @@ def _now_iso() -> str:
 def _fetch_latest_rows(names: Tuple[str, ...]) -> Dict[str, Dict[str, Any]]:
     if not names:
         return {}
+
     placeholders = ", ".join(["%s"] * len(names))
-    try:
-        sql = f"""
-        WITH latest AS (
-          SELECT name, value_bool, ts_utc,
-                 ROW_NUMBER() OVER (PARTITION BY name ORDER BY ts_utc DESC) AS rn
-          FROM opc_samples
-          WHERE name IN ({placeholders})
-        )
-        SELECT name, value_bool, ts_utc
-        FROM latest
-        WHERE rn = 1
-        """
-        rows = fetch_all(sql, names)
-    except Exception:
-        sql = f"""
+    # Se criar o índice abaixo, você pode forçar o uso dele:
+    # FORCE INDEX (idx_opc_name_ts)
+    sql = f"""
         SELECT s.name, s.value_bool, s.ts_utc
-        FROM opc_samples s
+        FROM opc_samples s /* FORCE INDEX (idx_opc_name_ts) */
         JOIN (
             SELECT name, MAX(ts_utc) AS ts_utc
             FROM opc_samples
             WHERE name IN ({placeholders})
             GROUP BY name
         ) m ON m.name = s.name AND m.ts_utc = s.ts_utc
-        """
-        rows = fetch_all(sql, names)
+    """
+    rows = fetch_all(sql, names)
 
     out: Dict[str, Dict[str, Any]] = {}
     for r in rows:
@@ -449,6 +437,130 @@ def _infer_state_from_latest(cfg: _LatchCfg, latest: Dict[str, Dict[str, Any]]):
         "elapsed_ms": elapsed_ms,
         "started_at": (started_at.isoformat() if started_at else None),
     }
+
+# =========================
+# Séries S1/S2 (helpers)
+# =========================
+OPC_TABLE = os.getenv("OPC_TABLE", "opc_samples")
+
+def _fetch_series(names: List[str], window_s: int) -> Dict[str, List[Tuple[datetime,int]]]:
+    if not names:
+        return {}
+    placeholders = ", ".join(["%s"] * len(names))
+    sql = f"""
+        SELECT name, ts_utc, value_bool
+        FROM {OPC_TABLE}
+        WHERE name IN ({placeholders})
+          AND ts_utc >= NOW(6) - INTERVAL %s SECOND
+        ORDER BY ts_utc ASC
+    """
+    rows = fetch_all(sql, (*names, window_s))
+    out: Dict[str, List[Tuple[datetime,int]]] = {str(n): [] for n in names}
+    for r in rows:
+        nm = str(col(r, "name") or r[0])
+        ts_raw = col(r, "ts_utc") or r[1]
+        vb_raw = col(r, "value_bool") if isinstance(r, dict) else r[2]
+
+        dt = _coerce_to_datetime(ts_raw)
+        if dt is None:
+            continue  # ignora ts inválido
+
+        if vb_raw is None:
+            continue
+        try:
+            v = 1 if int(vb_raw) else 0
+        except Exception:
+            v = 1 if bool(vb_raw) else 0
+
+        out[nm].append((dt, v))
+    return out
+
+def _dedup(seq: List[Tuple[datetime,int]]) -> List[Tuple[datetime,int]]:
+    if not seq:
+        return []
+    out = [seq[0]]
+    for t, v in seq[1:]:
+        if v != out[-1][1]:
+            out.append((t, v))
+    return out
+
+def _derive_open_closed_from_S1S2(
+    s1: List[Tuple[datetime,int]],
+    s2: List[Tuple[datetime,int]],
+) -> Tuple[List[Tuple[datetime,int]], List[Tuple[datetime,int]]]:
+    """
+    MESMA regra do Dashboard:
+    ABERTO quando S1=0 & S2=1; FECHADO quando S1=1 & S2=0; senão mantém o último.
+    Retorna (ABERTO[], FECHADO[]) com dedup por valor.
+    """
+    if not s1 and not s2:
+        return [], []
+
+    times = sorted({t for t,_ in s1} | {t for t,_ in s2})
+    if not times:
+        return [], []
+
+    def val_at(seq: List[Tuple[datetime,int]], t: datetime) -> int:
+        # último valor <= t (busca binária simples)
+        if not seq:
+            return 0
+        lo, hi = 0, len(seq) - 1
+        last = seq[0][1]
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if seq[mid][0] <= t:
+                last = seq[mid][1]
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return last
+
+    opened: List[Tuple[datetime,int]] = []
+    closed: List[Tuple[datetime,int]] = []
+    prev_open: Optional[int] = None
+
+    for t in times:
+        v1 = val_at(s1, t)
+        v2 = val_at(s2, t)
+        if v1 == 0 and v2 == 1:
+            cur_open, cur_close = 1, 0
+            prev_open = 1
+        elif v1 == 1 and v2 == 0:
+            cur_open, cur_close = 0, 1
+            prev_open = 0
+        else:
+            if prev_open is None:
+                cur_open, cur_close = 0, 0
+            else:
+                cur_open = 1 if prev_open == 1 else 0
+                cur_close = 0 if prev_open == 1 else 1
+        opened.append((t, cur_open))
+        closed.append((t, cur_close))
+
+    return _dedup(opened), _dedup(closed)
+
+def _rising_edges(seq: List[Tuple[datetime,int]]) -> List[datetime]:
+    edges: List[datetime] = []
+    for i in range(1, len(seq)):
+        if seq[i-1][1] == 0 and seq[i][1] == 1:
+            edges.append(seq[i][0])
+    return edges
+
+def _last_pulse_duration(seq: List[Tuple[datetime,int]]) -> Optional[float]:
+    """Duração do último 1...0 (segundos). Se termina em 1, conta até agora."""
+    if not seq: return None
+    last_on = None; last_pulse = None
+    for i in range(1, len(seq)):
+        if seq[i-1][1]==0 and seq[i][1]==1:
+            last_on = seq[i][0]
+        if seq[i-1][1]==1 and seq[i][1]==0 and last_on:
+            last_pulse = (last_on, seq[i][0])
+    if last_pulse:
+        t_on, t_off = last_pulse
+        return (t_off - t_on).total_seconds()
+    if seq[-1][1]==1 and last_on:
+        return (datetime.now(timezone.utc) - last_on).total_seconds()
+    return None
 
 # -----------------------------------------------------------------------------
 # Health
@@ -533,7 +645,6 @@ def opc_history(
                        else int(col(r, "value_bool") if isinstance(r, dict) else r[1])),
     } for r in rows]
 
-    # retorna como objeto com items (teu front também aceita esse shape)
     return {"name": name, "count": len(items), "items": items}
 
 @app.get("/opc/history/{act}/{facet}")
@@ -605,9 +716,9 @@ def mpu_history(
     items = []
     for r in rows:
         items.append({
-            "ts_utc": dt_to_iso_utc(r["ts_utc"]),
-            "ax_g": r["ax_g"], "ay_g": r["ay_g"], "az_g": r["az_g"],
-            "gx_dps": r["gx_dps"], "gy_dps": r["gy_dps"], "gz_dps": r["gz_dps"],
+            "ts_utc": dt_to_iso_utc(col(r, "ts_utc") or col(r, 0)),
+            "ax_g": col(r, "ax_g"), "ay_g": col(r, "ay_g"), "az_g": col(r, "az_g"),
+            "gx_dps": col(r, "gx_dps"), "gy_dps": col(r, "gy_dps"), "gz_dps": col(r, "gz_dps"),
         })
     return {"id": ("MPUA1" if mid == 1 else "MPUA2"), "count": len(items), "items": items}
 
@@ -668,17 +779,36 @@ def _live_actuators_state_data_fast() -> Dict[str, Any]:
         ]
     }
 
-@app.get("/api/live/actuators/state", tags=["Live"])
-def live_actuators_state(since_ms: int = 12000):
-    # caminho rápido (último por nome)
+# --- NOVO endpoint estável para Monitoring (não conflita com o antigo) -------
+@app.get("/api/live/actuators/state-mon", tags=["Live"])
+def live_actuators_state_mon(since_ms: int = 12000):
+    """
+    Endpoint dedicado para a aba Monitoring. Não altera /api/live/actuators/state.
+    """
     try:
         data = _live_actuators_state_data_fast()
-        return JSONResponse(content=data, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
     except Exception:
-        # fallback por janela curta
         data = _live_actuators_state_data_window(since_ms)
-        return JSONResponse(content=data, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
+    return JSONResponse(content=data, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
 
+# --- Aliases opcionais (mantidos, se quiser usar) -----------------------------
+@app.get("/live/actuators/state", tags=["Live"])
+def live_actuators_state_alias1(since_ms: int = 12000):
+    try:
+        data = _live_actuators_state_data_fast()
+    except Exception:
+        data = _live_actuators_state_data_window(since_ms)
+    return JSONResponse(content=data, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
+
+@app.get("/api/live/actuators/state2", tags=["Live"])
+def live_actuators_state_alias2(since_ms: int = 12000):
+    try:
+        data = _live_actuators_state_data_fast()
+    except Exception:
+        data = _live_actuators_state_data_window(since_ms)
+    return JSONResponse(content=data, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
+
+# --- Cycles total (FSM leve, compat) -----------------------------------------
 _cycle_fsm: Dict[int, Dict[str, Any]] = {
     1: {"baseline": None, "last": None, "seen_other": False, "count": 0, "since_ts": time.time()},
     2: {"baseline": None, "last": None, "seen_other": False, "count": 0, "since_ts": time.time()},
@@ -734,6 +864,7 @@ def live_cycles_total():
         return {"total": total, "actuators": out, "ts": _now_iso()}
     return cached("live_cycles_total", 0.05, _impl)
 
+# --- Vibration (janela curta) -------------------------------------------------
 @app.get("/api/live/vibration", tags=["Live"])
 def live_vibration(window_s: int = Query(2, ge=1, le=60)):
     def _impl():
@@ -775,33 +906,80 @@ def live_vibration(window_s: int = Query(2, ge=1, le=60)):
         return {"items": items}
     return cached(f"live_vibration:{window_s}", 0.05, _impl)
 
-@app.get("/api/live/actuators/timings", tags=["Live"])
-def live_actuator_timings():
-    DB_NAME = os.getenv("MYSQL_DB") or os.getenv("DB_NAME") or ""
-    def last_from_table(tname: str):
-        if not DB_NAME or not table_exists(DB_NAME, tname):
-            return None
-        row = fetch_one(
-            f"""
-            SELECT ts_utc AS ts_utc, dt_abre_s AS dt_abre_s, dt_fecha_s AS dt_fecha_s, dt_ciclo_s AS dt_ciclo_s
-            FROM {tname}
-            ORDER BY ts_utc DESC
-            LIMIT 1
-            """
-        )
-        if not row: return None
-        return {
-            "ts_utc": dt_to_iso_utc(col(row, "ts_utc") or col(row, 0)),
-            "dt_abre_s": col(row, "dt_abre_s"),
-            "dt_fecha_s": col(row, "dt_fecha_s"),
-            "dt_ciclo_s": col(row, "dt_ciclo_s"),
+# --- CPM por janela (S1/S2) ---------------------------------------------------
+@app.get("/api/live/actuators/cpm", tags=["Live"])
+def live_actuators_cpm(window_s: int = Query(60, ge=10, le=600)):
+    try:
+        s_map = {
+            1: {"S1": _CFG_A1.s_adv, "S2": _CFG_A1.s_rec},  # atenção: nomes conforme config atual
+            2: {"S1": _CFG_A2.s_adv, "S2": _CFG_A2.s_rec},
         }
-    out = []
-    r1 = last_from_table("cycles_atuador1")
-    out.append({"actuator_id": 1, "last": (r1 or {"ts_utc": None, "dt_abre_s": None, "dt_fecha_s": None, "dt_ciclo_s": None})})
-    r2 = last_from_table("cycles_atuador2")
-    out.append({"actuator_id": 2, "last": (r2 or {"ts_utc": None, "dt_abre_s": None, "dt_fecha_s": None, "dt_ciclo_s": None})})
-    return {"actuators": out}
+        names = [v for m in s_map.values() for v in (m["S1"], m["S2"])]
+        raw = _fetch_series(names, window_s)
+        compact = {k: _dedup(v) for k, v in raw.items()}
+
+        out = []
+        for aid, m in s_map.items():
+            s1 = compact.get(m["S1"], [])
+            s2 = compact.get(m["S2"], [])
+            opened, closed = _derive_open_closed_from_S1S2(s1, s2)
+            e_open  = _rising_edges(opened)
+            e_close = _rising_edges(closed)
+            cycles = min(len(e_open), len(e_close))
+            cpm = cycles * (60.0 / float(window_s)) if window_s > 0 else 0.0
+            out.append({"id": aid, "window_s": window_s, "cycles": cycles, "cpm": cpm})
+
+        return {"actuators": out, "ts": _now_iso()}
+    except Exception as e:
+        return JSONResponse(
+            status_code=200,
+            content={"actuators": [{"id": 1, "window_s": window_s, "cycles": 0, "cpm": 0.0},
+                                   {"id": 2, "window_s": window_s, "cycles": 0, "cpm": 0.0}],
+                     "ts": _now_iso(), "error": str(e)[:200]},
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
+
+# --- Timings via S1/S2 (sem tabelas auxiliares) -------------------------------
+@app.get("/api/live/actuators/timings", tags=["Live"])
+def live_actuator_timings(window_s: int = Query(600, ge=60, le=3600)):
+    try:
+        s_map = {
+            1: {"S1": _CFG_A1.s_adv, "S2": _CFG_A1.s_rec},
+            2: {"S1": _CFG_A2.s_adv, "S2": _CFG_A2.s_rec},
+        }
+        names = [v for m in s_map.values() for v in (m["S1"], m["S2"])]
+        raw = _fetch_series(names, window_s)
+        compact = {k: _dedup(v) for k, v in raw.items()}
+
+        out = []
+        for aid, m in s_map.items():
+            s1 = compact.get(m["S1"], [])
+            s2 = compact.get(m["S2"], [])
+            opened, closed = _derive_open_closed_from_S1S2(s1, s2)
+            t_abre  = _last_pulse_duration(opened)
+            t_fecha = _last_pulse_duration(closed)
+            t_ciclo = (t_abre or 0.0) + (t_fecha or 0.0) if (t_abre or t_fecha) else None
+
+            out.append({
+                "actuator_id": aid,
+                "last": {
+                    "ts_utc": None,
+                    "dt_abre_s":  t_abre,
+                    "dt_fecha_s": t_fecha,
+                    "dt_ciclo_s": t_ciclo,
+                }
+            })
+        return {"actuators": out, "ts": _now_iso()}
+    except Exception as e:
+        safe = [
+            {"actuator_id": 1, "last": {"ts_utc": None, "dt_abre_s": None, "dt_fecha_s": None, "dt_ciclo_s": None}},
+            {"actuator_id": 2, "last": {"ts_utc": None, "dt_abre_s": None, "dt_fecha_s": None, "dt_ciclo_s": None}},
+        ]
+        return JSONResponse(
+            status_code=200,
+            content={"actuators": safe, "ts": _now_iso(), "error": str(e)[:200]},
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
 
 # -----------------------------------------------------------------------------
 # Analytics: minuto agregado (CPM/tempos/runtime)
@@ -814,7 +992,6 @@ def metrics_minute_agg(act: str = Query("A1"), since: str = Query("-60m")):
     try:
         data = get_kpis() or {}
         items = data.get("minute_agg", [])
-        # se vier no shape {"items":[...]} ou outro, normaliza
         if isinstance(items, dict) and "items" in items:
             items = items["items"]
         if isinstance(items, list):
@@ -823,25 +1000,28 @@ def metrics_minute_agg(act: str = Query("A1"), since: str = Query("-60m")):
     except Exception:
         return []
 
-# --- ADD: router Simulation ---------------------------------------------------
+# --- routers adicionais (se existirem) ---------------------------------------
 try:
-    from .routes import simulation  # novo arquivo abaixo
+    from .routes import simulation  # opcional
     app.include_router(simulation.router)
 except Exception as e:
     print(f"[simulation] router não carregado: {e}")
-# -----------------------------------------------------------------------------
 
-# --- ADD: router Alerts -------------------------------------------------------
 try:
-    from .routes import alerts as alerts_route
+    from .routes import alerts as alerts_route  # opcional
     app.include_router(alerts_route.router)
 except Exception as e:
     print(f"[alerts] router não carregado: {e}")
-# -----------------------------------------------------------------------------
 
-try:
-    from .routes import metrics as metrics_route
-    app.include_router(metrics_route.router)  # expõe /metrics/...
-    print("[ok] router /metrics montado")
-except Exception as e:
-    print(f"[warn] router /metrics não montado: {e}")
+# --- RESTAURA rota clássica usada pelo Dashboard ------------------------------
+@app.get("/api/live/actuators/state", tags=["Live"])
+def live_actuators_state(since_ms: int = 12000):
+    """
+    Compatibilidade: rota clássica usada pelo Dashboard/LiveContext.
+    Tenta caminho rápido (últimos por nome) e cai para janela se necessário.
+    """
+    try:
+        data = _live_actuators_state_data_fast()
+    except Exception:
+        data = _live_actuators_state_data_window(since_ms)
+    return JSONResponse(content=data, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
