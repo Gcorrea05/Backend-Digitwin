@@ -170,6 +170,9 @@ def dt_to_iso_utc(value: Any) -> Optional[str]:
 # -----------------------------------------------------------------------------
 # Cache curtinho
 # -----------------------------------------------------------------------------
+PROCESS_STARTED_MS = int(time.time() * 1000)  # instante em que o processo subiu (epoch ms)
+
+
 _cache: Dict[str, Dict[str, Any]] = {}
 def cached(key: str, ttl: float, producer):
     now = time.time()
@@ -567,9 +570,25 @@ def _last_pulse_duration(seq: List[Tuple[datetime,int]]) -> Optional[float]:
 # -----------------------------------------------------------------------------
 @app.get("/health")
 def health():
+    # DB time (igual você já fazia)
     row = fetch_one("SELECT NOW(6) AS now6")
     db_time_val = first_col(row) if row is not None else None
-    return {"status": "ok", "db_time": (str(db_time_val) if db_time_val is not None else None)}
+
+    # runtime e started_at do processo
+    now_ms = int(time.time() * 1000)
+    runtime_ms = now_ms - PROCESS_STARTED_MS
+    started_at_iso = datetime.fromtimestamp(PROCESS_STARTED_MS / 1000, tz=timezone.utc).isoformat()
+
+    # (opcional) horário do servidor para comparação
+    server_time_iso = datetime.now(tz=timezone.utc).isoformat()
+
+    return {
+        "status": "ok",
+        "runtime_ms": runtime_ms,                     # <- o front usa isso direto
+        "started_at": started_at_iso,                 # <- fallback/telemetria
+        "server_time": server_time_iso,               # opcional
+        "db_time": str(db_time_val) if db_time_val is not None else None,
+    }
 
 @app.get("/api/health")
 def api_health():
