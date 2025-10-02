@@ -839,3 +839,9 @@ except Exception as e:
     print(f"[alerts] router não carregado: {e}")
 # -----------------------------------------------------------------------------
 
+try:
+    from .routes import metrics as metrics_route
+    app.include_router(metrics_route.router)  # expõe /metrics/...
+    print("[ok] router /metrics montado")
+except Exception as e:
+    print(f"[warn] router /metrics não montado: {e}")
