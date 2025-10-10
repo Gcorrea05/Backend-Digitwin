@@ -2,33 +2,32 @@
 import os
 import re
 import time
+import asyncio
+import math
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Any, Dict, Tuple
-from dataclasses import dataclass
 
 from dotenv import load_dotenv, find_dotenv
-from fastapi import FastAPI, Query, HTTPException, Request
+from fastapi import FastAPI, Request, HTTPException, Query, WebSocket, WebSocketDisconnect, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from mysql.connector.errors import PoolError
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # .env
-# -----------------------------------------------------------------------------
+# =============================================================================
 load_dotenv(find_dotenv())
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # FastAPI + CORS
-# -----------------------------------------------------------------------------
-app = FastAPI(title="Festo DT API (HTTP only)", version="3.1.0")
+# =============================================================================
+app = FastAPI(title="Festo DT API (WS-first)", version="4.0.0")
 
 ALLOWED_ORIGINS = [
     o.strip()
-    for o in os.getenv(
-        "ALLOWED_ORIGINS",
-        "http://localhost:8080,http://127.0.0.1:8080"
-    ).split(",")
+    for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:8080,http://127.0.0.1:8080").split(",")
     if o.strip()
 ]
 
@@ -64,9 +63,7 @@ def any_options(full_path: str, request: Request):
         headers["Vary"] = "Origin"
         headers["Access-Control-Allow-Credentials"] = "true"
         headers["Access-Control-Expose-Headers"] = "*"
-    headers["Access-Control-Allow-Methods"] = request.headers.get(
-        "access-control-request-method", "*"
-    ) or "*"
+    headers["Access-Control-Allow-Methods"] = request.headers.get("access-control-request-method", "*") or "*"
     req_headers = request.headers.get("access-control-request-headers")
     headers["Access-Control-Allow-Headers"] = req_headers or "*"
     return Response(status_code=204, headers=headers)
@@ -75,20 +72,32 @@ def any_options(full_path: str, request: Request):
 async def pool_error_handler(_, __):
     return JSONResponse(status_code=503, content={"detail": "DB pool exhausted"})
 
-# -----------------------------------------------------------------------------
-# Imports locais
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Imports locais (apenas o essencial)
+# =============================================================================
 from .database import get_db
-try:
-    # usado só para /metrics/minute-agg (Analytics)
-    from .services.analytics import get_kpis  # type: ignore
-except Exception:  # fallback se serviço não existir
-    def get_kpis():
-        return {}
 
-# -----------------------------------------------------------------------------
-# DB helpers
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Config / Constantes
+# =============================================================================
+PROCESS_STARTED_MS = int(time.time() * 1000)
+
+# Cadências (ENV sobrescreve)
+LIVE_TICK_MS = int(os.getenv("LIVE_TICK_MS", "200"))          # Dashboard (200 ms)
+MON_TICK_MS  = int(os.getenv("MON_TICK_MS",  "2000"))         # Monitoring (2 s)
+SLOW_TICK_MS = int(os.getenv("SLOW_TICK_MS", "60000"))        # CPM (60 s)
+HEARTBEAT_MS = int(os.getenv("WS_HEARTBEAT_MS", "10000"))     # Heartbeat (10 s)
+
+# Tabelas
+OPC_TABLE = os.getenv("OPC_TABLE", "opc_samples")
+MPU_TABLE = os.getenv("MPU_TABLE", "mpu_samples")
+_DURATION_RE = re.compile(r"^-(\d+)\s*([smhd])$", re.IGNORECASE)
+
+MAX_LIMIT = 50000
+
+# =============================================================================
+# DB helpers (mínimos)
+# =============================================================================
 def get_db_safe():
     return get_db()
 
@@ -108,149 +117,37 @@ def fetch_all(q: str, params: Tuple[Any, ...] = ()):
     finally:
         db.close()
 
-def first_col(row: Any) -> Any:
-    if row is None: return None
-    if isinstance(row, (list, tuple)): return row[0]
-    if isinstance(row, dict):
-        for _, v in row.items(): return v
-    return row
-
 def col(row: Any, key_or_index: Any) -> Any:
-    if row is None: return None
-    if isinstance(row, dict): return row.get(key_or_index)
-    if isinstance(key_or_index, int): return row[key_or_index]
-    return None
-
-def cols(row: Any, *keys_or_idx: Any) -> Tuple[Any, ...]:
-    return tuple(col(row, k) for k in keys_or_idx)
-
-def table_exists(schema: str, table: str) -> bool:
-    q = """
-    SELECT COUNT(*) AS c
-    FROM information_schema.tables
-    WHERE table_schema=%s AND table_name=%s
-    """
-    row = fetch_one(q, (schema, table))
-    v = first_col(row)
-    try: return int(v) > 0
-    except Exception: return False
-
-def _coerce_to_datetime(value: Any) -> Optional[datetime]:
-    if value is None: return None
-    if isinstance(value, datetime):
-        dt = value
-    elif isinstance(value, (int, float)):
-        dt = datetime.fromtimestamp(value, tz=timezone.utc)
-    elif isinstance(value, str):
-        s = value.strip()
-        try:
-            s2 = s.replace("Z", "+00:00")
-            dt = datetime.fromisoformat(s2)
-        except Exception:
-            dt = None
-            for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
-                try:
-                    dt = datetime.strptime(s, fmt)
-                    break
-                except Exception:
-                    continue
-            if dt is None:
-                return None
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-    else:
+    if row is None:
         return None
-    return dt.astimezone(timezone.utc)
-
-def dt_to_iso_utc(value: Any) -> Optional[str]:
-    dt = _coerce_to_datetime(value)
-    if dt is None: return None
-    return dt.isoformat().replace("+00:00", "Z")
-
-# -----------------------------------------------------------------------------
-# Cache curtinho
-# -----------------------------------------------------------------------------
-PROCESS_STARTED_MS = int(time.time() * 1000)  # instante em que o processo subiu (epoch ms)
-
-
-_cache: Dict[str, Dict[str, Any]] = {}
-def cached(key: str, ttl: float, producer):
-    now = time.time()
-    e = _cache.get(key)
-    if e and now - e["ts"] < ttl:
-        return e["val"]
-    val = producer()
-    _cache[key] = {"ts": now, "val": val}
-    return val
-
-# -----------------------------------------------------------------------------
-# Helpers de janela e IDs
-# -----------------------------------------------------------------------------
-def _normalize_since(since: Optional[str], last: Optional[int], seconds: Optional[str],
-                     window: Optional[str], duration: Optional[str]) -> Optional[str]:
-    def with_s(val: str) -> str:
-        v = val.strip().lower()
-        if not v: return v
-        if not v.startswith(("+", "-")): v = "-" + v
-        if v.lstrip("+-").isdigit(): v += "s"
-        return v
-    if since:
-        s = since.strip().lower()
-        if s.lstrip("+-").isdigit(): return with_s(s)
-        return s
-    for cand in (seconds, window, duration):
-        if cand: return with_s(cand)
-    if last is not None:
-        try:
-            val = int(last)
-            if val > 0: val = -val
-            return f"{val}s"
-        except Exception:
-            pass
+    if isinstance(row, dict):
+        return row.get(key_or_index)
+    if isinstance(key_or_index, int):
+        return row[key_or_index]
     return None
 
-def _parse_since(s: Optional[str]) -> Optional[datetime]:
-    if not s: return None
-    s = s.strip().lower()
-    m = re.fullmatch(r"([+-]?\d+)([smhd])", s)
-    if m:
-        qty = int(m.group(1)); unit = m.group(2); now = datetime.now(timezone.utc)
-        if unit == "s": return now + timedelta(seconds=qty)
-        if unit == "m": return now + timedelta(minutes=qty)
-        if unit == "h": return now + timedelta(hours=qty)
-        if unit == "d": return now + timedelta(days=qty)
+def _parse_since_to_seconds(s: str, default_s: int = 7200) -> int:
+    """Aceita -60m, -2h, -7200s (ou vazio) -> segundos (int, positivo)."""
+    if not s:
+        return default_s
+    ss = s.strip()
+    if ss.startswith("-"):
+        ss = ss[1:]
     try:
-        dt = datetime.fromisoformat(s.replace("z", "+00:00"))
-        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        if ss.endswith("h"):
+            return int(float(ss[:-1]) * 3600)
+        if ss.endswith("m"):
+            return int(float(ss[:-1]) * 60)
+        if ss.endswith("s"):
+            return int(float(ss[:-1]))
+        # número puro (assume segundos)
+        return int(float(ss))
     except Exception:
-        raise HTTPException(400, detail="since inválido. Use '-60s', '-15m', '-1h', '-7d' ou ISO8601.")
+        return default_s
 
-def _coerce_mpu_id(id_: Optional[str], mpu: Optional[str], device: Optional[str], name: Optional[str]) -> int:
-    cand = None
-    for v in (id_, mpu, device, name):
-        if v: cand = v; break
-    if cand is None:
-        raise HTTPException(400, "Informe id=MPUA1|MPUA2 (ou mpu|device|name)")
-    s = str(cand).strip().upper()
-    if s in ("1", "MPU1", "MPUA1", "A1"): return 1
-    if s in ("2", "MPU2", "MPUA2", "A2"): return 2
-    raise HTTPException(400, "MPU inválido (use 1,2, MPUA1, MPUA2)")
-
-def _coerce_act_from_path(act_raw: str) -> int:
-    s = (act_raw or "").strip().upper()
-    if s in ("1", "A1", "MPUA1", "MPU1"): return 1
-    if s in ("2", "A2", "MPUA2", "MPU2"): return 2
-    raise HTTPException(400, "act inválido (use 1|2|A1|A2)")
-
-def _coerce_facet_from_path(facet_raw: str) -> str:
-    s = (facet_raw or "").strip().upper()
-    if s not in ("S1", "S2"):
-        raise HTTPException(400, "facet inválido (use S1|S2)")
-    return s
-
-# -----------------------------------------------------------------------------
-# Latch config (mantidas EXATAMENTE como você pediu)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Latch config (EXATAMENTE como seu modelo)
+# =============================================================================
 StableState = str  # "RECUADO" | "AVANÇADO"
 
 @dataclass
@@ -264,118 +161,98 @@ class _LatchCfg:
     s_adv: str
     s_rec: str
 
-@dataclass
-class _LatchState:
-    displayed: StableState = "RECUADO"
-    pending_target: Optional[str] = None
-    fault: str = "NONE"
-    started_at: Optional[datetime] = None
-    elapsed_ms: int = 0
-
-class _Deb:
-    __slots__ = ("v","t")
-    def __init__(self):
-        self.v = False
-        self.t = datetime.min.replace(tzinfo=timezone.utc)
-
-def _stable(prev:_Deb, now_v:bool, ts:datetime, debounce_ms:int):
-    if now_v != prev.v:
-        prev.v = now_v
-        prev.t = ts
-        return False, now_v
-    return ((ts - prev.t).total_seconds()*1000 >= debounce_ms), prev.v
-
-def _compute_latched_state(
-    cfg: _LatchCfg,
-    rows: List[Tuple[datetime,str,Optional[int]]],
-    initial_displayed: StableState = "RECUADO",
-) -> _LatchState:
-    st = _LatchState(displayed=initial_displayed)
-    rec = _Deb(); adv = _Deb()
-    for ts, name, vb in rows:
-        if vb is None: continue
-        v = bool(vb)
-
-        if name == cfg.s_rec: _stable(rec, v, ts, cfg.debounce_ms)
-        if name == cfg.s_adv: _stable(adv, v, ts, cfg.debounce_ms)
-
-        rec_st, rec_val = _stable(rec, rec.v, ts, cfg.debounce_ms)
-        adv_st, adv_val = _stable(adv, adv.v, ts, cfg.debounce_ms)
-
-        if rec_st and adv_st and rec_val and adv_val:
-            st.fault = "FAULT_SENSORS_CONFLICT"
-
-        if name == cfg.v_av and v:
-            st.pending_target = "AV";  st.started_at = ts; st.fault = "NONE"
-        elif name == cfg.v_rec and v:
-            st.pending_target = "REC"; st.started_at = ts; st.fault = "NONE"
-
-        if not st.pending_target:
-            if rec_st and rec_val and not (adv_st and adv_val):
-                st.displayed = "RECUADO"
-            elif adv_st and adv_val and not (rec_st and rec_val):
-                st.displayed = "AVANÇADO"
-
-        if st.pending_target:
-            if st.started_at:
-                st.elapsed_ms = int((ts - st.started_at).total_seconds()*1000)
-                if st.elapsed_ms > int(cfg.expected_ms * cfg.timeout_factor):
-                    st.fault = "FAULT_TIMEOUT"
-
-            if st.pending_target == "AV" and adv_st and adv_val:
-                st.displayed = "AVANÇADO"; st.pending_target = None; st.started_at = None; st.elapsed_ms = 0; st.fault = "NONE"
-            elif st.pending_target == "REC" and rec_st and rec_val:
-                st.displayed = "RECUADO";  st.pending_target = None; st.started_at = None; st.elapsed_ms = 0; st.fault = "NONE"
-    return st
-
-# --- Latch config (mantido EXATAMENTE como tinha) -----------------------------
+# Mantido 1:1 com seu arquivo
 _CFG_A1 = _LatchCfg(
-    id="A1",
-    expected_ms=1500,
-    debounce_ms=80,
-    timeout_factor=1.5,
-    v_av="V1_14",
-    v_rec="V1_12",
-    s_adv="Recuado_1S1",
-    s_rec="Avancado_1S2",
+    id="A1", expected_ms=1500, debounce_ms=80, timeout_factor=1.5,
+    v_av="V1_14", v_rec="V1_12", s_adv="Recuado_1S1", s_rec="Avancado_1S2",
 )
-
 _CFG_A2 = _LatchCfg(
-    id="A2",
-    expected_ms=500,
-    debounce_ms=80,
-    timeout_factor=1.5,
-    v_av="V2_14",
-    v_rec="V2_12",
-    s_adv="Recuado_2S1",
-    s_rec="Avancado_2S2",
+    id="A2", expected_ms=500, debounce_ms=80, timeout_factor=1.5,
+    v_av="V2_14", v_rec="V2_12", s_adv="Recuado_2S1", s_rec="Avancado_2S2",
+)
+_NAMES_LATCH = (
+    _CFG_A1.v_av, _CFG_A1.v_rec, _CFG_A1.s_adv, _CFG_A1.s_rec,
+    _CFG_A2.v_av, _CFG_A2.v_rec, _CFG_A2.s_adv, _CFG_A2.s_rec
 )
 
-_NAMES_LATCH = (_CFG_A1.v_av, _CFG_A1.v_rec, _CFG_A1.s_adv, _CFG_A1.s_rec,
-                _CFG_A2.v_av, _CFG_A2.v_rec, _CFG_A2.s_adv, _CFG_A2.s_rec)
+# Mapa para resolver facetas -> nomes de sinais
+_SMAP = {
+    1: {"S1": _CFG_A1.s_adv, "S2": _CFG_A1.s_rec},
+    2: {"S1": _CFG_A2.s_adv, "S2": _CFG_A2.s_rec},
+}
+
+def _resolve_signal_by_facet(act: str | int, facet: str) -> Optional[str]:
+    """act pode ser 1/2 ou 'A1'/'A2'. facet é 'S1' ou 'S2'."""
+    if isinstance(act, str):
+        act = act.upper().replace("A", "")
+    try:
+        aid = int(act)
+    except Exception:
+        return None
+    f = facet.upper()
+    mp = _SMAP.get(aid)
+    if not mp or f not in mp:
+        return None
+    return mp[f]
+
+# =============================================================================
+# Utils de tempo/ISO
+# =============================================================================
+def _coerce_to_datetime(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, (int, float)):
+        dt = datetime.fromtimestamp(value, tz=timezone.utc)
+    elif isinstance(value, str):
+        s = value.strip()
+        try:
+            s2 = s.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(s2)
+        except Exception:
+            dt = None
+            for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+                try:
+                    dt = datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+                    break
+                except Exception:
+                    continue
+            if dt is None:
+                return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        return None
+    return dt.astimezone(timezone.utc)
+
+def dt_to_iso_utc(value: Any) -> Optional[str]:
+    dt = _coerce_to_datetime(value)
+    if dt is None:
+        return None
+    return dt.isoformat().replace("+00:00", "Z")
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
+# =============================================================================
+# Leituras S1/S2 e derivados (mínimos para live/monitoring/CPM)
+# =============================================================================
 def _fetch_latest_rows(names: Tuple[str, ...]) -> Dict[str, Dict[str, Any]]:
     if not names:
         return {}
-
     placeholders = ", ".join(["%s"] * len(names))
-    # Se criar o índice abaixo, você pode forçar o uso dele:
-    # FORCE INDEX (idx_opc_name_ts)
     sql = f"""
         SELECT s.name, s.value_bool, s.ts_utc
-        FROM opc_samples s /* FORCE INDEX (idx_opc_name_ts) */
+        FROM {OPC_TABLE} s
         JOIN (
             SELECT name, MAX(ts_utc) AS ts_utc
-            FROM opc_samples
+            FROM {OPC_TABLE}
             WHERE name IN ({placeholders})
             GROUP BY name
         ) m ON m.name = s.name AND m.ts_utc = s.ts_utc
     """
     rows = fetch_all(sql, names)
-
     out: Dict[str, Dict[str, Any]] = {}
     for r in rows:
         n = col(r, "name") or col(r, 0)
@@ -402,9 +279,8 @@ def _infer_state_from_latest(cfg: _LatchCfg, latest: Dict[str, Dict[str, Any]]):
     t_vrc = _coerce_to_datetime(vrc.get("ts_utc"))
 
     displayed = "RECUADO"
-    fault = "NONE"
     if adv_v and rec_v:
-        displayed = "RECUADO"; fault = "FAULT_SENSORS_CONFLICT"
+        displayed = "RECUADO"  # conflito -> mantém RECUADO (regra simples)
     elif adv_v:
         displayed = "AVANÇADO"
     elif rec_v:
@@ -412,7 +288,6 @@ def _infer_state_from_latest(cfg: _LatchCfg, latest: Dict[str, Dict[str, Any]]):
 
     pending = None
     started_at = None
-    elapsed_ms = 0
 
     last_cmd_ts = None
     last_cmd_kind = None  # "AV" | "REC"
@@ -428,23 +303,11 @@ def _infer_state_from_latest(cfg: _LatchCfg, latest: Dict[str, Dict[str, Any]]):
         if not rec_v or (t_rec and last_cmd_ts and last_cmd_ts > t_rec):
             pending = "REC"; started_at = last_cmd_ts or now
 
-    if pending and started_at:
-        elapsed_ms = max(0, int((now - started_at).total_seconds() * 1000))
-        if elapsed_ms > int(cfg.expected_ms * cfg.timeout_factor):
-            fault = "FAULT_TIMEOUT"
-
     return {
         "state": displayed,
         "pending": pending,
-        "fault": fault,
-        "elapsed_ms": elapsed_ms,
         "started_at": (started_at.isoformat() if started_at else None),
     }
-
-# =========================
-# Séries S1/S2 (helpers)
-# =========================
-OPC_TABLE = os.getenv("OPC_TABLE", "opc_samples")
 
 def _fetch_series(names: List[str], window_s: int) -> Dict[str, List[Tuple[datetime,int]]]:
     if not names:
@@ -463,18 +326,13 @@ def _fetch_series(names: List[str], window_s: int) -> Dict[str, List[Tuple[datet
         nm = str(col(r, "name") or r[0])
         ts_raw = col(r, "ts_utc") or r[1]
         vb_raw = col(r, "value_bool") if isinstance(r, dict) else r[2]
-
         dt = _coerce_to_datetime(ts_raw)
-        if dt is None:
-            continue  # ignora ts inválido
-
-        if vb_raw is None:
+        if dt is None or vb_raw is None:
             continue
         try:
             v = 1 if int(vb_raw) else 0
         except Exception:
             v = 1 if bool(vb_raw) else 0
-
         out[nm].append((dt, v))
     return out
 
@@ -491,20 +349,13 @@ def _derive_open_closed_from_S1S2(
     s1: List[Tuple[datetime,int]],
     s2: List[Tuple[datetime,int]],
 ) -> Tuple[List[Tuple[datetime,int]], List[Tuple[datetime,int]]]:
-    """
-    MESMA regra do Dashboard:
-    ABERTO quando S1=0 & S2=1; FECHADO quando S1=1 & S2=0; senão mantém o último.
-    Retorna (ABERTO[], FECHADO[]) com dedup por valor.
-    """
     if not s1 and not s2:
         return [], []
-
     times = sorted({t for t,_ in s1} | {t for t,_ in s2})
     if not times:
         return [], []
 
     def val_at(seq: List[Tuple[datetime,int]], t: datetime) -> int:
-        # último valor <= t (busca binária simples)
         if not seq:
             return 0
         lo, hi = 0, len(seq) - 1
@@ -539,7 +390,6 @@ def _derive_open_closed_from_S1S2(
                 cur_close = 0 if prev_open == 1 else 1
         opened.append((t, cur_open))
         closed.append((t, cur_close))
-
     return _dedup(opened), _dedup(closed)
 
 def _rising_edges(seq: List[Tuple[datetime,int]]) -> List[datetime]:
@@ -550,7 +400,6 @@ def _rising_edges(seq: List[Tuple[datetime,int]]) -> List[datetime]:
     return edges
 
 def _last_pulse_duration(seq: List[Tuple[datetime,int]]) -> Optional[float]:
-    """Duração do último 1...0 (segundos). Se termina em 1, conta até agora."""
     if not seq: return None
     last_on = None; last_pulse = None
     for i in range(1, len(seq)):
@@ -565,28 +414,612 @@ def _last_pulse_duration(seq: List[Tuple[datetime,int]]) -> Optional[float]:
         return (datetime.now(timezone.utc) - last_on).total_seconds()
     return None
 
-# -----------------------------------------------------------------------------
-# Health
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Payload builders (contratos WS)
+# =============================================================================
+def build_live_payload() -> dict:
+    latest = _fetch_latest_rows(_NAMES_LATCH)
+    a1 = _infer_state_from_latest(_CFG_A1, latest)
+    a2 = _infer_state_from_latest(_CFG_A2, latest)
+    items = [
+        {"id": 1, "state": a1["state"]},
+        {"id": 2, "state": a2["state"]},
+    ]
+    return {"type": "live", "ts": _now_iso(), "actuators": items}
+
+def build_monitoring_payload() -> dict:
+    # Timings pela última janela de 2s
+    s_map = {1: {"S1": _CFG_A1.s_adv, "S2": _CFG_A1.s_rec},
+             2: {"S1": _CFG_A2.s_adv, "S2": _CFG_A2.s_rec}}
+    names = [v for m in s_map.values() for v in (m["S1"], m["S2"])]
+    raw = _fetch_series(names, 2)
+    compact = {k: _dedup(v) for k, v in raw.items()}
+    timings = []
+    for aid, m in s_map.items():
+        s1 = compact.get(m["S1"], [])
+        s2 = compact.get(m["S2"], [])
+        opened, closed = _derive_open_closed_from_S1S2(s1, s2)
+        t_abre  = _last_pulse_duration(opened)
+        t_fecha = _last_pulse_duration(closed)
+        t_ciclo = (t_abre or 0.0) + (t_fecha or 0.0) if (t_abre or t_fecha) else None
+        timings.append({"actuator_id": aid, "last": {
+            "dt_abre_s": t_abre, "dt_fecha_s": t_fecha, "dt_ciclo_s": t_ciclo
+        }})
+
+    # Vibração: RMS em 2s
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(seconds=2)
+    rows = fetch_all(
+        f"SELECT mpu_id, ts_utc, ax_g, ay_g, az_g FROM {MPU_TABLE} WHERE ts_utc >= %s AND ts_utc < %s",
+        (start, now),
+    )
+    by: Dict[int, Dict[str, List[float]]] = {}
+    for r in rows:
+        mid = int(col(r, "mpu_id") or col(r, 0))
+        ax = col(r, "ax_g"); ay = col(r, "ay_g"); az = col(r, "az_g")
+        d = by.setdefault(mid, {"ax": [], "ay": [], "az": []})
+        d["ax"].append(float(ax or 0.0))
+        d["ay"].append(float(ay or 0.0))
+        d["az"].append(float(az or 0.0))
+    vib_items = []
+    for mid, d in by.items():
+        rms_ax = (sum(v*v for v in d["ax"]) / max(1, len(d["ax"]))) ** 0.5
+        rms_ay = (sum(v*v for v in d["ay"]) / max(1, len(d["ay"]))) ** 0.5
+        rms_az = (sum(v*v for v in d["az"]) / max(1, len(d["az"]))) ** 0.5
+        overall = float((rms_ax**2 + rms_ay**2 + rms_az**2) ** 0.5)
+        vib_items.append({"mpu_id": mid, "overall": overall})
+
+    return {
+        "type": "monitoring",
+        "ts": _now_iso(),
+        "timings": timings,
+        "vibration": {"window_s": 2, "items": vib_items},
+    }
+
+def build_cpm_payload(window_s: int = 60) -> dict:
+    s_map = {1: {"S1": _CFG_A1.s_adv, "S2": _CFG_A1.s_rec},
+             2: {"S1": _CFG_A2.s_adv, "S2": _CFG_A2.s_rec}}
+    names = [v for m in s_map.values() for v in (m["S1"], m["S2"])]
+    raw = _fetch_series(names, window_s)
+    compact = {k: _dedup(v) for k, v in raw.items()}
+    out = []
+    for aid, m in s_map.items():
+        s1 = compact.get(m["S1"], [])
+        s2 = compact.get(m["S2"], [])
+        opened, closed = _derive_open_closed_from_S1S2(s1, s2)
+        e_open  = _rising_edges(opened)
+        e_close = _rising_edges(closed)
+        cycles = min(len(e_open), len(e_close))
+        cpm = cycles * (60.0 / float(window_s)) if window_s > 0 else 0.0
+        out.append({"id": aid, "cycles": cycles, "cpm": cpm, "window_s": window_s})
+    return {"type": "cpm", "ts": _now_iso(), "window_s": window_s, "items": out}
+
+def maybe_alerts_from_vibration(vib_items: List[dict], threshold: float = 0.5) -> List[dict]:
+    alerts = []
+    for it in vib_items:
+        if float(it.get("overall", 0.0)) >= threshold:
+            origin = "A1" if it.get("mpu_id") == 1 else "A2" if it.get("mpu_id") == 2 else f"MPU{it.get('mpu_id')}"
+            alerts.append({
+                "type": "alert", "ts": _now_iso(),
+                "code": "LIMIT", "severity": 3, "origin": origin,
+                "message": f"Vibration overall >= {threshold:g}",
+            })
+    return alerts
+
+# =============================================================================
+# Alerts cache (evita rebuild a cada request)
+# =============================================================================
+from hashlib import sha1
+
+_LAST_ALERTS_PAYLOAD: dict | None = None
+_LAST_ALERTS_ETAG: str | None = None
+_LAST_ALERTS_TS: datetime | None = None          # quando OS ITEMS mudaram
+_LAST_ALERTS_SIG: str | None = None             # assinatura (hash) só dos items
+
+def _alerts_signature(items: list[dict]) -> str:
+    """Hash estável SOMENTE do conteúdo (items), ignorando timestamps efêmeros."""
+    # ordena chaves para ter determinismo
+    # cuidado para não explodir com floats -> normaliza com repr
+    norm = repr([{k: v for k, v in sorted(it.items())} for it in items])
+    return sha1(norm.encode("utf-8")).hexdigest()
+
+def _make_alerts_payload(items: list[dict], changed_at: datetime) -> tuple[dict, str]:
+    """
+    Monta payload + ETag:
+    - ETag = hash(items) -> estável se conteúdo não mudou
+    - ts = changed_at (ISO) -> quando o conteúdo mudou pela última vez
+    """
+    etag = _alerts_signature(items)
+    payload = {"items": items, "ts": changed_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")}
+    return payload, etag
+def _make_alerts_payload_from_mon(mon: dict, limit: int = 5) -> tuple[dict, str]:
+    items = maybe_alerts_from_vibration(mon.get("vibration", {}).get("items", []))
+    items = items[: max(1, min(limit, 100))]
+    payload = {"items": items, "ts": _now_iso()}
+    body = (repr(items) + "|" + payload["ts"]).encode("utf-8")
+    etag = sha1(body).hexdigest()
+    return payload, etag
+
+def _update_alerts_cache_from_mon(mon: dict) -> None:
+    """
+    Atualiza cache APENAS se a lista de alerts mudou.
+    """
+    global _LAST_ALERTS_PAYLOAD, _LAST_ALERTS_ETAG, _LAST_ALERTS_TS, _LAST_ALERTS_SIG
+
+    items = maybe_alerts_from_vibration(mon.get("vibration", {}).get("items", []))
+    items = items[:5]  # mesmo limit padrão do endpoint
+
+    sig = _alerts_signature(items)
+    if sig == _LAST_ALERTS_SIG and _LAST_ALERTS_PAYLOAD is not None:
+        # nada mudou -> mantém ETag e Last-Modified/ts
+        return
+
+    changed_at = datetime.now(timezone.utc)
+    payload, etag = _make_alerts_payload(items, changed_at)
+
+    _LAST_ALERTS_SIG = sig
+    _LAST_ALERTS_TS = changed_at
+    _LAST_ALERTS_ETAG = etag
+    _LAST_ALERTS_PAYLOAD = payload
+
+def _get_cached_alerts(limit: int = 5) -> tuple[dict | None, str | None, datetime | None]:
+    if _LAST_ALERTS_PAYLOAD is None:
+        return None, None, None
+    items = (_LAST_ALERTS_PAYLOAD.get("items") or [])[: max(1, min(limit, 100))]
+    # IMPORTANTE: não atualizamos ts aqui — ele representa a ÚLTIMA mudança real
+    payload = {"items": items, "ts": _LAST_ALERTS_PAYLOAD.get("ts")}
+    return payload, _LAST_ALERTS_ETAG, _LAST_ALERTS_TS
+
+# =============================================================================
+# WS Groups / Broadcast
+# =============================================================================
+class WSGroup:
+    def __init__(self, name: str):
+        self.name = name
+        self.clients: "set[WebSocket]" = set()
+        self._lock = asyncio.Lock()
+        self.last_hb = 0
+
+    async def connect(self, ws: WebSocket):
+        await ws.accept()
+        async with self._lock:
+            self.clients.add(ws)
+
+    async def disconnect(self, ws: WebSocket):
+        async with self._lock:
+            self.clients.discard(ws)
+
+    async def broadcast_json(self, payload: dict):
+        dead = []
+        for ws in list(self.clients):
+            try:
+                await ws.send_json(payload)
+            except Exception:
+                dead.append(ws)
+        if dead:
+            async with self._lock:
+                for ws in dead:
+                    self.clients.discard(ws)
+
+    async def heartbeat_if_due(self):
+        now = time.time() * 1000
+        if now - self.last_hb >= HEARTBEAT_MS:
+            await self.broadcast_json({"type": "hb", "ts": _now_iso(), "channel": self.name})
+            self.last_hb = now
+
+WS_LIVE = WSGroup("live")
+WS_MON  = WSGroup("monitoring")
+WS_SLOW = WSGroup("slow")
+
+_bg_tasks: "list[asyncio.Task]" = []
+
+# =============================================================================
+# Producers
+# =============================================================================
+async def live_producer_loop():
+    tick = max(0.02, LIVE_TICK_MS / 1000.0)
+    while True:
+        try:
+            await WS_LIVE.broadcast_json(build_live_payload())
+            await WS_LIVE.heartbeat_if_due()
+        except Exception as e:
+            await WS_LIVE.broadcast_json({"type": "error", "channel": "live", "detail": str(e)[:180], "ts": _now_iso()})
+        await asyncio.sleep(tick)
+
+async def monitoring_producer_loop():
+    tick = max(0.2, MON_TICK_MS / 1000.0)
+    while True:
+        try:
+            mon = build_monitoring_payload()
+            _update_alerts_cache_from_mon(mon)  # atualiza cache de alerts
+
+            await WS_MON.broadcast_json(mon)
+            # Alerts simples derivados de vibração (push)
+            for a in maybe_alerts_from_vibration(mon.get("vibration", {}).get("items", [])):
+                await WS_SLOW.broadcast_json(a)
+            await WS_MON.heartbeat_if_due()
+        except Exception as e:
+            await WS_MON.broadcast_json({"type": "error", "channel": "monitoring", "detail": str(e)[:180], "ts": _now_iso()})
+        await asyncio.sleep(tick)
+
+async def slow_producer_loop():
+    tick = max(1.0, SLOW_TICK_MS / 1000.0)
+    while True:
+        try:
+            await WS_SLOW.broadcast_json(build_cpm_payload(window_s=int(tick)))
+            await WS_SLOW.heartbeat_if_due()
+        except Exception as e:
+            await WS_SLOW.broadcast_json({"type": "error", "channel": "slow", "detail": str(e)[:180], "ts": _now_iso()})
+        await asyncio.sleep(tick)
+
+# =============================================================================
+# Startup / Shutdown
+# =============================================================================
+@app.on_event("startup")
+async def _startup_ws_tasks():
+    for fn in (live_producer_loop, monitoring_producer_loop, slow_producer_loop):
+        _bg_tasks.append(asyncio.create_task(fn()))
+
+@app.on_event("shutdown")
+async def _shutdown_ws_tasks():
+    for t in _bg_tasks:
+        t.cancel()
+    await asyncio.gather(*_bg_tasks, return_exceptions=True)
+
+# =============================================================================
+# Endpoints WebSocket
+# =============================================================================
+@app.websocket("/ws/live")
+async def ws_live(ws: WebSocket):
+    await WS_LIVE.connect(ws)
+    try:
+        while True:
+            try:
+                await ws.receive_text()  # ignoramos; serve só p/ detectar disconnect
+            except WebSocketDisconnect:
+                break
+            except Exception:
+                await asyncio.sleep(1.0)
+    finally:
+        await WS_LIVE.disconnect(ws)
+
+@app.websocket("/ws/monitoring")
+async def ws_monitoring(ws: WebSocket):
+    await WS_MON.connect(ws)
+    try:
+        while True:
+            try:
+                await ws.receive_text()
+            except WebSocketDisconnect:
+                break
+            except Exception:
+                await asyncio.sleep(1.0)
+    finally:
+        await WS_MON.disconnect(ws)
+
+@app.websocket("/ws/slow")
+async def ws_slow(ws: WebSocket):
+    await WS_SLOW.connect(ws)
+    try:
+        while True:
+            try:
+                await ws.receive_text()
+            except WebSocketDisconnect:
+                break
+            except Exception:
+                await asyncio.sleep(1.0)
+    finally:
+        await WS_SLOW.disconnect(ws)
+
+# =============================================================================
+# Snapshots HTTP (fallback)
+# =============================================================================
+@app.get("/api/live/snapshot")
+def http_snapshot_live():
+    return JSONResponse(build_live_payload(), headers={"Cache-Control":"no-store","Pragma":"no-cache"})
+
+@app.get("/api/monitoring/snapshot")
+def http_snapshot_monitoring():
+    return JSONResponse(build_monitoring_payload(), headers={"Cache-Control":"no-store","Pragma":"no-cache"})
+
+@app.get("/api/slow/snapshot")
+def http_snapshot_slow():
+    return JSONResponse(build_cpm_payload(), headers={"Cache-Control":"no-store","Pragma":"no-cache"})
+
+# =============================================================================
+# Helpers de janela/series para OPC
+# =============================================================================
+def _since_to_window_seconds(since: str, default_sec: int = 7200) -> int:
+    """
+    Converte 'since' em janela (segundos) para a query baseada em NOW() - INTERVAL.
+    Aceita:
+      - padrões relativos: '-10s', '-120m', '-2h', '-1d'
+      - ISO/Datetime (interpreta como ts inicial -> janela = agora - ts_inicial)
+      - vazio/None -> default_sec
+    """
+    if not since:
+        return default_sec
+    s = str(since).strip()
+    m = _DURATION_RE.match(s)
+    if m:
+        val = int(m.group(1))
+        unit = m.group(2).lower()
+        mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+        return max(1, val * mult)
+    # tenta ISO: janela = now - since
+    dt = _coerce_to_datetime(s)
+    if dt:
+        now = datetime.now(timezone.utc)
+        delta = (now - dt).total_seconds()
+        if math.isfinite(delta) and delta > 0:
+            return int(delta)
+    return default_sec
+
+def _rows_for_names(names: List[str], window_s: int) -> Dict[str, List[Dict[str, Any]]]:
+    """Usa _fetch_series e entrega points [{ts, value}] por nome."""
+    raw = _fetch_series(names, window_s)
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for nm, series in raw.items():
+        compact = _dedup(series)
+        out[nm] = [{"ts": dt_to_iso_utc(t), "value": int(v)} for (t, v) in compact if dt_to_iso_utc(t)]
+    return out
+
+# =============================================================================
+# OPC Endpoints
+# =============================================================================
+@app.get("/api/opc/history/name")
+def http_opc_history_by_name(
+    name: str = Query(...),
+    since: str = Query("-120m"),
+    limit: int = Query(200),
+    asc: bool = Query(True),
+):
+    return http_opc_by_name(name=name, since=since, limit=limit, asc=asc)
+
+@app.get("/api/opc/by-name")
+def http_opc_by_name(
+    name: str = Query(...),
+    since: str = Query("-120m"),
+    limit: int = Query(200),
+    asc: bool = Query(True),
+):
+    window_s = _parse_since_to_seconds(since, 7200)
+    safe_limit = max(1, min(int(limit), MAX_LIMIT))
+    series = _fetch_series([name], window_s).get(name, [])
+    if not asc:
+        series = list(reversed(series))
+    if safe_limit and len(series) > safe_limit:
+        series = series[-safe_limit:] if asc else series[:safe_limit]
+
+    return JSONResponse({
+        "name": name,
+        "points": [{"ts": dt_to_iso_utc(t), "value": v} for t, v in series],
+        "window_s": window_s,
+        "count": len(series),
+    }, headers={"Cache-Control":"no-store","Pragma":"no-cache"})
+
+@app.get("/api/opc/query")
+def http_opc_query(
+    act: str | int = Query(..., description="1/2 ou A1/A2"),
+    facet: str = Query("S1", pattern="^(?i:S1|S2)$"),
+    since: str = Query("-120m"),
+    asc: bool = Query(True),
+):
+    name = _resolve_signal_by_facet(act, facet)
+    if not name:
+        raise HTTPException(status_code=422, detail="act/facet inválidos")
+    return http_opc_by_name(name=name, since=since, limit=MAX_LIMIT, asc=asc)
+
+@app.get("/api/opc/by-facet")
+def http_opc_by_facet(
+    act: str | int = Query(...),
+    facet: str = Query(...),
+    since: str = Query("-120m"),
+    asc: bool = Query(True),
+):
+    name = _resolve_signal_by_facet(act, facet)
+    if not name:
+        raise HTTPException(status_code=422, detail="act/facet inválidos")
+    return http_opc_by_name(name=name, since=since, limit=MAX_LIMIT, asc=asc)
+
+@app.get("/api/opc/history/facet")
+def http_opc_history_facet(
+    act: str | int = Query(...),
+    facet: str = Query(...),
+    since: str = Query("-120m"),
+    asc: bool = Query(True),
+):
+    return http_opc_by_facet(act=act, facet=facet, since=since, asc=asc)
+
+# ---------- Aliases SEM /api (compat com legado) ----------
+@app.get("/opc/history/name")
+def compat_opc_history_name_legacy(**kwargs): return http_opc_history_by_name(**kwargs)
+
+@app.get("/opc/by-name")
+def compat_opc_by_name_legacy(**kwargs): return http_opc_by_name(**kwargs)
+
+@app.get("/opc/query")
+def compat_opc_query_legacy(**kwargs): return http_opc_query(**kwargs)
+
+@app.get("/opc/by-facet")
+def compat_opc_by_facet_legacy(**kwargs): return http_opc_by_facet(**kwargs)
+
+@app.get("/opc/history/facet")
+def compat_opc_history_facet_legacy(**kwargs): return http_opc_history_facet(**kwargs)
+
+# ---------- Compat POST (aceita JSON no body) ----------
+@app.post("/api/opc/history/name")
+def http_opc_history_by_name_post(body: dict = Body(...)):
+    return http_opc_by_name_post(body)
+
+@app.post("/api/opc/by-name")
+def http_opc_by_name_post(body: dict = Body(...)):
+    return http_opc_by_name(
+        name=str(body.get("name")),
+        since=str(body.get("since", "-120m")),
+        limit=int(body.get("limit", 200)),
+        asc=bool(body.get("asc", True)),
+    )
+
+# Alias adicional que seu front parece chamar:
+@app.get("/api/opc/history")
+def http_opc_history_alias(name: str = Query(...), since: str = "-120m", limit: int = 200, asc: bool = True):
+    return http_opc_history_by_name(name=name, since=since, limit=limit, asc=asc)
+
+@app.post("/api/opc/history")
+def http_opc_history_alias_post(body: dict = Body(...)):
+    return http_opc_history_by_name(
+        name=str(body.get("name")),
+        since=str(body.get("since", "-120m")),
+        limit=int(body.get("limit", 200)),
+        asc=bool(body.get("asc", True)),
+    )
+
+# =============================================================================
+# Endpoints compat do live (HTTP)
+# =============================================================================
+@app.get("/api/live/actuators/cpm")
+def compat_actuators_cpm(window_s: int = Query(60, ge=10, le=600)):
+    payload = build_cpm_payload(window_s=window_s)
+    items = payload.get("items", [])
+    return JSONResponse(
+        {
+            "ts": payload.get("ts"),
+            "actuators": [
+                {
+                    "id": int(it.get("id")),
+                    "window_s": int(it.get("window_s", window_s)),
+                    "cycles": int(it.get("cycles", 0)),
+                    "cpm": float(it.get("cpm", 0.0)),
+                }
+                for it in items
+            ],
+        },
+        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+    )
+
+@app.get("/api/live/actuators/timings")
+def compat_actuators_timings():
+    mon = build_monitoring_payload()
+    return JSONResponse(
+        {
+            "ts": mon.get("ts"),
+            "actuators": [
+                {
+                    "actuator_id": int(t.get("actuator_id")),
+                    "last": {
+                        "ts_utc": mon.get("ts"),
+                        "dt_abre_s": t.get("last", {}).get("dt_abre_s"),
+                        "dt_fecha_s": t.get("last", {}).get("dt_fecha_s"),
+                        "dt_ciclo_s": t.get("last", {}).get("dt_ciclo_s"),
+                    },
+                }
+                for t in (mon.get("timings") or [])
+            ],
+        },
+        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+    )
+
+@app.get("/api/live/vibration")
+def compat_live_vibration(window_s: int = Query(2, ge=1, le=60)):
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(seconds=window_s)
+    rows = fetch_all(
+        f"SELECT mpu_id, ts_utc, ax_g, ay_g, az_g FROM {MPU_TABLE} WHERE ts_utc >= %s AND ts_utc < %s",
+        (start, now),
+    )
+    by: Dict[int, Dict[str, List[float]]] = {}
+    ts_by: Dict[int, List[datetime]] = {}
+    for r in rows:
+        mid = int(col(r, "mpu_id") or r[0])
+        ax = col(r, "ax_g"); ay = col(r, "ay_g"); az = col(r, "az_g")
+        by.setdefault(mid, {"ax": [], "ay": [], "az": []})
+        ts_by.setdefault(mid, [])
+        by[mid]["ax"].append(float(ax or 0.0))
+        by[mid]["ay"].append(float(ay or 0.0))
+        by[mid]["az"].append(float(az or 0.0))
+        ts_by[mid].append(_coerce_to_datetime(col(r, "ts_utc") or r[1]) or now)
+
+    items = []
+    for mid, d in by.items():
+        rms_ax = (sum(v*v for v in d["ax"]) / max(1, len(d["ax"]))) ** 0.5
+        rms_ay = (sum(v*v for v in d["ay"]) / max(1, len(d["ay"]))) ** 0.5
+        rms_az = (sum(v*v for v in d["az"]) / max(1, len(d["az"]))) ** 0.5
+        overall = float((rms_ax**2 + rms_ay**2 + rms_az**2) ** 0.5)
+        ts_list = ts_by.get(mid) or [start, now]
+        items.append({
+            "mpu_id": mid,
+            "ts_start": dt_to_iso_utc(min(ts_list)),
+            "ts_end": dt_to_iso_utc(max(ts_list)),
+            "rms_ax": float(rms_ax),
+            "rms_ay": float(rms_ay),
+            "rms_az": float(rms_az),
+            "overall": overall,
+        })
+
+    return JSONResponse({"items": items}, headers={"Cache-Control":"no-store","Pragma":"no-cache"})
+
+# =============================================================================
+# Alerts (com cache + ETag/304)
+# =============================================================================
+@app.get("/alerts")
+@app.get("/api/alerts")
+def compat_alerts(
+    request: Request,
+    limit: int = Query(5, ge=1, le=100),
+    max_age_s: int = Query(1, ge=0, le=60),
+):
+    """
+    Retorna alerts do cache preenchido pelo monitoring loop.
+    - Usa ETag/If-None-Match e Last-Modified/If-Modified-Since para 304.
+    - Cache-Control com max-age configurável (padrão 1s).
+    """
+    payload, etag, last_ts = _get_cached_alerts(limit=limit)
+    if payload is None:
+        # fallback (primeiro hit após start, antes do primeiro tick do loop)
+        mon = build_monitoring_payload()
+        _update_alerts_cache_from_mon(mon)
+        payload, etag, last_ts = _get_cached_alerts(limit=limit)
+
+    # Condicional por ETag
+    inm = request.headers.get("if-none-match")
+    if etag and inm and inm.strip('"') == etag:
+        return Response(status_code=304)
+
+    # Condicional por Last-Modified
+    ims = request.headers.get("if-modified-since")
+    if ims and last_ts:
+        try:
+            ims_dt = _coerce_to_datetime(ims)
+            if ims_dt and ims_dt >= last_ts.replace(microsecond=0):
+                return Response(status_code=304)
+        except Exception:
+            pass
+
+    headers = {"Cache-Control": f"public, max-age={max_age_s}"}
+    if etag:
+        headers["ETag"] = f'"{etag}"'
+    if last_ts:
+        headers["Last-Modified"] = last_ts.strftime("%a, %d %b %Y %H:%M:%S GMT")
+
+    return JSONResponse(payload, headers=headers)
+
+# =============================================================================
+# Health (mínimo e útil para telemetry do front)
+# =============================================================================
 @app.get("/health")
 def health():
-    # DB time (igual você já fazia)
     row = fetch_one("SELECT NOW(6) AS now6")
-    db_time_val = first_col(row) if row is not None else None
-
-    # runtime e started_at do processo
+    db_time_val = col(row, "now6") if isinstance(row, dict) else (row[0] if row else None)
     now_ms = int(time.time() * 1000)
     runtime_ms = now_ms - PROCESS_STARTED_MS
     started_at_iso = datetime.fromtimestamp(PROCESS_STARTED_MS / 1000, tz=timezone.utc).isoformat()
-
-    # (opcional) horário do servidor para comparação
     server_time_iso = datetime.now(tz=timezone.utc).isoformat()
-
     return {
         "status": "ok",
-        "runtime_ms": runtime_ms,                     # <- o front usa isso direto
-        "started_at": started_at_iso,                 # <- fallback/telemetria
-        "server_time": server_time_iso,               # opcional
+        "runtime_ms": runtime_ms,
+        "started_at": started_at_iso,
+        "server_time": server_time_iso,
         "db_time": str(db_time_val) if db_time_val is not None else None,
     }
 
@@ -594,453 +1027,112 @@ def health():
 def api_health():
     return health()
 
-# -----------------------------------------------------------------------------
-# OPC history (para CPM por bordas, etc.)
-# -----------------------------------------------------------------------------
-@app.get("/opc/history")
-def opc_history(
-    request: Request,
-    name: Optional[str] = Query(None),
-    act: Optional[str] = Query(None, description="1|2|A1|A2"),
-    facet: Optional[str] = Query(None, description="S1|S2"),
-    last: Optional[str] = Query(None),
-    since: Optional[str] = Query(None),
-    seconds: Optional[str] = Query(None),
-    window: Optional[str] = Query(None),
-    duration: Optional[str] = Query(None),
-    limit: int = Query(20000, ge=1, le=20000),
-    offset: int = Query(0, ge=0),
-    asc: bool = Query(False),
-):
-    act_int: Optional[int] = None
-    facet_norm: Optional[str] = None
+# =============================================================================
+# Simulation (catalog + draw)
+# =============================================================================
+from json import loads as _json_loads
 
-    if act is not None:
-        act_int = _coerce_act_from_path(str(act))
-    if facet is not None:
-        facet_norm = _coerce_facet_from_path(str(facet))
-
-    if not name and act_int and facet_norm:
-        name = f"Recuado_{act_int}S1" if facet_norm == "S1" else f"Avancado_{act_int}S2"
-    if not name:
-        raise HTTPException(400, "Informe name=... ou act=..&facet=..")
-
-    qp = request.query_params
-    alt_since = qp.get("from") or qp.get("start") or qp.get("begin") or None
-    alt_scalar = qp.get("period") or qp.get("seconds") or qp.get("duration") or None
-
-    last_int: Optional[int] = None
-    if last is not None:
-        s = str(last).strip().lower()
-        if s.endswith("s"): s = s[:-1]
-        try: last_int = int(s)
-        except Exception: last_int = None
-
-    norm = _normalize_since(
-        since=since or alt_since,
-        last=last_int,
-        seconds=seconds or alt_scalar,
-        window=window,
-        duration=duration,
-    )
-    dt = _parse_since(norm) if norm else None
-
-    sql = """
-        SELECT ts_utc AS ts_utc, value_bool AS value_bool
-        FROM opc_samples
-        WHERE name=%s
+@app.get("/api/simulation/catalog")
+def http_simulation_catalog():
     """
-    params: Tuple[Any, ...] = (name,)
-    if dt:
-        sql += " AND ts_utc >= %s"
-        params = (name, dt)
-    sql += f" ORDER BY ts_utc {'ASC' if asc else 'DESC'} LIMIT %s OFFSET %s"
-    params += (limit, offset)
-
-    rows = fetch_all(sql, params)
-    items: List[Dict[str, Any]] = [{
-        "ts_utc": dt_to_iso_utc(col(r, "ts_utc") if isinstance(r, dict) else r[0]),
-        "value_bool": (None if (col(r, "value_bool") if isinstance(r, dict) else r[1]) is None
-                       else int(col(r, "value_bool") if isinstance(r, dict) else r[1])),
-    } for r in rows]
-
-    return {"name": name, "count": len(items), "items": items}
-
-@app.get("/opc/history/{act}/{facet}")
-def opc_history_by_path(
-    request: Request,
-    act: str,
-    facet: str,
-    **kwargs
-):
-    act_int = _coerce_act_from_path(act)
-    facet_str = _coerce_facet_from_path(facet)
-    return opc_history(request=request, name=None, act=str(act_int), facet=facet_str, **kwargs)
-
-@app.get("/api/opc/history")
-def api_opc_history(**kwargs):
-    return opc_history(**kwargs)
-
-# -----------------------------------------------------------------------------
-# MPU: ids + history (para Analytics / vibração por histórico)
-# -----------------------------------------------------------------------------
-@app.get("/mpu/ids")
-def mpu_ids():
-    rows = fetch_all("SELECT DISTINCT mpu_id AS mid FROM mpu_samples ORDER BY mpu_id ASC")
-    def id_to_str(i: int) -> str:
-        return "MPUA1" if i == 1 else "MPUA2" if i == 2 else f"MPU{i}"
-    ids = []
-    for r in rows:
-        mid = col(r, "mid")
-        if mid is None: mid = col(r, 0)
-        ids.append(id_to_str(int(mid)))
-    return {"ids": ids}
-
-@app.get("/api/mpu/ids")
-def api_mpu_ids():
-    return mpu_ids()
-
-@app.get("/mpu/history")
-def mpu_history(
-    id: Optional[str] = Query(None, description="MPUA1|MPUA2|1|2"),
-    mpu: Optional[str] = Query(None),
-    device: Optional[str] = Query(None),
-    name: Optional[str] = Query(None),
-    since: Optional[str] = Query(None),
-    last: Optional[int] = Query(None),
-    seconds: Optional[str] = Query(None),
-    window: Optional[str] = Query(None),
-    duration: Optional[str] = Query(None),
-    limit: int = Query(1000, ge=1, le=20000),
-    offset: int = Query(0, ge=0),
-    asc: bool = Query(False),
-):
-    mid = _coerce_mpu_id(id, mpu, device, name)
-    norm = _normalize_since(since, last, seconds, window, duration)
-    dt = _parse_since(norm) if norm else None
-
-    sql = """
-        SELECT ts_utc AS ts_utc, ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps
-        FROM mpu_samples
-        WHERE mpu_id=%s
+    Retorna o catálogo de erros para popular o <select> do front.
+    Base: tabela error_catalog (id, code, name, grp, severity, ...).
     """
-    params: Tuple[Any, ...] = (mid,)
-    if dt:
-        sql += " AND ts_utc >= %s"
-        params = (mid, dt)
-    sql += f" ORDER BY ts_utc {'ASC' if asc else 'DESC'} LIMIT %s OFFSET %s"
-    params += (limit, offset)
-
-    rows = fetch_all(sql, params)
+    rows = fetch_all("""
+        SELECT id, code, name, grp, COALESCE(severity, 0) AS severity
+        FROM error_catalog
+        ORDER BY grp, code
+    """)
     items = []
     for r in rows:
         items.append({
-            "ts_utc": dt_to_iso_utc(col(r, "ts_utc") or col(r, 0)),
-            "ax_g": col(r, "ax_g"), "ay_g": col(r, "ay_g"), "az_g": col(r, "az_g"),
-            "gx_dps": col(r, "gx_dps"), "gy_dps": col(r, "gy_dps"), "gz_dps": col(r, "gz_dps"),
+            "id": int(col(r, "id") or r[0]),
+            "code": str(col(r, "code") or r[1]),
+            "name": str(col(r, "name") or r[2]),
+            "grp":  str(col(r, "grp")  or r[3] or "SISTEMA"),
+            "label": f'{col(r,"code") or r[1]} — {col(r,"name") or r[2]}',
+            "severity": int(col(r, "severity") or r[4] or 0),
         })
-    return {"id": ("MPUA1" if mid == 1 else "MPUA2"), "count": len(items), "items": items}
+    return JSONResponse({"items": items}, headers={"Cache-Control":"no-store","Pragma":"no-cache"})
 
-@app.get("/api/mpu/history")
-def api_mpu_history(**kwargs):
-    return mpu_history(**kwargs)
+@app.post("/api/simulation/draw")
+def http_simulation_draw(body: dict = Body(...)):
+    """
+    Gera um cenário a partir de um code do catálogo.
+    Payload esperado pelo front:
+      { scenario_id, actuator, error{...}, cause, actions[], params{}, ui{}, resume_allowed }
+    """
+    mode = str(body.get("mode", "by_code"))
+    code = str(body.get("code") or "").strip()
 
-# -----------------------------------------------------------------------------
-# Live: atuadores / ciclos / vibração / timings
-# -----------------------------------------------------------------------------
-def _live_actuators_state_data_window(since_ms: int = 12000) -> Dict[str, Any]:
-    rows = fetch_all(
-        """
-        SELECT ts_utc, name, value_bool
-        FROM opc_samples
-        WHERE name IN (%s,%s,%s,%s,%s,%s,%s,%s)
-          AND ts_utc >= NOW(6) - INTERVAL %s MICROSECOND
-        ORDER BY ts_utc ASC, id ASC
-        """,
-        (*_NAMES_LATCH, since_ms * 1000)
-    )
+    if mode != "by_code" or not code:
+        raise HTTPException(status_code=422, detail="Use {mode:'by_code', code:'...'}")
 
-    def norm_row(r):
-        if isinstance(r, dict): return (r["ts_utc"], r["name"], r["value_bool"])
-        return (r[0], r[1], r[2])
+    row = fetch_one("""
+        SELECT id, code, name, grp, COALESCE(severity, 0) AS severity, default_actions, description
+        FROM error_catalog
+        WHERE code = %s
+        LIMIT 1
+    """, (code,))
+    if not row:
+        raise HTTPException(status_code=404, detail=f"code '{code}' não encontrado no catálogo")
 
-    a1_rows = [norm_row(r) for r in rows if ((r["name"] if isinstance(r,dict) else r[1]) in (_CFG_A1.v_av, _CFG_A1.v_rec, _CFG_A1.s_adv, _CFG_A1.s_rec))]
-    a2_rows = [norm_row(r) for r in rows if ((r["name"] if isinstance(r,dict) else r[1]) in (_CFG_A2.v_av, _CFG_A2.v_rec, _CFG_A2.s_adv, _CFG_A2.s_rec))]
+    err_id = int(col(row, "id") or row[0])
+    err_code = str(col(row, "code") or row[1])
+    err_name = str(col(row, "name") or row[2])
+    err_grp  = str(col(row, "grp")  or row[3] or "SISTEMA")
+    err_sev  = int(col(row, "severity") or row[4] or 0)
+    raw_actions = col(row, "default_actions") if isinstance(row, dict) else row[5]
+    desc = (col(row, "description") if isinstance(row, dict) else row[6]) or ""
 
-    st1 = _compute_latched_state(_CFG_A1, a1_rows, initial_displayed="RECUADO")
-    st2 = _compute_latched_state(_CFG_A2, a2_rows, initial_displayed="RECUADO")
+    # default_actions pode estar como JSON (["a","b"]) ou texto
+    actions: list[str] = []
+    if raw_actions:
+        try:
+            parsed = _json_loads(raw_actions)
+            if isinstance(parsed, list):
+                actions = [str(x) for x in parsed if isinstance(x, (str, int, float))]
+        except Exception:
+            pass
+    if not actions:
+        # fallback: separa por vírgula
+        actions = [p.strip() for p in str(raw_actions or "").split(",") if p.strip()]
 
-    return {
-        "ts": _now_iso(),
-        "actuators": [
-            {"actuator_id": 1, "state": st1.displayed, "pending": st1.pending_target,
-             "fault": st1.fault, "elapsed_ms": st1.elapsed_ms,
-             "started_at": (st1.started_at.isoformat() if st1.started_at else None)},
-            {"actuator_id": 2, "state": st2.displayed, "pending": st2.pending_target,
-             "fault": st2.fault, "elapsed_ms": st2.elapsed_ms,
-             "started_at": (st2.started_at.isoformat() if st2.started_at else None)},
-        ]
+    # escolhe um atuador (heurística simples pelo grupo)
+    actuator = 1 if err_grp.upper().startswith("MPU") else 2
+
+    payload = {
+        "scenario_id": f"{err_code}-{int(time.time()*1000)%100000}",
+        "actuator": 1 if actuator == 1 else 2,
+        "error": {
+            "id": err_id,
+            "code": err_code,
+            "name": err_name,
+            "grp": err_grp,
+            "severity": err_sev,
+        },
+        # causa básica (você pode refinar usando error_scenarios no futuro)
+        "cause": desc or f"Cenário simulado para {err_code}",
+        "actions": actions or ["Parada controlada", "Inspecionar equipamento"],
+        "params": {
+            "seed": int(time.time() * 1000) % 1_000_000,
+            "code": err_code,
+        },
+        # flags lidas pelo front pra pausar 3D/mostrar popup etc
+        "ui": {
+            "halt_sim": True,               # pausar a “lógica” da tela
+            "halt_3d": (err_sev >= 4),      # pausa 3D em severidade alta
+            "show_popup": True,
+        },
+        # se pode retomar (depende da severidade, por ex.)
+        "resume_allowed": (err_sev <= 3),
     }
+    return JSONResponse(payload, headers={"Cache-Control":"no-store","Pragma":"no-cache"})
 
-def _live_actuators_state_data_fast() -> Dict[str, Any]:
-    names = (
-        _CFG_A1.v_av, _CFG_A1.v_rec, _CFG_A1.s_adv, _CFG_A1.s_rec,
-        _CFG_A2.v_av, _CFG_A2.v_rec, _CFG_A2.s_adv, _CFG_A2.s_rec
-    )
-    latest = _fetch_latest_rows(names)
-    a1 = _infer_state_from_latest(_CFG_A1, latest)
-    a2 = _infer_state_from_latest(_CFG_A2, latest)
-    return {
-        "ts": _now_iso(),
-        "actuators": [
-            {"actuator_id": 1, **a1},
-            {"actuator_id": 2, **a2},
-        ]
-    }
+# ---------- aliases sem /api (opcional) ----------
+@app.get("/simulation/catalog")
+def compat_sim_catalog(): return http_simulation_catalog()
 
-# --- NOVO endpoint estável para Monitoring (não conflita com o antigo) -------
-@app.get("/api/live/actuators/state-mon", tags=["Live"])
-def live_actuators_state_mon(since_ms: int = 12000):
-    """
-    Endpoint dedicado para a aba Monitoring. Não altera /api/live/actuators/state.
-    """
-    try:
-        data = _live_actuators_state_data_fast()
-    except Exception:
-        data = _live_actuators_state_data_window(since_ms)
-    return JSONResponse(content=data, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
+@app.post("/simulation/draw")
+def compat_sim_draw(body: dict = Body(...)): return http_simulation_draw(body)
 
-# --- Aliases opcionais (mantidos, se quiser usar) -----------------------------
-@app.get("/live/actuators/state", tags=["Live"])
-def live_actuators_state_alias1(since_ms: int = 12000):
-    try:
-        data = _live_actuators_state_data_fast()
-    except Exception:
-        data = _live_actuators_state_data_window(since_ms)
-    return JSONResponse(content=data, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
-
-@app.get("/api/live/actuators/state2", tags=["Live"])
-def live_actuators_state_alias2(since_ms: int = 12000):
-    try:
-        data = _live_actuators_state_data_fast()
-    except Exception:
-        data = _live_actuators_state_data_window(since_ms)
-    return JSONResponse(content=data, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
-
-# --- Cycles total (FSM leve, compat) -----------------------------------------
-_cycle_fsm: Dict[int, Dict[str, Any]] = {
-    1: {"baseline": None, "last": None, "seen_other": False, "count": 0, "since_ts": time.time()},
-    2: {"baseline": None, "last": None, "seen_other": False, "count": 0, "since_ts": time.time()},
-}
-
-def _normalize_state(s: Any) -> Optional[str]:
-    if not s: return None
-    u = str(s).upper()
-    if "RECU" in u: return "RECUADO"
-    if "AVAN" in u: return "AVANÇADO"
-    return None
-
-def _update_cycle_fsm_from_state(aid: int, state: Optional[str]) -> None:
-    if aid not in _cycle_fsm: return
-    f = _cycle_fsm[aid]
-    if state not in ("RECUADO", "AVANÇADO"):
-        f["last"] = state
-        return
-    if f["baseline"] is None:
-        f["baseline"] = state
-        f["last"] = state
-        f["seen_other"] = False
-        f["since_ts"] = f.get("since_ts", time.time())
-        return
-    last = f["last"]
-    if state != last and state != f["baseline"]:
-        f["seen_other"] = True
-    if state == f["baseline"] and f.get("seen_other"):
-        f["count"] = int(f.get("count", 0)) + 1
-        f["seen_other"] = False
-    f["last"] = state
-
-@app.get("/api/live/cycles/total", tags=["Live"])
-def live_cycles_total():
-    def _impl():
-        states = _live_actuators_state_data_fast().get("actuators", [])
-        for it in states:
-            aid = int(it.get("actuator_id") or it.get("id"))
-            s = _normalize_state(it.get("state"))
-            if aid in (1, 2): _update_cycle_fsm_from_state(aid, s)
-
-        out = []; total = 0
-        for aid in (1, 2):
-            f = _cycle_fsm[aid]; c = int(f.get("count", 0)); total += c
-            out.append({
-                "actuator_id": aid,
-                "cycles": c,
-                "baseline": f.get("baseline"),
-                "last_state": f.get("last"),
-                "seen_other": f.get("seen_other"),
-                "since": dt_to_iso_utc(datetime.fromtimestamp(f.get("since_ts", time.time()), tz=timezone.utc)),
-            })
-        return {"total": total, "actuators": out, "ts": _now_iso()}
-    return cached("live_cycles_total", 0.05, _impl)
-
-# --- Vibration (janela curta) -------------------------------------------------
-@app.get("/api/live/vibration", tags=["Live"])
-def live_vibration(window_s: int = Query(2, ge=1, le=60)):
-    def _impl():
-        now = datetime.now(timezone.utc)
-        start = now - timedelta(seconds=window_s)
-        rows = fetch_all(
-            """
-            SELECT mpu_id AS mpu_id, ts_utc AS ts_utc, ax_g, ay_g, az_g
-            FROM mpu_samples
-            WHERE ts_utc >= %s AND ts_utc < %s
-            """,
-            (start, now),
-        )
-        if not rows:
-            return {"items": []}
-        by: Dict[int, Dict[str, List[Any]]] = {}
-        for r in rows:
-            mpu_id = int(col(r, "mpu_id") or col(r, 0))
-            ts = col(r, "ts_utc") or col(r, 1)
-            ax = col(r, "ax_g"); ay = col(r, "ay_g"); az = col(r, "az_g")
-            d = by.setdefault(mpu_id, {"ax": [], "ay": [], "az": [], "ts": []})
-            d["ax"].append(0.0 if ax is None else float(ax))
-            d["ay"].append(0.0 if ay is None else float(ay))
-            d["az"].append(0.0 if az is None else float(az))
-            d["ts"].append(ts)
-        items = []
-        for mpu_id, d in by.items():
-            rms_ax = (sum(v*v for v in d["ax"]) / max(1, len(d["ax"]))) ** 0.5
-            rms_ay = (sum(v*v for v in d["ay"]) / max(1, len(d["ay"]))) ** 0.5
-            rms_az = (sum(v*v for v in d["az"]) / max(1, len(d["az"]))) ** 0.5
-            overall = float((rms_ax**2 + rms_ay**2 + rms_az**2) ** 0.5)
-            items.append({
-                "mpu_id": mpu_id,
-                "ts_start": dt_to_iso_utc(min(d["ts"])),
-                "ts_end": dt_to_iso_utc(max(d["ts"])),
-                "rms_ax": float(rms_ax), "rms_ay": float(rms_ay), "rms_az": float(rms_az),
-                "overall": overall,
-            })
-        return {"items": items}
-    return cached(f"live_vibration:{window_s}", 0.05, _impl)
-
-# --- CPM por janela (S1/S2) ---------------------------------------------------
-@app.get("/api/live/actuators/cpm", tags=["Live"])
-def live_actuators_cpm(window_s: int = Query(60, ge=10, le=600)):
-    try:
-        s_map = {
-            1: {"S1": _CFG_A1.s_adv, "S2": _CFG_A1.s_rec},  # atenção: nomes conforme config atual
-            2: {"S1": _CFG_A2.s_adv, "S2": _CFG_A2.s_rec},
-        }
-        names = [v for m in s_map.values() for v in (m["S1"], m["S2"])]
-        raw = _fetch_series(names, window_s)
-        compact = {k: _dedup(v) for k, v in raw.items()}
-
-        out = []
-        for aid, m in s_map.items():
-            s1 = compact.get(m["S1"], [])
-            s2 = compact.get(m["S2"], [])
-            opened, closed = _derive_open_closed_from_S1S2(s1, s2)
-            e_open  = _rising_edges(opened)
-            e_close = _rising_edges(closed)
-            cycles = min(len(e_open), len(e_close))
-            cpm = cycles * (60.0 / float(window_s)) if window_s > 0 else 0.0
-            out.append({"id": aid, "window_s": window_s, "cycles": cycles, "cpm": cpm})
-
-        return {"actuators": out, "ts": _now_iso()}
-    except Exception as e:
-        return JSONResponse(
-            status_code=200,
-            content={"actuators": [{"id": 1, "window_s": window_s, "cycles": 0, "cpm": 0.0},
-                                   {"id": 2, "window_s": window_s, "cycles": 0, "cpm": 0.0}],
-                     "ts": _now_iso(), "error": str(e)[:200]},
-            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
-        )
-
-# --- Timings via S1/S2 (sem tabelas auxiliares) -------------------------------
-@app.get("/api/live/actuators/timings", tags=["Live"])
-def live_actuator_timings(window_s: int = Query(600, ge=60, le=3600)):
-    try:
-        s_map = {
-            1: {"S1": _CFG_A1.s_adv, "S2": _CFG_A1.s_rec},
-            2: {"S1": _CFG_A2.s_adv, "S2": _CFG_A2.s_rec},
-        }
-        names = [v for m in s_map.values() for v in (m["S1"], m["S2"])]
-        raw = _fetch_series(names, window_s)
-        compact = {k: _dedup(v) for k, v in raw.items()}
-
-        out = []
-        for aid, m in s_map.items():
-            s1 = compact.get(m["S1"], [])
-            s2 = compact.get(m["S2"], [])
-            opened, closed = _derive_open_closed_from_S1S2(s1, s2)
-            t_abre  = _last_pulse_duration(opened)
-            t_fecha = _last_pulse_duration(closed)
-            t_ciclo = (t_abre or 0.0) + (t_fecha or 0.0) if (t_abre or t_fecha) else None
-
-            out.append({
-                "actuator_id": aid,
-                "last": {
-                    "ts_utc": None,
-                    "dt_abre_s":  t_abre,
-                    "dt_fecha_s": t_fecha,
-                    "dt_ciclo_s": t_ciclo,
-                }
-            })
-        return {"actuators": out, "ts": _now_iso()}
-    except Exception as e:
-        safe = [
-            {"actuator_id": 1, "last": {"ts_utc": None, "dt_abre_s": None, "dt_fecha_s": None, "dt_ciclo_s": None}},
-            {"actuator_id": 2, "last": {"ts_utc": None, "dt_abre_s": None, "dt_fecha_s": None, "dt_ciclo_s": None}},
-        ]
-        return JSONResponse(
-            status_code=200,
-            content={"actuators": safe, "ts": _now_iso(), "error": str(e)[:200]},
-            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
-        )
-
-# -----------------------------------------------------------------------------
-# Analytics: minuto agregado (CPM/tempos/runtime)
-# -----------------------------------------------------------------------------
-@app.get("/metrics/minute-agg")
-def metrics_minute_agg(act: str = Query("A1"), since: str = Query("-60m")):
-    """
-    Retorna **array** de agregações por minuto (o front espera `MinuteAgg[]`).
-    """
-    try:
-        data = get_kpis() or {}
-        items = data.get("minute_agg", [])
-        if isinstance(items, dict) and "items" in items:
-            items = items["items"]
-        if isinstance(items, list):
-            return items
-        return []
-    except Exception:
-        return []
-
-# --- routers adicionais (se existirem) ---------------------------------------
-try:
-    from .routes import simulation  # opcional
-    app.include_router(simulation.router)
-except Exception as e:
-    print(f"[simulation] router não carregado: {e}")
-
-try:
-    from .routes import alerts as alerts_route  # opcional
-    app.include_router(alerts_route.router)
-except Exception as e:
-    print(f"[alerts] router não carregado: {e}")
-
-# --- RESTAURA rota clássica usada pelo Dashboard ------------------------------
-@app.get("/api/live/actuators/state", tags=["Live"])
-def live_actuators_state(since_ms: int = 12000):
-    """
-    Compatibilidade: rota clássica usada pelo Dashboard/LiveContext.
-    Tenta caminho rápido (últimos por nome) e cai para janela se necessário.
-    """
-    try:
-        data = _live_actuators_state_data_fast()
-    except Exception:
-        data = _live_actuators_state_data_window(since_ms)
-    return JSONResponse(content=data, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
