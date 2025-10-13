@@ -1,17 +1,22 @@
 # app.py — DUAL “idêntico ao OPCUA” + MPU gravando amostras brutas (sem windows)
 # Tabelas: gmdigital.opc_samples, gmdigital.mpu_samples
-# Modos: SIMULATE | OPCUA | SERIAL_MPU | DUAL | DEV
+# Modos: SIMULATE | OPCUA | SERIAL_MPU | DUAL | DEV | DEV_DUAL
 import os, csv, json, time, signal, sys
 from typing import List, Dict, Any, Iterable, Optional
 from datetime import datetime
 from dotenv import load_dotenv
 load_dotenv()
 
+# ===== Imports DEV =====
 try:
     from dev_reader import DevReader
 except Exception:
     DevReader = None
 
+try:
+    from dev_mpu_reader import DevMpuReader
+except Exception:
+    DevMpuReader = None
 
 # ===== UTC helpers =====
 def _get_utc():
@@ -41,7 +46,7 @@ def iso_to_mysql_dt6(iso_str: str) -> str:
     return s
 
 # ===== Config =====
-DATA_MODE = os.getenv("DATA_MODE", "DUAL").upper()      # SIMULATE | OPCUA | SERIAL_MPU | DUAL | DEV
+DATA_MODE = os.getenv("DATA_MODE", "DUAL").upper()      # SIMULATE | OPCUA | SERIAL_MPU | DUAL | DEV | DEV_DUAL
 SINK_MODE = os.getenv("SINK_MODE", "MYSQL").upper()     # MYSQL | CSV
 
 # OPC UA
@@ -63,7 +68,7 @@ CSV_MPU_PATH = os.getenv("CSV_MPU_PATH", "bank_mpu.csv")
 # MySQL
 MYSQL_HOST = os.getenv("MYSQL_HOST", "localhost")
 MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
-MYSQL_DB   = os.getenv("MYSQL_DB", "gmdigital")  # <- padrão ajustado para gmdigital
+MYSQL_DB   = os.getenv("MYSQL_DB", "gmdigital")
 MYSQL_USER = os.getenv("MYSQL_USER", "root")
 MYSQL_PASS = os.getenv("MYSQL_PASS", "")
 
@@ -229,13 +234,17 @@ class MySqlOpcSink(MySqlBase):
               ts_utc DATETIME(6) NOT NULL,
               name VARCHAR(128) NOT NULL,
               value_bool TINYINT(1) NULL,
+              actuator_id TINYINT UNSIGNED NULL,
+              facet VARCHAR(8) NULL,
               INDEX idx_opc_name_ts (name, ts_utc),
-              INDEX idx_opc_ts (ts_utc)
+              INDEX idx_opc_ts (ts_utc),
+              INDEX idx_opc_actuator_ts (actuator_id, ts_utc)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """); cur.close(); self.conn.commit()
     def write_many(self, ts_iso: str, values: Dict[str, Any]):
         ts_mysql = iso_to_mysql_dt6(ts_iso)
         cur = self.conn.cursor()
+        # Inserimos apenas as colunas disponíveis; actuator_id/facet ficam NULL
         cur.executemany(
             "INSERT INTO opc_samples (ts_utc,name,value_bool) VALUES (%s,%s,%s)",
             [(ts_mysql, name, (None if v is None else int(bool(v)))) for name, v in values.items()]
@@ -302,44 +311,41 @@ def opc_loop():
     items = load_nodes(NODES_CSV)
     names = [i["name"] for i in items]
 
-    # Fonte
-    if DATA_MODE == "DEV":
+    # ===== Fonte =====
+    if DATA_MODE in ("DEV", "DEV_DUAL"):
         if DevReader is None:
-            raise RuntimeError("DevReader não encontrado. Garanta collectors/dev_reader.py disponível.")
+            raise RuntimeError("DevReader não encontrado. Garanta dev_reader.py disponível.")
         reader, connected = DevReader(NODES_CSV), True
     elif DATA_MODE == "SIMULATE":
         reader, connected = Simulator(items), True
     else:
         reader, connected = OpcUaReader(OPCUA_ENDPOINT, items), False
 
-    # Sink
+    # ===== Sink =====
     sink = MySqlOpcSink() if SINK_MODE == "MYSQL" else CsvOpcSink(CSV_OPC_PATH, names)
 
-    # Intervalo determinístico (20 ms no DEV; POLL_INTERVAL nos demais)
-    if DATA_MODE == "DEV":
-        dev_tick_ms = float(os.getenv("DEV_TICK_MS", "20"))
+    # ===== Intervalo ===== (200 ms em DEV/DEV_DUAL)
+    if DATA_MODE in ("DEV", "DEV_DUAL"):
+        dev_tick_ms = float(os.getenv("DEV_TICK_MS", "200"))
         interval = max(0.001, dev_tick_ms / 1000.0)
     else:
         interval = max(0.01, float(POLL_INTERVAL))
-        # >>> DEBUG DO INTERVALO EFETIVO <<<
     print(f"[DEV] interval={interval:.6f}s  mode={DATA_MODE}  sink={SINK_MODE}")
+
+    # métricas do loop
     t_prev = time.perf_counter()
     tick = 0
 
     try:
         if hasattr(reader, "connect") and not connected:
             while not STOP.is_set() and not connected:
-                tick += 1
-                if tick % 1000 == 0:
-                    t_now = time.perf_counter()
-                    elapsed = t_now - t_prev
-                print(f"[DEV] 1000 ticks em {elapsed:.3f}s  (média {elapsed/1000:.6f}s/tick)")
-                t_prev = t_now
-                try: reader.connect(); connected = True
+                try:
+                    reader.connect(); connected = True
                 except Exception as e:
-                    print(f"[OPC] Conexão falhou: {e}. Retentando em 0.5s..."); time.sleep(0.5)
+                    print(f"[OPC] Conexão falhou: {e}. Retentando em 0.5s...")
+                    time.sleep(0.5)
 
-        # === TICK DETERMINÍSTICO (idêntico ao modo OPCUA) ===
+        # === TICK DETERMINÍSTICO ===
         next_t = time.perf_counter()
         while not STOP.is_set():
             next_t += interval
@@ -354,7 +360,8 @@ def opc_loop():
                     while not STOP.is_set() and not connected:
                         try: reader.connect(); connected = True
                         except Exception as e2:
-                            print(f"[OPC] Reconnect falhou: {e2}. Retentando em 0.5s..."); time.sleep(0.5)
+                            print(f"[OPC] Reconnect falhou: {e2}. Retentando em 0.5s...")
+                            time.sleep(0.5)
                 values = {}
             ts = now_utc_iso()
             try:
@@ -363,6 +370,15 @@ def opc_loop():
             except Exception as e:
                 print(f"[OPC] Erro gravação: {e}")
             _publish_opc_events(ts, values)
+
+            # métrica a cada 1000 ticks
+            tick += 1
+            if tick % 1000 == 0:
+                t_now = time.perf_counter()
+                elapsed = t_now - t_prev
+                print(f"[DEV] 1000 ticks em {elapsed:.3f}s  (média {elapsed/1000:.6f}s/tick)")
+                t_prev = t_now
+
             rem = next_t - time.perf_counter()
             if rem > 0: time.sleep(rem)
             else: next_t = time.perf_counter()
@@ -404,11 +420,55 @@ def mpu_loop_forever():
         except Exception: pass
         ser.disconnect()
 
+def mpu_loop_dev():
+    reader = DevMpuReader()
+    sink = MySqlMpuSink() if SINK_MODE == "MYSQL" else CsvMpuSink(CSV_MPU_PATH)
+    # intervalo do MPU (ms) — usa DEV_TICK_MS_MPU se setado; senão DEV_TICK_MS
+    dev_tick_ms = float(os.getenv("DEV_TICK_MS_MPU", os.getenv("DEV_TICK_MS", "200")))
+    interval = max(0.001, dev_tick_ms / 1000.0)
+    try:
+        next_t = time.perf_counter()
+        while True:
+            next_t += interval
+            s1, s2 = reader.read_tick()
+            ts_iso = now_utc_iso()
+            s1_row = { "ts_utc": ts_iso, **s1 }
+            s2_row = { "ts_utc": ts_iso, **s2 }
+            try:
+                if isinstance(sink, MySqlMpuSink):
+                    sink.write_sample(ts_iso, s1_row); sink.write_sample(ts_iso, s2_row)
+                else:
+                    sink.write_sample(s1_row); sink.write_sample(s2_row)
+            except Exception as e:
+                print(f"[MPU-DEV] Erro gravação: {e}")
+            _publish_mpu_sample(s1_row); _publish_mpu_sample(s2_row)
+            rem = next_t - time.perf_counter()
+            if rem > 0: time.sleep(rem)
+            else: next_t = time.perf_counter()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            if hasattr(sink, "close"): sink.close()
+        except Exception: pass
+
 # ===== Execução =====
 def run_dual():
     # OPC no processo principal (mesmo laço do modo OPCUA). MPU em outro processo.
     from multiprocessing import Process
     p_mpu = Process(target=mpu_loop_forever, name="mpu_proc", daemon=True)
+    p_mpu.start()
+    try:
+        opc_loop()
+    finally:
+        if p_mpu.is_alive():
+            p_mpu.terminate()
+            p_mpu.join(timeout=3.0)
+
+def run_dev_dual():
+    # OPC (DevReader) no processo principal; MPU (DevMpuReader) em outro processo.
+    from multiprocessing import Process
+    p_mpu = Process(target=mpu_loop_dev, name="mpu_dev_proc", daemon=True)
     p_mpu.start()
     try:
         opc_loop()
@@ -423,13 +483,12 @@ def run_mpu_only(): mpu_loop_forever()
 def main():
     mode = DATA_MODE
     if mode == "DUAL": run_dual()
+    elif mode == "DEV_DUAL": run_dev_dual()
     elif mode in ("OPCUA","SIMULATE","DEV"): run_opc_only()
     elif mode == "SERIAL_MPU": run_mpu_only()
     else:
-        print(f"[ERRO] DATA_MODE inválido: {mode} (use SIMULATE | OPCUA | SERIAL_MPU | DUAL | DEV)")
+        print(f"[ERRO] DATA_MODE inválido: {mode} (use SIMULATE | OPCUA | SERIAL_MPU | DUAL | DEV | DEV_DUAL)")
         sys.exit(2)
 
 if __name__ == "__main__":
     main()
-
-
