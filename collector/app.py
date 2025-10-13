@@ -1,11 +1,17 @@
 # app.py — DUAL “idêntico ao OPCUA” + MPU gravando amostras brutas (sem windows)
-# Tabelas: festo_dt.opc_samples, festo_dt.mpu_samples
-# Modos: SIMULATE | OPCUA | SERIAL_MPU | DUAL
+# Tabelas: gmdigital.opc_samples, gmdigital.mpu_samples
+# Modos: SIMULATE | OPCUA | SERIAL_MPU | DUAL | DEV
 import os, csv, json, time, signal, sys
 from typing import List, Dict, Any, Iterable, Optional
 from datetime import datetime
 from dotenv import load_dotenv
 load_dotenv()
+
+try:
+    from dev_reader import DevReader
+except Exception:
+    DevReader = None
+
 
 # ===== UTC helpers =====
 def _get_utc():
@@ -35,7 +41,7 @@ def iso_to_mysql_dt6(iso_str: str) -> str:
     return s
 
 # ===== Config =====
-DATA_MODE = os.getenv("DATA_MODE", "DUAL").upper()      # SIMULATE | OPCUA | SERIAL_MPU | DUAL
+DATA_MODE = os.getenv("DATA_MODE", "DUAL").upper()      # SIMULATE | OPCUA | SERIAL_MPU | DUAL | DEV
 SINK_MODE = os.getenv("SINK_MODE", "MYSQL").upper()     # MYSQL | CSV
 
 # OPC UA
@@ -57,7 +63,7 @@ CSV_MPU_PATH = os.getenv("CSV_MPU_PATH", "bank_mpu.csv")
 # MySQL
 MYSQL_HOST = os.getenv("MYSQL_HOST", "localhost")
 MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
-MYSQL_DB   = os.getenv("MYSQL_DB", "festo_dt")
+MYSQL_DB   = os.getenv("MYSQL_DB", "gmdigital")  # <- padrão ajustado para gmdigital
 MYSQL_USER = os.getenv("MYSQL_USER", "root")
 MYSQL_PASS = os.getenv("MYSQL_PASS", "")
 
@@ -295,18 +301,40 @@ def _publish_mpu_sample(sample: Dict[str, Any]):
 def opc_loop():
     items = load_nodes(NODES_CSV)
     names = [i["name"] for i in items]
+
     # Fonte
-    if DATA_MODE == "SIMULATE":
+    if DATA_MODE == "DEV":
+        if DevReader is None:
+            raise RuntimeError("DevReader não encontrado. Garanta collectors/dev_reader.py disponível.")
+        reader, connected = DevReader(NODES_CSV), True
+    elif DATA_MODE == "SIMULATE":
         reader, connected = Simulator(items), True
     else:
         reader, connected = OpcUaReader(OPCUA_ENDPOINT, items), False
+
     # Sink
     sink = MySqlOpcSink() if SINK_MODE == "MYSQL" else CsvOpcSink(CSV_OPC_PATH, names)
 
-    interval = max(0.01, float(POLL_INTERVAL))
+    # Intervalo determinístico (20 ms no DEV; POLL_INTERVAL nos demais)
+    if DATA_MODE == "DEV":
+        dev_tick_ms = float(os.getenv("DEV_TICK_MS", "20"))
+        interval = max(0.001, dev_tick_ms / 1000.0)
+    else:
+        interval = max(0.01, float(POLL_INTERVAL))
+        # >>> DEBUG DO INTERVALO EFETIVO <<<
+    print(f"[DEV] interval={interval:.6f}s  mode={DATA_MODE}  sink={SINK_MODE}")
+    t_prev = time.perf_counter()
+    tick = 0
+
     try:
         if hasattr(reader, "connect") and not connected:
             while not STOP.is_set() and not connected:
+                tick += 1
+                if tick % 1000 == 0:
+                    t_now = time.perf_counter()
+                    elapsed = t_now - t_prev
+                print(f"[DEV] 1000 ticks em {elapsed:.3f}s  (média {elapsed/1000:.6f}s/tick)")
+                t_prev = t_now
                 try: reader.connect(); connected = True
                 except Exception as e:
                     print(f"[OPC] Conexão falhou: {e}. Retentando em 0.5s..."); time.sleep(0.5)
@@ -395,11 +423,13 @@ def run_mpu_only(): mpu_loop_forever()
 def main():
     mode = DATA_MODE
     if mode == "DUAL": run_dual()
-    elif mode in ("OPCUA","SIMULATE"): run_opc_only()
+    elif mode in ("OPCUA","SIMULATE","DEV"): run_opc_only()
     elif mode == "SERIAL_MPU": run_mpu_only()
     else:
-        print(f"[ERRO] DATA_MODE inválido: {mode} (use SIMULATE | OPCUA | SERIAL_MPU | DUAL)")
+        print(f"[ERRO] DATA_MODE inválido: {mode} (use SIMULATE | OPCUA | SERIAL_MPU | DUAL | DEV)")
         sys.exit(2)
 
 if __name__ == "__main__":
     main()
+
+
