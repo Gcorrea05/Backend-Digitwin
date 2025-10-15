@@ -76,6 +76,34 @@ async def pool_error_handler(_, __):
 # Imports locais (apenas o essencial)
 # =============================================================================
 from .database import get_db
+from .database import fetch_all as db_fetch_all   # usa seu helper real
+
+
+from .routes import metrics as metrics_routes
+app.include_router(metrics_routes.router)
+app.include_router(metrics_routes.router, prefix="/api")
+
+@app.get("/api/mpu/ids")
+def get_mpu_ids_api() -> Dict[str, List[Any]]:
+    # tenta mpu_id (schema mais comum)
+    rows = db_fetch_all("SELECT DISTINCT mpu_id FROM mpu_samples ORDER BY mpu_id")
+    # fallback: se sua tabela usa 'id' em vez de 'mpu_id'
+    if not rows:
+        rows = db_fetch_all("SELECT DISTINCT id AS mpu_id FROM mpu_samples ORDER BY id")
+
+    ids: List[Any] = []
+    for r in rows:
+        # como o cursor está em dictionary=True, r é dict
+        val = r.get("mpu_id")
+        if val is not None:
+            ids.append(val)
+
+    return {"ids": ids}
+
+# alias sem /api, para compat com partes do front que chamam sem prefixo
+@app.get("/mpu/ids")
+def get_mpu_ids_compat() -> Dict[str, List[Any]]:
+    return get_mpu_ids_api()
 
 # =============================================================================
 # Config / Constantes
