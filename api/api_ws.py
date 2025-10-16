@@ -328,21 +328,43 @@ def _infer_state_from_latest(cfg: _LatchCfg, latest: Dict[str, Dict[str, Any]]):
     }
 
 def _fetch_series(names: List[str], window_s: int) -> Dict[str, List[Tuple[datetime,int]]]:
+    """
+    Busca séries binárias ancoradas em MAX(ts_utc) com 'pré-rolo' para
+    detectar bordas no início da janela (evita CPM=0 por meia transição).
+    """
     if not names:
         return {}
+
     placeholders = ", ".join(["%s"] * len(names))
+
+    # Âncora = última amostra observada (imune a skew de relógio)
+    ref_row = fetch_one(f"SELECT COALESCE(MAX(ts_utc), NOW(6)) AS ref_ts FROM {OPC_TABLE}")
+    ref_ts = col(ref_row, "ref_ts") if isinstance(ref_row, dict) else (ref_row[0] if ref_row else None)
+    if ref_ts is None:
+        return {str(n): [] for n in names}
+
+    # Janela principal e pré-rolo (5s)
+    pre_roll_s = 5
     sql = f"""
         SELECT name, ts_utc, value_bool
         FROM {OPC_TABLE}
         WHERE name IN ({placeholders})
-          AND ts_utc >= NOW(6) - INTERVAL %s SECOND
+          AND ts_utc BETWEEN DATE_SUB(%s, INTERVAL %s SECOND) AND %s
         ORDER BY ts_utc ASC
     """
-    rows = fetch_all(sql, (*names, window_s))
+    # buscamos window_s + pre_roll_s e depois apararmos
+    rows = fetch_all(sql, (*names, ref_ts, window_s + pre_roll_s, ref_ts))
+
+    # Corte: início real da janela (sem pré-rolo)
+    start_real = _coerce_to_datetime(ref_ts) - timedelta(seconds=window_s)
+
+    # Vamos manter, para cada nome, **no máximo 1 ponto antes de start_real**
     out: Dict[str, List[Tuple[datetime,int]]] = {str(n): [] for n in names}
-    for r in rows:
-        nm = str(col(r, "name") or r[0])
-        ts_raw = col(r, "ts_utc") or r[1]
+    last_before: Dict[str, Tuple[datetime,int] | None] = {str(n): None for n in names}
+
+    for r in rows or []:
+        nm = str(col(r, "name") or (r[0] if not isinstance(r, dict) else ""))
+        ts_raw = col(r, "ts_utc") if isinstance(r, dict) else r[1]
         vb_raw = col(r, "value_bool") if isinstance(r, dict) else r[2]
         dt = _coerce_to_datetime(ts_raw)
         if dt is None or vb_raw is None:
@@ -351,8 +373,20 @@ def _fetch_series(names: List[str], window_s: int) -> Dict[str, List[Tuple[datet
             v = 1 if int(vb_raw) else 0
         except Exception:
             v = 1 if bool(vb_raw) else 0
-        out[nm].append((dt, v))
+
+        if dt < start_real:
+            # candidato a "ponto de contexto" (guarda só o ÚLTIMO antes do início)
+            last_before[nm] = (dt, v)
+        else:
+            out[nm].append((dt, v))
+
+    # injeta o ponto de contexto (se houver) no começo de cada série
+    for nm in list(out.keys()):
+        if last_before[nm] is not None:
+            out[nm].insert(0, last_before[nm])
+
     return out
+
 
 def _dedup(seq: List[Tuple[datetime,int]]) -> List[Tuple[datetime,int]]:
     if not seq:
@@ -417,20 +451,35 @@ def _rising_edges(seq: List[Tuple[datetime,int]]) -> List[datetime]:
             edges.append(seq[i][0])
     return edges
 
-def _last_pulse_duration(seq: List[Tuple[datetime,int]]) -> Optional[float]:
-    if not seq: return None
-    last_on = None; last_pulse = None
+def _last_pulse_duration(
+    seq: List[Tuple[datetime,int]],
+    now_dt: Optional[datetime] = None
+) -> Optional[float]:
+    """
+    Duração (s) do último pulso 0->1->0.
+    Se a série termina em 1, retorna (now_dt - last_on).
+    now_dt permite usar a MESMA âncora temporal da série (ex.: MAX(ts_utc)).
+    """
+    if not seq:
+        return None
+    if now_dt is None:
+        now_dt = datetime.now(timezone.utc)
+
+    last_on = None
+    last_pulse = None
     for i in range(1, len(seq)):
-        if seq[i-1][1]==0 and seq[i][1]==1:
+        if seq[i-1][1] == 0 and seq[i][1] == 1:
             last_on = seq[i][0]
-        if seq[i-1][1]==1 and seq[i][1]==0 and last_on:
+        if seq[i-1][1] == 1 and seq[i][1] == 0 and last_on:
             last_pulse = (last_on, seq[i][0])
+
     if last_pulse:
         t_on, t_off = last_pulse
         return (t_off - t_on).total_seconds()
-    if seq[-1][1]==1 and last_on:
-        return (datetime.now(timezone.utc) - last_on).total_seconds()
+    if seq[-1][1] == 1 and last_on:
+        return (now_dt - last_on).total_seconds()
     return None
+
 
 # =============================================================================
 # Payload builders (contratos WS)
@@ -446,23 +495,57 @@ def build_live_payload() -> dict:
     return {"type": "live", "ts": _now_iso(), "actuators": items}
 
 def build_monitoring_payload() -> dict:
-    s_map = {1: {"S1": _CFG_A1.s_adv, "S2": _CFG_A1.s_rec},
-             2: {"S1": _CFG_A2.s_adv, "S2": _CFG_A2.s_rec}}
-    names = [v for m in s_map.values() for v in (m["S1"], m["S2"])]
-    raw = _fetch_series(names, 2)
-    compact = {k: _dedup(v) for k, v in raw.items()}
-    timings = []
-    for aid, m in s_map.items():
-        s1 = compact.get(m["S1"], [])
-        s2 = compact.get(m["S2"], [])
-        opened, closed = _derive_open_closed_from_S1S2(s1, s2)
-        t_abre  = _last_pulse_duration(opened)
-        t_fecha = _last_pulse_duration(closed)
-        t_ciclo = (t_abre or 0.0) + (t_fecha or 0.0) if (t_abre or t_fecha) else None
-        timings.append({"actuator_id": aid, "last": {
-            "dt_abre_s": t_abre, "dt_fecha_s": t_fecha, "dt_ciclo_s": t_ciclo
-        }})
+    # Janela para calcular DTs (segundos)
+    WINDOW_S_PRIMARY  = int(os.getenv("MON_TIMING_WINDOW_S", "60"))   # antes 10/2
+    WINDOW_S_FALLBACK = int(os.getenv("MON_TIMING_FALLBACK_S", "60")) # igual/maior que a primária
 
+    s_map = {
+        1: {"S1": _CFG_A1.s_adv, "S2": _CFG_A1.s_rec},
+        2: {"S1": _CFG_A2.s_adv, "S2": _CFG_A2.s_rec},
+    }
+    names = [v for m in s_map.values() for v in (m["S1"], m["S2"])]
+
+    # Âncora temporal igual à usada por _fetch_series (imune a skew do relógio local)
+    ref_row = fetch_one(f"SELECT COALESCE(MAX(ts_utc), NOW(6)) AS ref_ts FROM {OPC_TABLE}")
+    ref_ts = _coerce_to_datetime(
+        col(ref_row, "ref_ts") if isinstance(ref_row, dict) else (ref_row[0] if ref_row else None)
+    ) or datetime.now(timezone.utc)
+
+    def _nonneg(x: Optional[float]) -> Optional[float]:
+        if x is None:
+            return None
+        return x if x >= 0 else 0.0
+
+    def _timings_for_window(win_s: int):
+        raw = _fetch_series(names, win_s)              # já ancorado em ref_ts internamente
+        compact = {k: _dedup(v) for k, v in raw.items()}
+        timings = []
+        for aid, m in s_map.items():
+            s1 = compact.get(m["S1"], [])
+            s2 = compact.get(m["S2"], [])
+            opened, closed = _derive_open_closed_from_S1S2(s1, s2)
+
+            # segundos; usa a MESMA âncora (ref_ts) para evitar negativos
+            t_abre  = _nonneg(_last_pulse_duration(opened, now_dt=ref_ts))
+            t_fecha = _nonneg(_last_pulse_duration(closed, now_dt=ref_ts))
+            t_ciclo = ((t_abre or 0.0) + (t_fecha or 0.0)) if (t_abre or t_fecha) else None
+
+            timings.append({
+                "actuator_id": aid,
+                "last": {"dt_abre_s": t_abre, "dt_fecha_s": t_fecha, "dt_ciclo_s": t_ciclo},
+            })
+        return timings
+
+    # tenta janela primária; se nenhum pulso for visto, usa fallback
+    timings = _timings_for_window(WINDOW_S_PRIMARY)
+    need_fallback = all(
+        (t.get("last", {}).get("dt_abre_s") is None and t.get("last", {}).get("dt_fecha_s") is None)
+        for t in timings
+    )
+    if need_fallback and WINDOW_S_FALLBACK > WINDOW_S_PRIMARY:
+        timings = _timings_for_window(WINDOW_S_FALLBACK)
+
+    # Vibração mantém janela curta (2 s)
     now = datetime.now(timezone.utc)
     start = now - timedelta(seconds=2)
     rows = fetch_all(
@@ -492,23 +575,116 @@ def build_monitoring_payload() -> dict:
         "vibration": {"window_s": 2, "items": vib_items},
     }
 
+
 def build_cpm_payload(window_s: int = 60) -> dict:
-    s_map = {1: {"S1": _CFG_A1.s_adv, "S2": _CFG_A1.s_rec},
-             2: {"S1": _CFG_A2.s_adv, "S2": _CFG_A2.s_rec}}
+    """
+    Calcula CPM por atuador em uma janela de `window_s` segundos.
+    Um ciclo é contado a cada transição para o estado FECHADO (rising de "closed"),
+    o que contabiliza ciclos completos mesmo quando a abertura começou antes da janela.
+    """
+    s_map = {
+        1: {"S1": _CFG_A1.s_adv, "S2": _CFG_A1.s_rec},
+        2: {"S1": _CFG_A2.s_adv, "S2": _CFG_A2.s_rec},
+    }
+
     names = [v for m in s_map.values() for v in (m["S1"], m["S2"])]
     raw = _fetch_series(names, window_s)
     compact = {k: _dedup(v) for k, v in raw.items()}
+
     out = []
     for aid, m in s_map.items():
         s1 = compact.get(m["S1"], [])
         s2 = compact.get(m["S2"], [])
+
+        # Reconstrói as séries de estado "aberto" e "fechado"
         opened, closed = _derive_open_closed_from_S1S2(s1, s2)
-        e_open  = _rising_edges(opened)
-        e_close = _rising_edges(closed)
-        cycles = min(len(e_open), len(e_close))
+
+        # Bordas 0->1
+        e_open  = _rising_edges(opened)   # quando o estado "aberto" liga
+        e_close = _rising_edges(closed)   # quando o estado "fechado" liga
+
+        # 🔑 Conta ciclos como "entradas em fechado" na janela
+        cycles = len(e_close)
+
         cpm = cycles * (60.0 / float(window_s)) if window_s > 0 else 0.0
         out.append({"id": aid, "cycles": cycles, "cpm": cpm, "window_s": window_s})
+
     return {"type": "cpm", "ts": _now_iso(), "window_s": window_s, "items": out}
+
+
+
+
+@app.get("/api/debug/cpm")
+def debug_cpm(window_s: int = 60):
+    s_map = {1: {"S1": _CFG_A1.s_adv, "S2": _CFG_A1.s_rec},
+             2: {"S1": _CFG_A2.s_adv, "S2": _CFG_A2.s_rec}}
+    names = [v for m in s_map.values() for v in (m["S1"], m["S2"])]
+
+    # ref_ts = MAX(ts_utc) (a mesma âncora usada por _fetch_series modificado)
+    ref_row = fetch_one(f"SELECT COALESCE(MAX(ts_utc), NOW(6)) AS ref_ts FROM {OPC_TABLE}")
+    ref_ts = col(ref_row, "ref_ts") if isinstance(ref_row, dict) else (ref_row[0] if ref_row else None)
+
+    series = _fetch_series(names, window_s)
+
+    def tail(lst, n=5):
+        return [{"ts": dt_to_iso_utc(t), "v": v} for (t, v) in lst[-n:]]
+
+    payload = {
+        "ref_ts": dt_to_iso_utc(ref_ts),
+        "window_s": window_s,
+        "names": names,
+        "sizes": {k: len(v) for k, v in series.items()},
+        "tails": {k: tail(v, 5) for k, v in series.items()},
+        "now": _now_iso(),
+    }
+    return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+@app.get("/api/debug/cpm2")
+def debug_cpm2(window_s: int = 60):
+    s_map = {1: {"S1": _CFG_A1.s_adv, "S2": _CFG_A1.s_rec},
+             2: {"S1": _CFG_A2.s_adv, "S2": _CFG_A2.s_rec}}
+    names = [v for m in s_map.values() for v in (m["S1"], m["S2"])]
+
+    # mesma âncora usada no _fetch_series corrigido
+    ref_row = fetch_one(f"SELECT COALESCE(MAX(ts_utc), NOW(6)) AS ref_ts FROM {OPC_TABLE}")
+    ref_ts = col(ref_row, "ref_ts") if isinstance(ref_row, dict) else (ref_row[0] if ref_row else None)
+
+    series = _fetch_series(names, window_s)
+
+    def tail(lst, n=5):
+        return [{"ts": dt_to_iso_utc(t), "v": v} for (t, v) in lst[-n:]]
+
+    return JSONResponse({
+        "ref_ts": dt_to_iso_utc(ref_ts),
+        "window_s": window_s,
+        "names": names,
+        "sizes": {k: len(v) for k, v in series.items()},
+        "tails": {k: tail(v, 5) for k, v in series.items()},
+        "now": _now_iso(),
+    }, headers={"Cache-Control": "no-store"})
+
+# --- PING rápido --------------------------------------------------------------
+@app.get("/__ping")
+def __ping():
+    return {"ok": True, "ts": _now_iso()}
+# -----------------------------------------------------------------------------
+
+# --- LISTAR ROTAS -------------------------------------------------------------
+@app.get("/api/debug/routes")
+def list_routes():
+    out = []
+    for r in app.router.routes:
+        try:
+            path = r.path
+            methods = sorted([m for m in r.methods if m not in ("HEAD", "OPTIONS")])
+        except Exception:
+            continue
+        out.append({"path": path, "methods": methods})
+    # ordena para facilitar
+    out.sort(key=lambda x: x["path"])
+    return JSONResponse(out, headers={"Cache-Control":"no-store"})
+# -----------------------------------------------------------------------------
+
 
 def maybe_alerts_from_vibration(vib_items: List[dict], threshold: float = 0.5) -> List[dict]:
     alerts = []
@@ -746,7 +922,7 @@ def _since_to_window_seconds(since: str, default_sec: int = 7200) -> int:
     return default_sec
 
 def _rows_for_names(names: List[str], window_s: int) -> Dict[str, List[Dict[str, Any]]]:
-    raw = _fetch_series(names, window_s)
+    raw = _fetch_series(names, 30)
     out: Dict[str, List[Dict[str, Any]]] = {}
     for nm, series in raw.items():
         compact = _dedup(series)
