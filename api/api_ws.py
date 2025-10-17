@@ -13,6 +13,7 @@ from fastapi import FastAPI, Request, HTTPException, Query, WebSocket, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from mysql.connector.errors import PoolError
+from collections import deque
 
 # =============================================================================
 # .env
@@ -44,15 +45,23 @@ app.add_middleware(
 async def ensure_cors_headers(request: Request, call_next):
     try:
         resp = await call_next(request)
-    except Exception:
-        resp = JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
+    except Exception as e:
+        # Loga o traceback e RE-LANÇA para o Uvicorn/FastAPI mostrar o stack trace
+        import logging
+        logging.exception("Unhandled error in request")
+        raise
     origin = request.headers.get("origin")
-    if origin and origin in ALLOWED_ORIGINS:
-        resp.headers.setdefault("Access-Control-Allow-Origin", origin)
-        resp.headers.setdefault("Vary", "Origin")
-        resp.headers.setdefault("Access-Control-Allow-Credentials", "true")
-        resp.headers.setdefault("Access-Control-Expose-Headers", "*")
+    if origin:
+        if "*" in ALLOWED_ORIGINS:
+            resp.headers.setdefault("Access-Control-Allow-Origin", "*")
+            resp.headers.setdefault("Access-Control-Expose-Headers", "*")
+        elif origin in ALLOWED_ORIGINS:
+            resp.headers.setdefault("Access-Control-Allow-Origin", origin)
+            resp.headers.setdefault("Vary", "Origin")
+            resp.headers.setdefault("Access-Control-Allow-Credentials", "true")
+            resp.headers.setdefault("Access-Control-Expose-Headers", "*")
     return resp
+
 
 @app.options("/{full_path:path}")
 def any_options(full_path: str, request: Request):
@@ -102,6 +111,11 @@ def get_mpu_ids_api() -> Dict[str, List[Any]]:
 def get_mpu_ids_compat() -> Dict[str, List[Any]]:
     return get_mpu_ids_api()
 
+@app.on_event("startup")
+async def _startup_ws_tasks():
+    for fn in (live_sampler_loop, live_producer_loop, monitoring_producer_loop, slow_producer_loop):
+        _bg_tasks.append(asyncio.create_task(fn()))
+
 # =============================================================================
 # Config / Constantes
 # =============================================================================
@@ -110,6 +124,9 @@ LIVE_TICK_MS = int(os.getenv("LIVE_TICK_MS", "200"))
 MON_TICK_MS  = int(os.getenv("MON_TICK_MS",  "2000"))
 SLOW_TICK_MS = int(os.getenv("SLOW_TICK_MS", "60000"))
 HEARTBEAT_MS = int(os.getenv("WS_HEARTBEAT_MS", "10000"))
+# Buffer de debug (somente estados) — não muda comportamento
+STATE_LOG = deque(maxlen=5000)  # ~ alguns minutos de histórico a 5 Hz
+
 
 OPC_TABLE = os.getenv("OPC_TABLE", "opc_samples")
 MPU_TABLE = os.getenv("MPU_TABLE", "mpu_samples")
@@ -260,17 +277,35 @@ def _fetch_latest_rows(names: Tuple[str, ...]) -> Dict[str, Dict[str, Any]]:
     if not names:
         return {}
     placeholders = ", ".join(["%s"] * len(names))
-    sql = f"""
-        SELECT s.name, s.value_bool, s.ts_utc
-        FROM {OPC_TABLE} s
-        JOIN (
-            SELECT name, MAX(ts_utc) AS ts_utc
-            FROM {OPC_TABLE}
-            WHERE name IN ({placeholders})
-            GROUP BY name
-        ) m ON m.name = s.name AND m.ts_utc = s.ts_utc
-    """
-    rows = fetch_all(sql, names)
+    # Empate por ts_utc? Desempata por id desc se existir; caso não exista, só pelo ts_utc desc.
+    # Ajuste 'id' para a sua PK real, se houver.
+    try:
+        sql = f"""
+            SELECT name, value_bool, ts_utc
+            FROM (
+                SELECT s.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY s.name
+                           ORDER BY s.ts_utc DESC, s.id DESC
+                       ) AS rn
+                FROM {OPC_TABLE} s
+                WHERE s.name IN ({placeholders})
+            ) z
+            WHERE z.rn = 1
+        """
+    except Exception:
+        # fallback sem window (mais impreciso; evita crash em MySQL<8)
+        sql = f"""
+            SELECT s.name, s.value_bool, s.ts_utc
+            FROM {OPC_TABLE} s
+            JOIN (
+                SELECT name, MAX(ts_utc) AS ts_utc
+                FROM {OPC_TABLE}
+                WHERE name IN ({placeholders})
+                GROUP BY name
+            ) m ON m.name = s.name AND m.ts_utc = s.ts_utc
+        """
+    rows = fetch_all(sql, names) or []
     out: Dict[str, Dict[str, Any]] = {}
     for r in rows:
         n = col(r, "name") or col(r, 0)
@@ -281,32 +316,97 @@ def _fetch_latest_rows(names: Tuple[str, ...]) -> Dict[str, Dict[str, Any]]:
         out.setdefault(n, {"value_bool": None, "ts_utc": None})
     return out
 
+def _append_state_log(
+    aid: int,
+    cfg: _LatchCfg,
+    latest: Dict[str, Dict[str, Any]],
+    s1: int, s2: int,
+    t_s1: Optional[datetime], t_s2: Optional[datetime],
+    t_vav: Optional[datetime], t_vrc: Optional[datetime],
+    raw_state: Optional[str],
+    displayed: str,
+    pending: Optional[str],
+    note: str,
+):
+    try:
+        STATE_LOG.append({
+            "ts": _now_iso(),
+            "act": aid,
+            "names": {"S1": cfg.s_rec, "S2": cfg.s_adv, "VAV": cfg.v_av, "VREC": cfg.v_rec},
+            "vals": {
+                "S1": s1, "S2": s2,
+                "t_S1": dt_to_iso_utc(t_s1), "t_S2": dt_to_iso_utc(t_s2),
+                "t_VAV": dt_to_iso_utc(t_vav), "t_VREC": dt_to_iso_utc(t_vrc),
+            },
+            "raw_state": raw_state,
+            "displayed": displayed,
+            "pending": pending,
+            "note": note,   # resumo do critério que levou ao 'displayed'
+        })
+    except Exception:
+        pass
+
+_LATCH_STATE: Dict[int, Dict[str, Any]] = {
+    1: {"last_state": None, "last_confirmed_ts": None, "indef_since": None},
+    2: {"last_state": None, "last_confirmed_ts": None, "indef_since": None},
+}
+
+def _aid_from_cfg(cfg: _LatchCfg) -> int:
+    try:
+        return int(cfg.id.upper().replace("A", ""))
+    except Exception:
+        return 0
+
+
 def _infer_state_from_latest(cfg: _LatchCfg, latest: Dict[str, Dict[str, Any]]):
+    """
+    Sticky: só confirma mudança quando S1/S2 estão em uma combinação inequívoca.
+    - S1=1,S2=0 => RECUADO
+    - S1=0,S2=1 => AVANÇADO
+    - 00 ou 11  => indefinido (NÃO MUDA o último confirmado)
+
+    pending é puramente diagnóstico (com base na última válvula acionada).
+    """
     now = datetime.now(timezone.utc)
-    adv = latest.get(cfg.s_adv, {})
-    rec = latest.get(cfg.s_rec, {})
-    vav = latest.get(cfg.v_av, {})
-    vrc = latest.get(cfg.v_rec, {})
 
-    adv_v = int(adv.get("value_bool") or 0)
-    rec_v = int(rec.get("value_bool") or 0)
+    # Leituras atuais
+    s_adv = latest.get(cfg.s_adv, {})     # S2 (avançado)
+    s_rec = latest.get(cfg.s_rec, {})     # S1 (recuado)
+    vav   = latest.get(cfg.v_av, {})      # válvula avançar
+    vrc   = latest.get(cfg.v_rec, {})     # válvula recuar
 
-    t_adv = _coerce_to_datetime(adv.get("ts_utc"))
-    t_rec = _coerce_to_datetime(rec.get("ts_utc"))
+    s2 = int(s_adv.get("value_bool") or 0)
+    s1 = int(s_rec.get("value_bool") or 0)
+
     t_vav = _coerce_to_datetime(vav.get("ts_utc"))
     t_vrc = _coerce_to_datetime(vrc.get("ts_utc"))
 
-    displayed = "RECUADO"
-    if adv_v and rec_v:
-        displayed = "RECUADO"
-    elif adv_v:
-        displayed = "AVANÇADO"
-    elif rec_v:
-        displayed = "RECUADO"
+    aid = _aid_from_cfg(cfg)
+    st = _LATCH_STATE.get(aid) or {"last_state": None, "last_confirmed_ts": None, "indef_since": None}
 
+    # Determina estado bruto pela tabela-verdade
+    raw_state: Optional[StableState] = None
+    if s1 == 1 and s2 == 0:
+        raw_state = "RECUADO"
+    elif s1 == 0 and s2 == 1:
+        raw_state = "AVANÇADO"
+    else:
+        raw_state = None  # 00 ou 11
+
+    # Sticky: só atualiza quando inequívoco; 00/11 mantém último confirmado
+    if raw_state is not None:
+        st["last_state"] = raw_state
+        st["last_confirmed_ts"] = now
+        st["indef_since"] = None
+    else:
+        if st.get("indef_since") is None:
+            st["indef_since"] = now
+
+    displayed = st["last_state"] or "RECUADO"   # fallback inicial
+
+    # pending (diagnóstico, não altera displayed)
     pending = None
     started_at = None
-
     last_cmd_ts = None
     last_cmd_kind = None  # "AV" | "REC"
     if t_vav and (not t_vrc or t_vav >= t_vrc):
@@ -314,11 +414,37 @@ def _infer_state_from_latest(cfg: _LatchCfg, latest: Dict[str, Dict[str, Any]]):
     elif t_vrc:
         last_cmd_ts = t_vrc; last_cmd_kind = "REC"
 
+    if last_cmd_kind == "AV" and displayed != "AVANÇADO":
+        pending = "AV"; started_at = last_cmd_ts or now
+    elif last_cmd_kind == "REC" and displayed != "RECUADO":
+        pending = "REC"; started_at = last_cmd_ts or now
+
+    _LATCH_STATE[aid] = st
+
+    return {
+        "state": displayed,
+        "pending": pending,
+        "started_at": (started_at.isoformat() if started_at else None),
+    }
+
+    _LATCH_STATE[aid] = st
+
+    # Diagnóstico de intenção (não altera 'displayed')
+    pending = None
+    started_at = None
+    last_cmd_ts = None
+    last_cmd_kind = None  # "AV" | "REC"
+
+    if t_vav and (not t_vrc or t_vav >= t_vrc):
+        last_cmd_ts = t_vav; last_cmd_kind = "AV"
+    elif t_vrc:
+        last_cmd_ts = t_vrc; last_cmd_kind = "REC"
+
     if last_cmd_kind == "AV":
-        if not adv_v or (t_adv and last_cmd_ts and last_cmd_ts > t_adv):
+        if displayed != "AVANÇADO":
             pending = "AV"; started_at = last_cmd_ts or now
     elif last_cmd_kind == "REC":
-        if not rec_v or (t_rec and last_cmd_ts and last_cmd_ts > t_rec):
+        if displayed != "RECUADO":
             pending = "REC"; started_at = last_cmd_ts or now
 
     return {
@@ -485,7 +611,12 @@ def _last_pulse_duration(
 # Payload builders (contratos WS)
 # =============================================================================
 def build_live_payload() -> dict:
-    latest = _fetch_latest_rows(_NAMES_LATCH)
+    # usa o cache preenchido pelo live_sampler_loop
+    latest = _LIVE_CACHE.get("vals") or {}
+    # se por algum motivo o cache ainda não encheu, cai para a consulta rápida
+    if not latest:
+        latest = _fetch_latest_rows_fast(_NAMES_LATCH)
+
     a1 = _infer_state_from_latest(_CFG_A1, latest)
     a2 = _infer_state_from_latest(_CFG_A2, latest)
     items = [
@@ -612,6 +743,15 @@ def build_cpm_payload(window_s: int = 60) -> dict:
     return {"type": "cpm", "ts": _now_iso(), "window_s": window_s, "items": out}
 
 
+@app.get("/api/debug/state-log")
+def debug_state_log(limit: int = Query(200, ge=1, le=2000), act: int | None = Query(None)):
+    # retorna do mais recente para o mais antigo
+    data = list(STATE_LOG)[-limit:]
+    if act in (1, 2):
+        data = [x for x in data if x.get("act") == act]
+    data.reverse()
+    return JSONResponse({"items": data, "count": len(data), "now": _now_iso()},
+                        headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/debug/cpm")
@@ -796,36 +936,52 @@ async def live_producer_loop():
     tick = max(0.02, LIVE_TICK_MS / 1000.0)
     while True:
         try:
-            await WS_LIVE.broadcast_json(build_live_payload())
+            # >>> NÃO bloquear o event loop com I/O de DB:
+            payload = await asyncio.to_thread(build_live_payload)
+            await WS_LIVE.broadcast_json(payload)
             await WS_LIVE.heartbeat_if_due()
         except Exception as e:
-            await WS_LIVE.broadcast_json({"type": "error", "channel": "live", "detail": str(e)[:180], "ts": _now_iso()})
+            await WS_LIVE.broadcast_json({
+                "type": "error", "channel": "live",
+                "detail": str(e)[:180], "ts": _now_iso()
+            })
         await asyncio.sleep(tick)
-
 async def monitoring_producer_loop():
     tick = max(0.2, MON_TICK_MS / 1000.0)
     while True:
         try:
-            mon = build_monitoring_payload()
+            mon = await asyncio.to_thread(build_monitoring_payload)
+            # atualizar cache/alerts também fora do loop (sem DB adicional aqui)
             _update_alerts_cache_from_mon(mon)
             await WS_MON.broadcast_json(mon)
-            for a in maybe_alerts_from_vibration(mon.get("vibration", {}).get("items", [])):
+
+            # alerts derivados (baratos) podem ir direto
+            for a in (maybe_alerts_from_vibration(mon.get("vibration", {}).get("items", []))
+                      + maybe_alerts_from_latch()):
                 await WS_SLOW.broadcast_json(a)
+
             await WS_MON.heartbeat_if_due()
         except Exception as e:
-            await WS_MON.broadcast_json({"type": "error", "channel": "monitoring", "detail": str(e)[:180], "ts": _now_iso()})
+            await WS_MON.broadcast_json({
+                "type": "error", "channel": "monitoring",
+                "detail": str(e)[:180], "ts": _now_iso()
+            })
         await asyncio.sleep(tick)
 
 async def slow_producer_loop():
     tick = max(1.0, SLOW_TICK_MS / 1000.0)
     while True:
         try:
-            await WS_SLOW.broadcast_json(build_cpm_payload(window_s=int(tick)))
+            # mesmo raciocínio: CPM também busca séries no DB
+            payload = await asyncio.to_thread(build_cpm_payload, int(tick))
+            await WS_SLOW.broadcast_json(payload)
             await WS_SLOW.heartbeat_if_due()
         except Exception as e:
-            await WS_SLOW.broadcast_json({"type": "error", "channel": "slow", "detail": str(e)[:180], "ts": _now_iso()})
+            await WS_SLOW.broadcast_json({
+                "type": "error", "channel": "slow",
+                "detail": str(e)[:180], "ts": _now_iso()
+            })
         await asyncio.sleep(tick)
-
 # =============================================================================
 # Startup / Shutdown
 # =============================================================================
@@ -1359,3 +1515,58 @@ def compat_opc_by_facet_post(body: dict = Body(...)):
 def compat_opc_history_facet_post(body: dict = Body(...)):
     return http_opc_by_facet_post(body)
 
+# ===== LIVE CACHE (amostrador desacoplado do WS) =============================
+_LIVE_CACHE = {
+    "ts": None,       # datetime da última leitura
+    "vals": {},       # {"Recuado_1S1": {"value_bool":0/1,"ts_utc":datetime}, ...}
+}
+
+def _fetch_latest_rows_fast(names: tuple[str, ...]) -> dict[str, dict]:
+    """
+    MySQL 8+: pega a última linha por 'name' numa tacada só (ROW_NUMBER()).
+    Cai para a consulta antiga se der erro (ex.: MySQL < 8).
+    """
+    if not names:
+        return {}
+    placeholders = ", ".join(["%s"] * len(names))
+    try:
+        sql = f"""
+        SELECT name, value_bool, ts_utc
+        FROM (
+            SELECT name, value_bool, ts_utc,
+                   ROW_NUMBER() OVER (PARTITION BY name ORDER BY ts_utc DESC) AS rn
+            FROM {OPC_TABLE}
+            WHERE name IN ({placeholders})
+        ) t
+        WHERE rn = 1
+        """
+        rows = fetch_all(sql, names) or []
+        out = {}
+        for r in rows:
+            n = str(col(r, "name") or r[0])
+            vb = col(r, "value_bool") if isinstance(r, dict) else r[1]
+            ts = col(r, "ts_utc")     if isinstance(r, dict) else r[2]
+            out[n] = {"value_bool": (None if vb is None else int(vb)), "ts_utc": ts}
+        for n in names:
+            out.setdefault(n, {"value_bool": None, "ts_utc": None})
+        return out
+    except Exception:
+        # fallback: a consulta antiga (funciona em qualquer versão)
+        return _fetch_latest_rows(names)
+
+async def live_sampler_loop():
+    """
+    Lê só os 8 sinais de latch (A1/A2: S1/S2 e V12/V14) e guarda em memória.
+    Faz 1 query rápida por tick usando o índice idx_opc_name_ts.
+    """
+    names = _NAMES_LATCH
+    tick = max(0.05, LIVE_TICK_MS / 1000.0)  # 50ms–200ms
+    while True:
+        try:
+            latest = _fetch_latest_rows_fast(names)
+            _LIVE_CACHE["vals"] = latest
+            _LIVE_CACHE["ts"] = datetime.now(timezone.utc)
+        except Exception:
+            # evita matar o loop se o DB oscilar
+            pass
+        await asyncio.sleep(tick)
