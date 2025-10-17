@@ -14,6 +14,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from mysql.connector.errors import PoolError
 from collections import deque
+from hashlib import sha1
+from json import loads as _json_loads
 
 # =============================================================================
 # .env
@@ -24,7 +26,7 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 # =============================================================================
 # FastAPI + CORS
 # =============================================================================
-app = FastAPI(title="Festo DT API (WS-first)", version="4.0.0")
+app = FastAPI(title="Festo DT API (WS-first)", version="4.1.0")
 
 ALLOWED_ORIGINS = [
     o.strip()
@@ -45,8 +47,7 @@ app.add_middleware(
 async def ensure_cors_headers(request: Request, call_next):
     try:
         resp = await call_next(request)
-    except Exception as e:
-        # Loga o traceback e RE-LANÇA para o Uvicorn/FastAPI mostrar o stack trace
+    except Exception:
         import logging
         logging.exception("Unhandled error in request")
         raise
@@ -111,11 +112,6 @@ def get_mpu_ids_api() -> Dict[str, List[Any]]:
 def get_mpu_ids_compat() -> Dict[str, List[Any]]:
     return get_mpu_ids_api()
 
-@app.on_event("startup")
-async def _startup_ws_tasks():
-    for fn in (live_sampler_loop, live_producer_loop, monitoring_producer_loop, slow_producer_loop):
-        _bg_tasks.append(asyncio.create_task(fn()))
-
 # =============================================================================
 # Config / Constantes
 # =============================================================================
@@ -124,9 +120,8 @@ LIVE_TICK_MS = int(os.getenv("LIVE_TICK_MS", "200"))
 MON_TICK_MS  = int(os.getenv("MON_TICK_MS",  "2000"))
 SLOW_TICK_MS = int(os.getenv("SLOW_TICK_MS", "60000"))
 HEARTBEAT_MS = int(os.getenv("WS_HEARTBEAT_MS", "10000"))
-# Buffer de debug (somente estados) — não muda comportamento
-STATE_LOG = deque(maxlen=5000)  # ~ alguns minutos de histórico a 5 Hz
 
+STATE_LOG = deque(maxlen=5000)  # ~ alguns minutos de histórico a 5 Hz
 
 OPC_TABLE = os.getenv("OPC_TABLE", "opc_samples")
 MPU_TABLE = os.getenv("MPU_TABLE", "mpu_samples")
@@ -277,8 +272,6 @@ def _fetch_latest_rows(names: Tuple[str, ...]) -> Dict[str, Dict[str, Any]]:
     if not names:
         return {}
     placeholders = ", ".join(["%s"] * len(names))
-    # Empate por ts_utc? Desempata por id desc se existir; caso não exista, só pelo ts_utc desc.
-    # Ajuste 'id' para a sua PK real, se houver.
     try:
         sql = f"""
             SELECT name, value_bool, ts_utc
@@ -294,7 +287,6 @@ def _fetch_latest_rows(names: Tuple[str, ...]) -> Dict[str, Dict[str, Any]]:
             WHERE z.rn = 1
         """
     except Exception:
-        # fallback sem window (mais impreciso; evita crash em MySQL<8)
         sql = f"""
             SELECT s.name, s.value_bool, s.ts_utc
             FROM {OPC_TABLE} s
@@ -341,7 +333,7 @@ def _append_state_log(
             "raw_state": raw_state,
             "displayed": displayed,
             "pending": pending,
-            "note": note,   # resumo do critério que levou ao 'displayed'
+            "note": note,
         })
     except Exception:
         pass
@@ -357,7 +349,6 @@ def _aid_from_cfg(cfg: _LatchCfg) -> int:
     except Exception:
         return 0
 
-
 def _infer_state_from_latest(cfg: _LatchCfg, latest: Dict[str, Dict[str, Any]]):
     """
     Sticky: só confirma mudança quando S1/S2 estão em uma combinação inequívoca.
@@ -369,7 +360,6 @@ def _infer_state_from_latest(cfg: _LatchCfg, latest: Dict[str, Dict[str, Any]]):
     """
     now = datetime.now(timezone.utc)
 
-    # Leituras atuais
     s_adv = latest.get(cfg.s_adv, {})     # S2 (avançado)
     s_rec = latest.get(cfg.s_rec, {})     # S1 (recuado)
     vav   = latest.get(cfg.v_av, {})      # válvula avançar
@@ -390,8 +380,6 @@ def _infer_state_from_latest(cfg: _LatchCfg, latest: Dict[str, Dict[str, Any]]):
         raw_state = "RECUADO"
     elif s1 == 0 and s2 == 1:
         raw_state = "AVANÇADO"
-    else:
-        raw_state = None  # 00 ou 11
 
     # Sticky: só atualiza quando inequívoco; 00/11 mantém último confirmado
     if raw_state is not None:
@@ -406,7 +394,6 @@ def _infer_state_from_latest(cfg: _LatchCfg, latest: Dict[str, Dict[str, Any]]):
 
     # pending (diagnóstico, não altera displayed)
     pending = None
-    started_at = None
     last_cmd_ts = None
     last_cmd_kind = None  # "AV" | "REC"
     if t_vav and (not t_vrc or t_vav >= t_vrc):
@@ -415,42 +402,16 @@ def _infer_state_from_latest(cfg: _LatchCfg, latest: Dict[str, Dict[str, Any]]):
         last_cmd_ts = t_vrc; last_cmd_kind = "REC"
 
     if last_cmd_kind == "AV" and displayed != "AVANÇADO":
-        pending = "AV"; started_at = last_cmd_ts or now
+        pending = "AV"
     elif last_cmd_kind == "REC" and displayed != "RECUADO":
-        pending = "REC"; started_at = last_cmd_ts or now
+        pending = "REC"
 
     _LATCH_STATE[aid] = st
 
     return {
         "state": displayed,
         "pending": pending,
-        "started_at": (started_at.isoformat() if started_at else None),
-    }
-
-    _LATCH_STATE[aid] = st
-
-    # Diagnóstico de intenção (não altera 'displayed')
-    pending = None
-    started_at = None
-    last_cmd_ts = None
-    last_cmd_kind = None  # "AV" | "REC"
-
-    if t_vav and (not t_vrc or t_vav >= t_vrc):
-        last_cmd_ts = t_vav; last_cmd_kind = "AV"
-    elif t_vrc:
-        last_cmd_ts = t_vrc; last_cmd_kind = "REC"
-
-    if last_cmd_kind == "AV":
-        if displayed != "AVANÇADO":
-            pending = "AV"; started_at = last_cmd_ts or now
-    elif last_cmd_kind == "REC":
-        if displayed != "RECUADO":
-            pending = "REC"; started_at = last_cmd_ts or now
-
-    return {
-        "state": displayed,
-        "pending": pending,
-        "started_at": (started_at.isoformat() if started_at else None),
+        "started_at": (last_cmd_ts.isoformat() if last_cmd_ts else None),
     }
 
 def _fetch_series(names: List[str], window_s: int) -> Dict[str, List[Tuple[datetime,int]]]:
@@ -478,20 +439,18 @@ def _fetch_series(names: List[str], window_s: int) -> Dict[str, List[Tuple[datet
           AND ts_utc BETWEEN DATE_SUB(%s, INTERVAL %s SECOND) AND %s
         ORDER BY ts_utc ASC
     """
-    # buscamos window_s + pre_roll_s e depois apararmos
     rows = fetch_all(sql, (*names, ref_ts, window_s + pre_roll_s, ref_ts))
 
     # Corte: início real da janela (sem pré-rolo)
     start_real = _coerce_to_datetime(ref_ts) - timedelta(seconds=window_s)
 
-    # Vamos manter, para cada nome, **no máximo 1 ponto antes de start_real**
     out: Dict[str, List[Tuple[datetime,int]]] = {str(n): [] for n in names}
     last_before: Dict[str, Tuple[datetime,int] | None] = {str(n): None for n in names}
 
     for r in rows or []:
-        nm = str(col(r, "name") or (r[0] if not isinstance(r, dict) else ""))
-        ts_raw = col(r, "ts_utc") if isinstance(r, dict) else r[1]
-        vb_raw = col(r, "value_bool") if isinstance(r, dict) else r[2]
+        nm = str(col(r, "name") or (r[0] if not isinstance(r, dict) else ""))  # type: ignore
+        ts_raw = col(r, "ts_utc") if isinstance(r, dict) else r[1]            # type: ignore
+        vb_raw = col(r, "value_bool") if isinstance(r, dict) else r[2]        # type: ignore
         dt = _coerce_to_datetime(ts_raw)
         if dt is None or vb_raw is None:
             continue
@@ -501,18 +460,15 @@ def _fetch_series(names: List[str], window_s: int) -> Dict[str, List[Tuple[datet
             v = 1 if bool(vb_raw) else 0
 
         if dt < start_real:
-            # candidato a "ponto de contexto" (guarda só o ÚLTIMO antes do início)
             last_before[nm] = (dt, v)
         else:
             out[nm].append((dt, v))
 
-    # injeta o ponto de contexto (se houver) no começo de cada série
     for nm in list(out.keys()):
         if last_before[nm] is not None:
             out[nm].insert(0, last_before[nm])
 
     return out
-
 
 def _dedup(seq: List[Tuple[datetime,int]]) -> List[Tuple[datetime,int]]:
     if not seq:
@@ -606,14 +562,11 @@ def _last_pulse_duration(
         return (now_dt - last_on).total_seconds()
     return None
 
-
 # =============================================================================
 # Payload builders (contratos WS)
 # =============================================================================
 def build_live_payload() -> dict:
-    # usa o cache preenchido pelo live_sampler_loop
     latest = _LIVE_CACHE.get("vals") or {}
-    # se por algum motivo o cache ainda não encheu, cai para a consulta rápida
     if not latest:
         latest = _fetch_latest_rows_fast(_NAMES_LATCH)
 
@@ -626,9 +579,8 @@ def build_live_payload() -> dict:
     return {"type": "live", "ts": _now_iso(), "actuators": items}
 
 def build_monitoring_payload() -> dict:
-    # Janela para calcular DTs (segundos)
-    WINDOW_S_PRIMARY  = int(os.getenv("MON_TIMING_WINDOW_S", "60"))   # antes 10/2
-    WINDOW_S_FALLBACK = int(os.getenv("MON_TIMING_FALLBACK_S", "60")) # igual/maior que a primária
+    WINDOW_S_PRIMARY  = int(os.getenv("MON_TIMING_WINDOW_S", "60"))
+    WINDOW_S_FALLBACK = int(os.getenv("MON_TIMING_FALLBACK_S", "60"))
 
     s_map = {
         1: {"S1": _CFG_A1.s_adv, "S2": _CFG_A1.s_rec},
@@ -636,7 +588,6 @@ def build_monitoring_payload() -> dict:
     }
     names = [v for m in s_map.values() for v in (m["S1"], m["S2"])]
 
-    # Âncora temporal igual à usada por _fetch_series (imune a skew do relógio local)
     ref_row = fetch_one(f"SELECT COALESCE(MAX(ts_utc), NOW(6)) AS ref_ts FROM {OPC_TABLE}")
     ref_ts = _coerce_to_datetime(
         col(ref_row, "ref_ts") if isinstance(ref_row, dict) else (ref_row[0] if ref_row else None)
@@ -648,7 +599,7 @@ def build_monitoring_payload() -> dict:
         return x if x >= 0 else 0.0
 
     def _timings_for_window(win_s: int):
-        raw = _fetch_series(names, win_s)              # já ancorado em ref_ts internamente
+        raw = _fetch_series(names, win_s)
         compact = {k: _dedup(v) for k, v in raw.items()}
         timings = []
         for aid, m in s_map.items():
@@ -656,7 +607,6 @@ def build_monitoring_payload() -> dict:
             s2 = compact.get(m["S2"], [])
             opened, closed = _derive_open_closed_from_S1S2(s1, s2)
 
-            # segundos; usa a MESMA âncora (ref_ts) para evitar negativos
             t_abre  = _nonneg(_last_pulse_duration(opened, now_dt=ref_ts))
             t_fecha = _nonneg(_last_pulse_duration(closed, now_dt=ref_ts))
             t_ciclo = ((t_abre or 0.0) + (t_fecha or 0.0)) if (t_abre or t_fecha) else None
@@ -667,7 +617,6 @@ def build_monitoring_payload() -> dict:
             })
         return timings
 
-    # tenta janela primária; se nenhum pulso for visto, usa fallback
     timings = _timings_for_window(WINDOW_S_PRIMARY)
     need_fallback = all(
         (t.get("last", {}).get("dt_abre_s") is None and t.get("last", {}).get("dt_fecha_s") is None)
@@ -676,7 +625,6 @@ def build_monitoring_payload() -> dict:
     if need_fallback and WINDOW_S_FALLBACK > WINDOW_S_PRIMARY:
         timings = _timings_for_window(WINDOW_S_FALLBACK)
 
-    # Vibração mantém janela curta (2 s)
     now = datetime.now(timezone.utc)
     start = now - timedelta(seconds=2)
     rows = fetch_all(
@@ -706,12 +654,10 @@ def build_monitoring_payload() -> dict:
         "vibration": {"window_s": 2, "items": vib_items},
     }
 
-
 def build_cpm_payload(window_s: int = 60) -> dict:
     """
     Calcula CPM por atuador em uma janela de `window_s` segundos.
-    Um ciclo é contado a cada transição para o estado FECHADO (rising de "closed"),
-    o que contabiliza ciclos completos mesmo quando a abertura começou antes da janela.
+    Um ciclo é contado a cada transição para o estado FECHADO (rising de "closed").
     """
     s_map = {
         1: {"S1": _CFG_A1.s_adv, "S2": _CFG_A1.s_rec},
@@ -727,14 +673,9 @@ def build_cpm_payload(window_s: int = 60) -> dict:
         s1 = compact.get(m["S1"], [])
         s2 = compact.get(m["S2"], [])
 
-        # Reconstrói as séries de estado "aberto" e "fechado"
         opened, closed = _derive_open_closed_from_S1S2(s1, s2)
 
-        # Bordas 0->1
-        e_open  = _rising_edges(opened)   # quando o estado "aberto" liga
-        e_close = _rising_edges(closed)   # quando o estado "fechado" liga
-
-        # 🔑 Conta ciclos como "entradas em fechado" na janela
+        e_close = _rising_edges(closed)
         cycles = len(e_close)
 
         cpm = cycles * (60.0 / float(window_s)) if window_s > 0 else 0.0
@@ -742,10 +683,11 @@ def build_cpm_payload(window_s: int = 60) -> dict:
 
     return {"type": "cpm", "ts": _now_iso(), "window_s": window_s, "items": out}
 
-
+# =============================================================================
+# Debug endpoints
+# =============================================================================
 @app.get("/api/debug/state-log")
 def debug_state_log(limit: int = Query(200, ge=1, le=2000), act: int | None = Query(None)):
-    # retorna do mais recente para o mais antigo
     data = list(STATE_LOG)[-limit:]
     if act in (1, 2):
         data = [x for x in data if x.get("act") == act]
@@ -753,14 +695,12 @@ def debug_state_log(limit: int = Query(200, ge=1, le=2000), act: int | None = Qu
     return JSONResponse({"items": data, "count": len(data), "now": _now_iso()},
                         headers={"Cache-Control": "no-store"})
 
-
 @app.get("/api/debug/cpm")
 def debug_cpm(window_s: int = 60):
     s_map = {1: {"S1": _CFG_A1.s_adv, "S2": _CFG_A1.s_rec},
              2: {"S1": _CFG_A2.s_adv, "S2": _CFG_A2.s_rec}}
     names = [v for m in s_map.values() for v in (m["S1"], m["S2"])]
 
-    # ref_ts = MAX(ts_utc) (a mesma âncora usada por _fetch_series modificado)
     ref_row = fetch_one(f"SELECT COALESCE(MAX(ts_utc), NOW(6)) AS ref_ts FROM {OPC_TABLE}")
     ref_ts = col(ref_row, "ref_ts") if isinstance(ref_row, dict) else (ref_row[0] if ref_row else None)
 
@@ -785,7 +725,6 @@ def debug_cpm2(window_s: int = 60):
              2: {"S1": _CFG_A2.s_adv, "S2": _CFG_A2.s_rec}}
     names = [v for m in s_map.values() for v in (m["S1"], m["S2"])]
 
-    # mesma âncora usada no _fetch_series corrigido
     ref_row = fetch_one(f"SELECT COALESCE(MAX(ts_utc), NOW(6)) AS ref_ts FROM {OPC_TABLE}")
     ref_ts = col(ref_row, "ref_ts") if isinstance(ref_row, dict) else (ref_row[0] if ref_row else None)
 
@@ -809,6 +748,7 @@ def __ping():
     return {"ok": True, "ts": _now_iso()}
 # -----------------------------------------------------------------------------
 
+
 # --- LISTAR ROTAS -------------------------------------------------------------
 @app.get("/api/debug/routes")
 def list_routes():
@@ -820,12 +760,14 @@ def list_routes():
         except Exception:
             continue
         out.append({"path": path, "methods": methods})
-    # ordena para facilitar
     out.sort(key=lambda x: x["path"])
     return JSONResponse(out, headers={"Cache-Control":"no-store"})
 # -----------------------------------------------------------------------------
 
 
+# =============================================================================
+# Alerts helpers
+# =============================================================================
 def maybe_alerts_from_vibration(vib_items: List[dict], threshold: float = 0.5) -> List[dict]:
     alerts = []
     for it in vib_items:
@@ -838,11 +780,39 @@ def maybe_alerts_from_vibration(vib_items: List[dict], threshold: float = 0.5) -
             })
     return alerts
 
+def _cfg_for_aid(aid: int) -> _LatchCfg:
+    return _CFG_A1 if aid == 1 else _CFG_A2
+
+def maybe_alerts_from_latch() -> List[dict]:
+    """
+    Gera alerta se um atuador ficar 'pending' além do timeout (expected_ms * timeout_factor).
+    Usa o último diagnóstico de _infer_state_from_latest via _LIVE_CACHE.
+    """
+    latest = _LIVE_CACHE.get("vals") or {}
+    if not latest:
+        return []
+    alerts: List[dict] = []
+    now = datetime.now(timezone.utc)
+    for aid, cfg in ((1, _CFG_A1), (2, _CFG_A2)):
+        diag = _infer_state_from_latest(cfg, latest)
+        if not diag.get("pending"):
+            continue
+        started_at = _coerce_to_datetime(diag.get("started_at"))
+        if not started_at:
+            continue
+        elapsed_ms = (now - started_at).total_seconds() * 1000.0
+        limit_ms = cfg.expected_ms * cfg.timeout_factor
+        if elapsed_ms >= limit_ms:
+            alerts.append({
+                "type": "alert", "ts": _now_iso(),
+                "code": "LATCH_TIMEOUT", "severity": 4, "origin": f"A{aid}",
+                "message": f"Transição '{diag['pending']}' excedeu {int(limit_ms)} ms (t={int(elapsed_ms)} ms)",
+            })
+    return alerts
+
 # =============================================================================
 # Alerts cache
 # =============================================================================
-from hashlib import sha1
-
 _LAST_ALERTS_PAYLOAD: dict | None = None
 _LAST_ALERTS_ETAG: str | None = None
 _LAST_ALERTS_TS: datetime | None = None
@@ -905,12 +875,18 @@ class WSGroup:
         async with self._lock:
             self.clients.discard(ws)
 
-    async def broadcast_json(self, payload: dict):
+    async def broadcast_json(self, payload: dict, send_timeout: float = 0.25):
+        if not self.clients:
+            return
         dead = []
-        for ws in list(self.clients):
-            try:
-                await ws.send_json(payload)
-            except Exception:
+        clients_snapshot = list(self.clients)
+        tasks = [
+            asyncio.wait_for(ws.send_json(payload), timeout=send_timeout)
+            for ws in clients_snapshot
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for ws, res in zip(clients_snapshot, results):
+            if isinstance(res, Exception):
                 dead.append(ws)
         if dead:
             async with self._lock:
@@ -930,13 +906,14 @@ WS_SLOW = WSGroup("slow")
 _bg_tasks: "list[asyncio.Task]" = []
 
 # =============================================================================
-# Producers
+# Producers (passo determinístico)
 # =============================================================================
 async def live_producer_loop():
-    tick = max(0.02, LIVE_TICK_MS / 1000.0)
+    period = max(0.02, LIVE_TICK_MS / 1000.0)
+    next_t = time.perf_counter()
     while True:
+        next_t += period
         try:
-            # >>> NÃO bloquear o event loop com I/O de DB:
             payload = await asyncio.to_thread(build_live_payload)
             await WS_LIVE.broadcast_json(payload)
             await WS_LIVE.heartbeat_if_due()
@@ -945,20 +922,22 @@ async def live_producer_loop():
                 "type": "error", "channel": "live",
                 "detail": str(e)[:180], "ts": _now_iso()
             })
-        await asyncio.sleep(tick)
+        await asyncio.sleep(max(0, next_t - time.perf_counter()))
+
 async def monitoring_producer_loop():
-    tick = max(0.2, MON_TICK_MS / 1000.0)
+    period = max(0.2, MON_TICK_MS / 1000.0)
+    next_t = time.perf_counter()
     while True:
+        next_t += period
         try:
             mon = await asyncio.to_thread(build_monitoring_payload)
-            # atualizar cache/alerts também fora do loop (sem DB adicional aqui)
             _update_alerts_cache_from_mon(mon)
             await WS_MON.broadcast_json(mon)
 
-            # alerts derivados (baratos) podem ir direto
-            for a in (maybe_alerts_from_vibration(mon.get("vibration", {}).get("items", []))
-                      + maybe_alerts_from_latch()):
-                await WS_SLOW.broadcast_json(a)
+            alerts = maybe_alerts_from_vibration(mon.get("vibration", {}).get("items", [])) + maybe_alerts_from_latch()
+            if alerts:
+                for a in alerts:
+                    await WS_SLOW.broadcast_json(a)
 
             await WS_MON.heartbeat_if_due()
         except Exception as e:
@@ -966,14 +945,15 @@ async def monitoring_producer_loop():
                 "type": "error", "channel": "monitoring",
                 "detail": str(e)[:180], "ts": _now_iso()
             })
-        await asyncio.sleep(tick)
+        await asyncio.sleep(max(0, next_t - time.perf_counter()))
 
 async def slow_producer_loop():
-    tick = max(1.0, SLOW_TICK_MS / 1000.0)
+    period = max(1.0, SLOW_TICK_MS / 1000.0)
+    next_t = time.perf_counter()
     while True:
+        next_t += period
         try:
-            # mesmo raciocínio: CPM também busca séries no DB
-            payload = await asyncio.to_thread(build_cpm_payload, int(tick))
+            payload = await asyncio.to_thread(build_cpm_payload, int(period))
             await WS_SLOW.broadcast_json(payload)
             await WS_SLOW.heartbeat_if_due()
         except Exception as e:
@@ -981,13 +961,20 @@ async def slow_producer_loop():
                 "type": "error", "channel": "slow",
                 "detail": str(e)[:180], "ts": _now_iso()
             })
-        await asyncio.sleep(tick)
+        await asyncio.sleep(max(0, next_t - time.perf_counter()))
+
 # =============================================================================
-# Startup / Shutdown
+# Startup / Shutdown (garante rodar uma única vez)
 # =============================================================================
+_started_flag = False
+
 @app.on_event("startup")
-async def _startup_ws_tasks():
-    for fn in (live_producer_loop, monitoring_producer_loop, slow_producer_loop):
+async def _startup_ws_tasks_once():
+    global _started_flag
+    if _started_flag:
+        return
+    _started_flag = True
+    for fn in (live_sampler_loop, live_producer_loop, monitoring_producer_loop, slow_producer_loop):
         _bg_tasks.append(asyncio.create_task(fn()))
 
 @app.on_event("shutdown")
@@ -1212,7 +1199,6 @@ def _since_str_to_dt(since: str, default="-10m") -> datetime:
     s = since or default
     s = s.strip()
     if not s.startswith("-"):
-        # se vier um ISO, interpreta como timestamp inicial
         dt = _coerce_to_datetime(s)
         if dt:
             return dt
@@ -1317,14 +1303,14 @@ def compat_live_vibration(window_s: int = Query(2, ge=1, le=60)):
     by: Dict[int, Dict[str, List[float]]] = {}
     ts_by: Dict[int, List[datetime]] = {}
     for r in rows:
-        mid = int(col(r, "mpu_id") or r[0])
+        mid = int(col(r, "mpu_id") or r[0])  # type: ignore
         ax = col(r, "ax_g"); ay = col(r, "ay_g"); az = col(r, "az_g")
         by.setdefault(mid, {"ax": [], "ay": [], "az": []})
         ts_by.setdefault(mid, [])
         by[mid]["ax"].append(float(ax or 0.0))
         by[mid]["ay"].append(float(ay or 0.0))
         by[mid]["az"].append(float(az or 0.0))
-        ts_by[mid].append(_coerce_to_datetime(col(r, "ts_utc") or r[1]) or now)
+        ts_by[mid].append(_coerce_to_datetime(col(r, "ts_utc") or r[1]) or now)  # type: ignore
 
     items = []
     for mid, d in by.items():
@@ -1408,8 +1394,6 @@ def api_health():
 # =============================================================================
 # Simulation (catalog + draw)
 # =============================================================================
-from json import loads as _json_loads
-
 @app.get("/api/simulation/catalog")
 def http_simulation_catalog():
     rows = fetch_all("""
@@ -1543,15 +1527,14 @@ def _fetch_latest_rows_fast(names: tuple[str, ...]) -> dict[str, dict]:
         rows = fetch_all(sql, names) or []
         out = {}
         for r in rows:
-            n = str(col(r, "name") or r[0])
-            vb = col(r, "value_bool") if isinstance(r, dict) else r[1]
-            ts = col(r, "ts_utc")     if isinstance(r, dict) else r[2]
+            n = str(col(r, "name") or r[0])  # type: ignore
+            vb = col(r, "value_bool") if isinstance(r, dict) else r[1]  # type: ignore
+            ts = col(r, "ts_utc")     if isinstance(r, dict) else r[2]  # type: ignore
             out[n] = {"value_bool": (None if vb is None else int(vb)), "ts_utc": ts}
         for n in names:
             out.setdefault(n, {"value_bool": None, "ts_utc": None})
         return out
     except Exception:
-        # fallback: a consulta antiga (funciona em qualquer versão)
         return _fetch_latest_rows(names)
 
 async def live_sampler_loop():
@@ -1560,13 +1543,14 @@ async def live_sampler_loop():
     Faz 1 query rápida por tick usando o índice idx_opc_name_ts.
     """
     names = _NAMES_LATCH
-    tick = max(0.05, LIVE_TICK_MS / 1000.0)  # 50ms–200ms
+    period = max(0.05, LIVE_TICK_MS / 1000.0)  # 50–200 ms
+    next_t = time.perf_counter()
     while True:
+        next_t += period
         try:
-            latest = _fetch_latest_rows_fast(names)
+            latest = await asyncio.to_thread(_fetch_latest_rows_fast, names)
             _LIVE_CACHE["vals"] = latest
             _LIVE_CACHE["ts"] = datetime.now(timezone.utc)
         except Exception:
-            # evita matar o loop se o DB oscilar
             pass
-        await asyncio.sleep(tick)
+        await asyncio.sleep(max(0, next_t - time.perf_counter()))
