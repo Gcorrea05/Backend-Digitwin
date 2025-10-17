@@ -1,7 +1,8 @@
 # app.py — DUAL “idêntico ao OPCUA” + MPU gravando amostras brutas (sem windows)
 # Tabelas: gmdigital.opc_samples, gmdigital.mpu_samples
 # Modos: SIMULATE | OPCUA | SERIAL_MPU | DUAL | DEV | DEV_DUAL
-import os, csv, json, time, signal, sys
+
+import os, csv, json, time, signal, sys, threading
 from typing import List, Dict, Any, Iterable, Optional
 from datetime import datetime
 from dotenv import load_dotenv
@@ -50,11 +51,13 @@ DATA_MODE = os.getenv("DATA_MODE", "DUAL").upper()      # SIMULATE | OPCUA | SER
 SINK_MODE = os.getenv("SINK_MODE", "MYSQL").upper()     # MYSQL | CSV
 
 # OPC UA
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "0.2"))  # 200 ms
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "0.2"))  # legado; ignorado fora do DEV
 OPCUA_ENDPOINT = os.getenv("OPCUA_ENDPOINT", "opc.tcp://192.168.0.40:4840")
 OPCUA_USER = os.getenv("OPCUA_USER", "")
 OPCUA_PASS = os.getenv("OPCUA_PASS", "")
 NODES_CSV = os.getenv("NODES_CSV", "nodes.csv")
+OPCUA_CONNECT_ASYNC = os.getenv("OPCUA_CONNECT_ASYNC", "1").lower() in {"1","true","yes","on"}
+OPCUA_RECONNECT_SEC = float(os.getenv("OPCUA_RECONNECT_SEC", "2.0"))
 
 # Serial MPU
 SERIAL_PORT = os.getenv("SERIAL_PORT", "COM3")
@@ -71,6 +74,17 @@ MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
 MYSQL_DB   = os.getenv("MYSQL_DB", "gmdigital")
 MYSQL_USER = os.getenv("MYSQL_USER", "root")
 MYSQL_PASS = os.getenv("MYSQL_PASS", "")
+# aceitar MYSQL_NAME como alias de MYSQL_DB (legado)
+MYSQL_DB = os.getenv("MYSQL_DB", os.getenv("MYSQL_NAME", MYSQL_DB))
+
+# Cadências (ativáveis por ENV — independentes de DEV)
+OPC_PERIOD = max(0.01, float(os.getenv("OPC_PERIOD_MS", "200")) / 1000.0)   # 200 ms
+MPU_PERIOD = max(0.05, float(os.getenv("MPU_PERIOD_MS", "1000")) / 1000.0)  # 1 s
+
+# Fail-safe replay (quando faltar sinal, regravar último estado)
+FAILSAFE_REPLAY = os.getenv("INGEST_FAILSAFE_REPLAY", "1").lower() in {"1","true","yes","on"}
+SEED_FROM_DB    = os.getenv("INGEST_SEED_FROM_DB", "1").lower() in {"1","true","yes","on"}
+LOG_FAILSAFE_EVERY_SEC = int(os.getenv("LOG_FAILSAFE_EVERY_SEC", "5"))
 
 # Live bus (Redis)
 REDIS_ENABLE = os.getenv("REDIS_ENABLE", "true").lower() in {"1","true","yes","on"}
@@ -210,6 +224,7 @@ class CsvMpuSink:
             csv.DictWriter(f, fieldnames=self.fields).writerow(sample)
     def close(self): pass
 
+# ===== MySQL base robusto =====
 class MySqlBase:
     def __init__(self):
         import mysql.connector
@@ -217,9 +232,22 @@ class MySqlBase:
         print(f"[MySQL] target={MYSQL_HOST}:{MYSQL_PORT} db={MYSQL_DB} user={MYSQL_USER}")
         self.conn = self.mysql.connect(
             host=MYSQL_HOST, port=MYSQL_PORT, database=MYSQL_DB,
-            user=MYSQL_USER, password=MYSQL_PASS, connection_timeout=5
+            user=MYSQL_USER, password=MYSQL_PASS, connection_timeout=5,
+            autocommit=True
         )
-        self.conn.autocommit = False  # commits explícitos
+        try:
+            self.conn.ping(reconnect=True, attempts=1, delay=0)
+        except Exception:
+            pass
+    def cursor(self):
+        try:
+            self.conn.ping(reconnect=True, attempts=1, delay=0)
+        except Exception:
+            try:
+                self.conn.reconnect(attempts=2, delay=0)
+            except Exception:
+                pass
+        return self.conn.cursor()
     def close(self):
         try: self.conn.close()
         except Exception: pass
@@ -227,7 +255,7 @@ class MySqlBase:
 class MySqlOpcSink(MySqlBase):
     def __init__(self):
         super().__init__()
-        cur = self.conn.cursor()
+        cur = self.cursor()
         cur.execute("""
             CREATE TABLE IF NOT EXISTS opc_samples (
               id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
@@ -240,21 +268,20 @@ class MySqlOpcSink(MySqlBase):
               INDEX idx_opc_ts (ts_utc),
               INDEX idx_opc_actuator_ts (actuator_id, ts_utc)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-        """); cur.close(); self.conn.commit()
+        """); cur.close()
     def write_many(self, ts_iso: str, values: Dict[str, Any]):
         ts_mysql = iso_to_mysql_dt6(ts_iso)
-        cur = self.conn.cursor()
-        # Inserimos apenas as colunas disponíveis; actuator_id/facet ficam NULL
+        cur = self.cursor()
         cur.executemany(
             "INSERT INTO opc_samples (ts_utc,name,value_bool) VALUES (%s,%s,%s)",
             [(ts_mysql, name, (None if v is None else int(bool(v)))) for name, v in values.items()]
         )
-        cur.close(); self.conn.commit()
+        cur.close()
 
 class MySqlMpuSink(MySqlBase):
     def __init__(self):
         super().__init__()
-        cur = self.conn.cursor()
+        cur = self.cursor()
         cur.execute("""
             CREATE TABLE IF NOT EXISTS mpu_samples (
               id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
@@ -265,10 +292,10 @@ class MySqlMpuSink(MySqlBase):
               INDEX idx_mpu_id_ts (mpu_id, ts_utc),
               INDEX idx_mpu_ts (ts_utc)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-        """); cur.close(); self.conn.commit()
+        """); cur.close()
     def write_sample(self, ts_iso: str, rec: Dict[str, Any]):
         ts_mysql = iso_to_mysql_dt6(ts_iso)
-        cur = self.conn.cursor()
+        cur = self.cursor()
         cur.execute("""
             INSERT INTO mpu_samples
               (ts_utc,mpu_id,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps)
@@ -280,7 +307,65 @@ class MySqlMpuSink(MySqlBase):
             (None if rec.get("gy_dps") is None else float(rec["gy_dps"])),
             (None if rec.get("gz_dps") is None else float(rec["gz_dps"]))
         ))
-        cur.close(); self.conn.commit()
+        cur.close()
+
+# ===== Fail-safe helpers =====
+from collections import defaultdict
+
+class _LastState:
+    """Guarda último estado por chave; gera linhas com ts atualizado para replay."""
+    def __init__(self, key_idx: int):
+        self.key_idx = key_idx
+        self._d = {}          # key -> (ts, key, value)
+        self._last_log = 0.0
+    def update_many(self, rows):
+        for r in rows:
+            self._d[r[self.key_idx]] = r
+    def as_replayed(self, now_iso: str):
+        out = []
+        for k,(ts,k2,val) in self._d.items():
+            out.append((now_iso, k2, val))
+        return out
+    def log_if_needed(self, tag: str):
+        now = time.time()
+        if now - self._last_log >= LOG_FAILSAFE_EVERY_SEC:
+            print(f"[{tag}] sem sinal — gravando no estado atual")
+            self._last_log = now
+
+def _seed_last_from_db_opc(conn, limit: int = 200):
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT ts_utc, name, value_bool
+            FROM opc_samples
+            ORDER BY ts_utc DESC
+            LIMIT %s
+        """, (limit,))
+        rows = cur.fetchall(); cur.close()
+        return rows
+    except Exception:
+        return []
+
+def _seed_last_from_db_mpu(conn, limit: int = 200):
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT t.ts_utc, t.mpu_id, t.ax_g, t.ay_g, t.az_g, t.gx_dps, t.gy_dps, t.gz_dps
+            FROM (
+              SELECT * FROM mpu_samples ORDER BY ts_utc DESC LIMIT %s
+            ) t
+            ORDER BY t.ts_utc DESC
+        """, (limit,))
+        rows = cur.fetchall(); cur.close()
+        # reduz para última por mpu_id
+        last_by_id = {}
+        for (ts, mpu_id, ax, ay, az, gx, gy, gz) in rows:
+            if mpu_id not in last_by_id:
+                last_by_id[mpu_id] = {"mpu_id": mpu_id, "ax_g": ax, "ay_g": ay, "az_g": az,
+                                      "gx_dps": gx, "gy_dps": gy, "gz_dps": gz}
+        return last_by_id
+    except Exception:
+        return {}
 
 # ===== Live publish =====
 from threading import Event
@@ -306,6 +391,29 @@ def _publish_mpu_sample(sample: Dict[str, Any]):
         _rcli.publish("mpu_samples", json.dumps(msg))
     except Exception: pass
 
+# ===== Reconexão OPC assíncrona =====
+class _AsyncOpcConnector:
+    def __init__(self, reader, period_sec: float):
+        self.reader = reader
+        self.period = max(0.5, period_sec)
+        self.connected = False
+        self._stop = threading.Event()
+        self._th = threading.Thread(target=self._run, name="opc_reconnector", daemon=True)
+    def start(self):
+        self._th.start()
+    def stop(self):
+        self._stop.set()
+    def _run(self):
+        while not self._stop.is_set():
+            if not self.connected:
+                try:
+                    self.reader.connect()
+                    self.connected = True
+                    print("[OPC] conectado")
+                except Exception as e:
+                    print(f"[OPC] Conexão falhou: {e}. Retentando em {self.period:.1f}s...")
+            self._stop.wait(self.period)
+
 # ===== Loops =====
 def opc_loop():
     items = load_nodes(NODES_CSV)
@@ -315,103 +423,177 @@ def opc_loop():
     if DATA_MODE in ("DEV", "DEV_DUAL"):
         if DevReader is None:
             raise RuntimeError("DevReader não encontrado. Garanta dev_reader.py disponível.")
-        reader, connected = DevReader(NODES_CSV), True
+        reader = DevReader(NODES_CSV)
+        connector = None
     elif DATA_MODE == "SIMULATE":
-        reader, connected = Simulator(items), True
+        reader = Simulator(items)
+        connector = None
     else:
-        reader, connected = OpcUaReader(OPCUA_ENDPOINT, items), False
+        reader = OpcUaReader(OPCUA_ENDPOINT, items)
+        connector = _AsyncOpcConnector(reader, period_sec=OPCUA_RECONNECT_SEC) if OPCUA_CONNECT_ASYNC else None
 
     # ===== Sink =====
     sink = MySqlOpcSink() if SINK_MODE == "MYSQL" else CsvOpcSink(CSV_OPC_PATH, names)
 
-    # ===== Intervalo ===== (200 ms em DEV/DEV_DUAL)
+    # ===== Intervalo (fora do DEV usa OPC_PERIOD) =====
     if DATA_MODE in ("DEV", "DEV_DUAL"):
         dev_tick_ms = float(os.getenv("DEV_TICK_MS", "200"))
         interval = max(0.001, dev_tick_ms / 1000.0)
     else:
-        interval = max(0.01, float(POLL_INTERVAL))
-    print(f"[DEV] interval={interval:.6f}s  mode={DATA_MODE}  sink={SINK_MODE}")
+        interval = OPC_PERIOD
+    print(f"[OPC] interval={interval:.6f}s  mode={DATA_MODE}  sink={SINK_MODE}")
 
-    # métricas do loop
+    # cache last-state para fallback
+    last = _LastState(key_idx=1)  # (ts,name,value)
+    if isinstance(sink, MySqlOpcSink) and FAILSAFE_REPLAY and SEED_FROM_DB:
+        try:
+            seed = _seed_last_from_db_opc(sink.conn, limit=200)
+            if seed: last.update_many(seed)
+        except Exception:
+            pass
+
+    if connector:
+        connector.start()
+
     t_prev = time.perf_counter()
     tick = 0
-
     try:
-        if hasattr(reader, "connect") and not connected:
-            while not STOP.is_set() and not connected:
-                try:
-                    reader.connect(); connected = True
-                except Exception as e:
-                    print(f"[OPC] Conexão falhou: {e}. Retentando em 0.5s...")
-                    time.sleep(0.5)
-
-        # === TICK DETERMINÍSTICO ===
         next_t = time.perf_counter()
         while not STOP.is_set():
             next_t += interval
-            try:
-                values = reader.read_all()
-            except Exception as e:
-                print(f"[OPC] Erro leitura: {e}")
-                if hasattr(reader, "disconnect"):
+
+            # Leitura (não bloqueante)
+            values: Dict[str, Any] = {}
+            is_connected = True
+            if connector is not None:
+                is_connected = connector.connected
+
+            if is_connected and connector is not None:
+                try:
+                    values = reader.read_all()
+                except Exception as e:
+                    print(f"[OPC] Erro leitura: {e}")
                     try: reader.disconnect()
                     except Exception: pass
-                    connected = False
-                    while not STOP.is_set() and not connected:
-                        try: reader.connect(); connected = True
-                        except Exception as e2:
-                            print(f"[OPC] Reconnect falhou: {e2}. Retentando em 0.5s...")
-                            time.sleep(0.5)
-                values = {}
-            ts = now_utc_iso()
-            try:
-                if isinstance(sink, MySqlOpcSink): sink.write_many(ts, values)
-                else: sink.write_row({"ts_utc": ts, **values})
-            except Exception as e:
-                print(f"[OPC] Erro gravação: {e}")
-            _publish_opc_events(ts, values)
+                    connector.connected = False
+                    values = {}
+            elif DATA_MODE in ("DEV", "DEV_DUAL", "SIMULATE"):
+                try:
+                    values = reader.read_all()
+                except Exception:
+                    values = {}
 
-            # métrica a cada 1000 ticks
+            ts = now_utc_iso()
+
+            # Fallback
+            if not values and FAILSAFE_REPLAY and isinstance(sink, MySqlOpcSink):
+                replay_rows = last.as_replayed(ts)
+                if replay_rows:
+                    cur = sink.cursor()
+                    cur.executemany(
+                        "INSERT INTO opc_samples (ts_utc,name,value_bool) VALUES (%s,%s,%s)",
+                        [(iso_to_mysql_dt6(ts), name, val) for (ts,name,val) in replay_rows]
+                    )
+                    cur.close()
+                    last.log_if_needed("OPC")
+                    _publish_opc_events(ts, {name: val for (_ts,name,val) in replay_rows})
+            elif values:
+                # Gravação normal
+                try:
+                    if isinstance(sink, MySqlOpcSink): sink.write_many(ts, values)
+                    else: sink.write_row({"ts_utc": ts, **values})
+                except Exception as e:
+                    print(f"[OPC] Erro gravação: {e}")
+                if FAILSAFE_REPLAY and isinstance(sink, MySqlOpcSink):
+                    rows = [(ts, name, (None if v is None else int(bool(v)))) for name, v in values.items()]
+                    last.update_many(rows)
+                _publish_opc_events(ts, values)
+
+            # Métricas
             tick += 1
             if tick % 1000 == 0:
                 t_now = time.perf_counter()
                 elapsed = t_now - t_prev
-                print(f"[DEV] 1000 ticks em {elapsed:.3f}s  (média {elapsed/1000:.6f}s/tick)")
+                print(f"[OPC] 1000 ticks em {elapsed:.3f}s  (média {elapsed/1000:.6f}s/tick)")
                 t_prev = t_now
 
+            # Scheduler (200 ms estáveis)
             rem = next_t - time.perf_counter()
             if rem > 0: time.sleep(rem)
             else: next_t = time.perf_counter()
     finally:
         try: sink.close()
         except Exception: pass
-        if hasattr(reader, "disconnect"): reader.disconnect()
+        try:
+            if connector: connector.stop()
+        except Exception: pass
+        if hasattr(reader, "disconnect"):
+            try: reader.disconnect()
+            except Exception: pass
 
 def mpu_loop_forever():
     ser = SerialMpuReader(SERIAL_PORT, SERIAL_BAUD, SERIAL_TIMEOUT)
     sink = MySqlMpuSink() if SINK_MODE == "MYSQL" else CsvMpuSink(CSV_MPU_PATH)
+
+    # cache de último estado por mpu_id
+    last_by_id: Dict[int, Dict[str, Any]] = {}
+    last_log = 0.0
+
+    # seed opcional via DB
+    if isinstance(sink, MySqlMpuSink) and FAILSAFE_REPLAY and SEED_FROM_DB:
+        try:
+            last_by_id.update(_seed_last_from_db_mpu(sink.conn, limit=200))
+        except Exception:
+            pass
+
     try:
+        # conecta serial com retry
         while True:
-            try: ser.connect(); break
+            try:
+                ser.connect(); break
             except Exception as e:
-                print(f"[MPU] Falha porta {SERIAL_PORT}: {e}. Retentando em 2s..."); time.sleep(2.0)
+                print(f"[MPU] Falha porta {SERIAL_PORT}: {e}. Retentando em 2s...")
+                time.sleep(2.0)
+
+        # writer determinístico de 1 s; leitor rápido
+        next_t = time.perf_counter()
         while True:
             rec = ser.read_one()
-            if rec is None:
-                time.sleep(0.002); continue
-            ts_iso = now_utc_iso()
-            sample = {
-                "ts_utc": ts_iso, "mpu_id": rec["mpu_id"],
-                "ax_g": rec["ax_g"], "ay_g": rec["ay_g"], "az_g": rec["az_g"],
-                "gx_dps": rec.get("gx_dps"), "gy_dps": rec.get("gy_dps"), "gz_dps": rec.get("gz_dps"),
-                "temp_c": rec.get("temp_c")
-            }
-            try:
-                if isinstance(sink, MySqlMpuSink): sink.write_sample(ts_iso, sample)
-                else: sink.write_sample(sample)
-            except Exception as e:
-                print(f"[MPU] Erro gravação: {e}")
-            _publish_mpu_sample(sample)
+            if rec is not None:
+                last_by_id[rec["mpu_id"]] = rec  # atualiza cache
+
+            nowp = time.perf_counter()
+            if nowp >= next_t:
+                next_t += MPU_PERIOD
+                ts_iso = now_utc_iso()
+
+                if last_by_id:
+                    for mpu_id in sorted(last_by_id.keys()):
+                        base = last_by_id[mpu_id]
+                        sample = {
+                            "ts_utc": ts_iso, "mpu_id": mpu_id,
+                            "ax_g": base.get("ax_g", 0.0),
+                            "ay_g": base.get("ay_g", 0.0),
+                            "az_g": base.get("az_g", 1.0),
+                            "gx_dps": base.get("gx_dps"),
+                            "gy_dps": base.get("gy_dps"),
+                            "gz_dps": base.get("gz_dps"),
+                            "temp_c": base.get("temp_c")
+                        }
+                        try:
+                            if isinstance(sink, MySqlMpuSink): sink.write_sample(ts_iso, sample)
+                            else: sink.write_sample(sample)
+                        except Exception as e:
+                            print(f"[MPU] Erro gravação: {e}")
+                        _publish_mpu_sample(sample)
+                else:
+                    if FAILSAFE_REPLAY:
+                        nowt = time.time()
+                        if nowt - last_log >= LOG_FAILSAFE_EVERY_SEC:
+                            print("[MPU] sem sinal — gravando no estado atual (aguardando primeira amostra)")
+                            last_log = nowt
+
+            time.sleep(0.005)
     except KeyboardInterrupt:
         pass
     finally:
@@ -423,7 +605,6 @@ def mpu_loop_forever():
 def mpu_loop_dev():
     reader = DevMpuReader()
     sink = MySqlMpuSink() if SINK_MODE == "MYSQL" else CsvMpuSink(CSV_MPU_PATH)
-    # intervalo do MPU (ms) — usa DEV_TICK_MS_MPU se setado; senão DEV_TICK_MS
     dev_tick_ms = float(os.getenv("DEV_TICK_MS_MPU", os.getenv("DEV_TICK_MS", "200")))
     interval = max(0.001, dev_tick_ms / 1000.0)
     try:
@@ -454,7 +635,7 @@ def mpu_loop_dev():
 
 # ===== Execução =====
 def run_dual():
-    # OPC no processo principal (mesmo laço do modo OPCUA). MPU em outro processo.
+    # OPC no processo principal; MPU em outro processo.
     from multiprocessing import Process
     p_mpu = Process(target=mpu_loop_forever, name="mpu_proc", daemon=True)
     p_mpu.start()
@@ -492,3 +673,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
