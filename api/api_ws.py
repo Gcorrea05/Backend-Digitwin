@@ -2,11 +2,15 @@
 import os
 import re
 import time
-import asyncio
 import math
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Any, Dict, Tuple
+import json  
+
+
+
 
 from dotenv import load_dotenv, find_dotenv
 from fastapi import FastAPI, Request, HTTPException, Query, WebSocket, WebSocketDisconnect, Body
@@ -17,16 +21,16 @@ from collections import deque
 from hashlib import sha1
 from json import loads as _json_loads
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # .env
-# =============================================================================
+# -----------------------------------------------------------------------------
 load_dotenv(find_dotenv())
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # FastAPI + CORS
-# =============================================================================
-app = FastAPI(title="Festo DT API (WS-first)", version="4.1.0")
+# -----------------------------------------------------------------------------
+app = FastAPI(title="Festo DT API (WS-first)", version="4.2.0")
 
 ALLOWED_ORIGINS = [
     o.strip()
@@ -63,7 +67,6 @@ async def ensure_cors_headers(request: Request, call_next):
             resp.headers.setdefault("Access-Control-Expose-Headers", "*")
     return resp
 
-
 @app.options("/{full_path:path}")
 def any_options(full_path: str, request: Request):
     origin = request.headers.get("origin")
@@ -82,56 +85,36 @@ def any_options(full_path: str, request: Request):
 async def pool_error_handler(_, __):
     return JSONResponse(status_code=503, content={"detail": "DB pool exhausted"})
 
-# =============================================================================
-# Imports locais (apenas o essencial)
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Imports locais
+# -----------------------------------------------------------------------------
 from .database import get_db
-from .database import fetch_all as db_fetch_all   # usa seu helper real
+from .database import fetch_all as db_fetch_all
 
-# Routers
+# rotas auxiliares já existentes
 from .routes import metrics as metrics_routes
-app.include_router(metrics_routes.router)
+app.include_router(metrics_routes.router)          # sem /api
 app.include_router(metrics_routes.router, prefix="/api")
 
-# =============================================================================
-# /mpu/ids (já existia)
-# =============================================================================
-@app.get("/api/mpu/ids")
-def get_mpu_ids_api() -> Dict[str, List[Any]]:
-    rows = db_fetch_all("SELECT DISTINCT mpu_id FROM mpu_samples ORDER BY mpu_id")
-    if not rows:
-        rows = db_fetch_all("SELECT DISTINCT id AS mpu_id FROM mpu_samples ORDER BY id")
-    ids: List[Any] = []
-    for r in rows or []:
-        val = r.get("mpu_id")
-        if val is not None:
-            ids.append(val)
-    return {"ids": ids}
-
-@app.get("/mpu/ids")
-def get_mpu_ids_compat() -> Dict[str, List[Any]]:
-    return get_mpu_ids_api()
-
-# =============================================================================
+# -----------------------------------------------------------------------------
 # Config / Constantes
-# =============================================================================
+# -----------------------------------------------------------------------------
 PROCESS_STARTED_MS = int(time.time() * 1000)
 LIVE_TICK_MS = int(os.getenv("LIVE_TICK_MS", "200"))
 MON_TICK_MS  = int(os.getenv("MON_TICK_MS",  "2000"))
 SLOW_TICK_MS = int(os.getenv("SLOW_TICK_MS", "60000"))
 HEARTBEAT_MS = int(os.getenv("WS_HEARTBEAT_MS", "10000"))
 
-STATE_LOG = deque(maxlen=5000)  # ~ alguns minutos de histórico a 5 Hz
+STATE_LOG = deque(maxlen=5000)  # ~ alguns minutos a 5 Hz
 
 OPC_TABLE = os.getenv("OPC_TABLE", "opc_samples")
 MPU_TABLE = os.getenv("MPU_TABLE", "mpu_samples")
 _DURATION_RE = re.compile(r"^-(\d+)\s*([smhd])$", re.IGNORECASE)
-
 MAX_LIMIT = 50000
 
-# =============================================================================
-# DB helpers (mínimos)
-# =============================================================================
+# -----------------------------------------------------------------------------
+# DB helpers
+# -----------------------------------------------------------------------------
 def get_db_safe():
     return get_db()
 
@@ -161,7 +144,6 @@ def col(row: Any, key_or_index: Any) -> Any:
     return None
 
 def _parse_since_to_seconds(s: str, default_s: int = 7200) -> int:
-    """Aceita -60m, -2h, -7200s (ou vazio) -> segundos (int, positivo)."""
     if not s:
         return default_s
     ss = s.strip()
@@ -178,56 +160,28 @@ def _parse_since_to_seconds(s: str, default_s: int = 7200) -> int:
     except Exception:
         return default_s
 
-# =============================================================================
-# Latch config (EXATAMENTE como seu modelo)
-# =============================================================================
-StableState = str  # "RECUADO" | "AVANÇADO"
+# -----------------------------------------------------------------------------
+# /mpu/ids
+# -----------------------------------------------------------------------------
+@app.get("/api/mpu/ids")
+def get_mpu_ids_api() -> Dict[str, List[Any]]:
+    rows = db_fetch_all("SELECT DISTINCT mpu_id FROM mpu_samples ORDER BY mpu_id")
+    if not rows:
+        rows = db_fetch_all("SELECT DISTINCT id AS mpu_id FROM mpu_samples ORDER BY id")
+    ids: List[Any] = []
+    for r in rows or []:
+        val = r.get("mpu_id")
+        if val is not None:
+            ids.append(val)
+    return {"ids": ids}
 
-@dataclass
-class _LatchCfg:
-    id: str
-    expected_ms: int
-    debounce_ms: int
-    timeout_factor: float
-    v_av: str
-    v_rec: str
-    s_adv: str
-    s_rec: str
+@app.get("/mpu/ids")
+def get_mpu_ids_compat() -> Dict[str, List[Any]]:
+    return get_mpu_ids_api()
 
-_CFG_A1 = _LatchCfg(
-    id="A1", expected_ms=1500, debounce_ms=80, timeout_factor=1.5,
-    v_av="V1_14", v_rec="V1_12", s_adv="Recuado_1S1", s_rec="Avancado_1S2",
-)
-_CFG_A2 = _LatchCfg(
-    id="A2", expected_ms=500, debounce_ms=80, timeout_factor=1.5,
-    v_av="V2_14", v_rec="V2_12", s_adv="Recuado_2S1", s_rec="Avancado_2S2",
-)
-_NAMES_LATCH = (
-    _CFG_A1.v_av, _CFG_A1.v_rec, _CFG_A1.s_adv, _CFG_A1.s_rec,
-    _CFG_A2.v_av, _CFG_A2.v_rec, _CFG_A2.s_adv, _CFG_A2.s_rec
-)
-
-_SMAP = {
-    1: {"S1": _CFG_A1.s_adv, "S2": _CFG_A1.s_rec},
-    2: {"S1": _CFG_A2.s_adv, "S2": _CFG_A2.s_rec},
-}
-
-def _resolve_signal_by_facet(act: str | int, facet: str) -> Optional[str]:
-    if isinstance(act, str):
-        act = act.upper().replace("A", "")
-    try:
-        aid = int(act)
-    except Exception:
-        return None
-    f = facet.upper()
-    mp = _SMAP.get(aid)
-    if not mp or f not in mp:
-        return None
-    return mp[f]
-
-# =============================================================================
+# -----------------------------------------------------------------------------
 # Utils de tempo/ISO
-# =============================================================================
+# -----------------------------------------------------------------------------
 def _coerce_to_datetime(value: Any) -> Optional[datetime]:
     if value is None:
         return None
@@ -265,9 +219,61 @@ def dt_to_iso_utc(value: Any) -> Optional[str]:
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
-# =============================================================================
-# Leituras/derivações de OPC
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Latch config/nomes
+# -----------------------------------------------------------------------------
+StableState = str  # "RECUADO" | "AVANÇADO"
+
+@dataclass
+class _LatchCfg:
+    id: str
+    expected_ms: int
+    debounce_ms: int
+    timeout_factor: float
+    v_av: str
+    v_rec: str
+    s_adv: str
+    s_rec: str
+
+_CFG_A1 = _LatchCfg(
+    id="A1", expected_ms=1500, debounce_ms=80, timeout_factor=1.5,
+    v_av="V1_14", v_rec="V1_12", s_adv="Recuado_1S1", s_rec="Avancado_1S2",
+)
+_CFG_A2 = _LatchCfg(
+    id="A2", expected_ms=500, debounce_ms=80, timeout_factor=1.5,
+    v_av="V2_14", v_rec="V2_12", s_adv="Recuado_2S1", s_rec="Avancado_2S2",
+)
+_NAMES_LATCH = (
+    _CFG_A1.v_av, _CFG_A1.v_rec, _CFG_A1.s_adv, _CFG_A1.s_rec,
+    _CFG_A2.v_av, _CFG_A2.v_rec, _CFG_A2.s_adv, _CFG_A2.s_rec
+)
+_SMAP = {
+    1: {"S1": _CFG_A1.s_adv, "S2": _CFG_A1.s_rec},
+    2: {"S1": _CFG_A2.s_adv, "S2": _CFG_A2.s_rec},
+}
+
+def _aid_from_cfg(cfg: _LatchCfg) -> int:
+    try:
+        return int(cfg.id.upper().replace("A", ""))
+    except Exception:
+        return 0
+
+def _resolve_signal_by_facet(act: str | int, facet: str) -> Optional[str]:
+    if isinstance(act, str):
+        act = act.upper().replace("A", "")
+    try:
+        aid = int(act)
+    except Exception:
+        return None
+    f = facet.upper()
+    mp = _SMAP.get(aid)
+    if not mp or f not in mp:
+        return None
+    return mp[f]
+
+# -----------------------------------------------------------------------------
+# OPC reading helpers
+# -----------------------------------------------------------------------------
 def _fetch_latest_rows(names: Tuple[str, ...]) -> Dict[str, Dict[str, Any]]:
     if not names:
         return {}
@@ -308,129 +314,24 @@ def _fetch_latest_rows(names: Tuple[str, ...]) -> Dict[str, Dict[str, Any]]:
         out.setdefault(n, {"value_bool": None, "ts_utc": None})
     return out
 
-def _append_state_log(
-    aid: int,
-    cfg: _LatchCfg,
-    latest: Dict[str, Dict[str, Any]],
-    s1: int, s2: int,
-    t_s1: Optional[datetime], t_s2: Optional[datetime],
-    t_vav: Optional[datetime], t_vrc: Optional[datetime],
-    raw_state: Optional[str],
-    displayed: str,
-    pending: Optional[str],
-    note: str,
-):
-    try:
-        STATE_LOG.append({
-            "ts": _now_iso(),
-            "act": aid,
-            "names": {"S1": cfg.s_rec, "S2": cfg.s_adv, "VAV": cfg.v_av, "VREC": cfg.v_rec},
-            "vals": {
-                "S1": s1, "S2": s2,
-                "t_S1": dt_to_iso_utc(t_s1), "t_S2": dt_to_iso_utc(t_s2),
-                "t_VAV": dt_to_iso_utc(t_vav), "t_VREC": dt_to_iso_utc(t_vrc),
-            },
-            "raw_state": raw_state,
-            "displayed": displayed,
-            "pending": pending,
-            "note": note,
-        })
-    except Exception:
-        pass
-
-_LATCH_STATE: Dict[int, Dict[str, Any]] = {
-    1: {"last_state": None, "last_confirmed_ts": None, "indef_since": None},
-    2: {"last_state": None, "last_confirmed_ts": None, "indef_since": None},
-}
-
-def _aid_from_cfg(cfg: _LatchCfg) -> int:
-    try:
-        return int(cfg.id.upper().replace("A", ""))
-    except Exception:
-        return 0
-
-def _infer_state_from_latest(cfg: _LatchCfg, latest: Dict[str, Dict[str, Any]]):
-    """
-    Sticky: só confirma mudança quando S1/S2 estão em uma combinação inequívoca.
-    - S1=1,S2=0 => RECUADO
-    - S1=0,S2=1 => AVANÇADO
-    - 00 ou 11  => indefinido (NÃO MUDA o último confirmado)
-
-    pending é puramente diagnóstico (com base na última válvula acionada).
-    """
-    now = datetime.now(timezone.utc)
-
-    s_adv = latest.get(cfg.s_adv, {})     # S2 (avançado)
-    s_rec = latest.get(cfg.s_rec, {})     # S1 (recuado)
-    vav   = latest.get(cfg.v_av, {})      # válvula avançar
-    vrc   = latest.get(cfg.v_rec, {})     # válvula recuar
-
-    s2 = int(s_adv.get("value_bool") or 0)
-    s1 = int(s_rec.get("value_bool") or 0)
-
-    t_vav = _coerce_to_datetime(vav.get("ts_utc"))
-    t_vrc = _coerce_to_datetime(vrc.get("ts_utc"))
-
-    aid = _aid_from_cfg(cfg)
-    st = _LATCH_STATE.get(aid) or {"last_state": None, "last_confirmed_ts": None, "indef_since": None}
-
-    # Determina estado bruto pela tabela-verdade
-    raw_state: Optional[StableState] = None
-    if s1 == 1 and s2 == 0:
-        raw_state = "RECUADO"
-    elif s1 == 0 and s2 == 1:
-        raw_state = "AVANÇADO"
-
-    # Sticky: só atualiza quando inequívoco; 00/11 mantém último confirmado
-    if raw_state is not None:
-        st["last_state"] = raw_state
-        st["last_confirmed_ts"] = now
-        st["indef_since"] = None
-    else:
-        if st.get("indef_since") is None:
-            st["indef_since"] = now
-
-    displayed = st["last_state"] or "RECUADO"   # fallback inicial
-
-    # pending (diagnóstico, não altera displayed)
-    pending = None
-    last_cmd_ts = None
-    last_cmd_kind = None  # "AV" | "REC"
-    if t_vav and (not t_vrc or t_vav >= t_vrc):
-        last_cmd_ts = t_vav; last_cmd_kind = "AV"
-    elif t_vrc:
-        last_cmd_ts = t_vrc; last_cmd_kind = "REC"
-
-    if last_cmd_kind == "AV" and displayed != "AVANÇADO":
-        pending = "AV"
-    elif last_cmd_kind == "REC" and displayed != "RECUADO":
-        pending = "REC"
-
-    _LATCH_STATE[aid] = st
-
-    return {
-        "state": displayed,
-        "pending": pending,
-        "started_at": (last_cmd_ts.isoformat() if last_cmd_ts else None),
-    }
+def _dedup(seq: List[Tuple[datetime,int]]) -> List[Tuple[datetime,int]]:
+    if not seq:
+        return []
+    out = [seq[0]]
+    for t, v in seq[1:]:
+        if v != out[-1][1]:
+            out.append((t, v))
+    return out
 
 def _fetch_series(names: List[str], window_s: int) -> Dict[str, List[Tuple[datetime,int]]]:
-    """
-    Busca séries binárias ancoradas em MAX(ts_utc) com 'pré-rolo' para
-    detectar bordas no início da janela (evita CPM=0 por meia transição).
-    """
     if not names:
         return {}
-
     placeholders = ", ".join(["%s"] * len(names))
-
-    # Âncora = última amostra observada (imune a skew de relógio)
+    # ancora: último ts do OPC (imune a skew)
     ref_row = fetch_one(f"SELECT COALESCE(MAX(ts_utc), NOW(6)) AS ref_ts FROM {OPC_TABLE}")
     ref_ts = col(ref_row, "ref_ts") if isinstance(ref_row, dict) else (ref_row[0] if ref_row else None)
     if ref_ts is None:
         return {str(n): [] for n in names}
-
-    # Janela principal e pré-rolo (5s)
     pre_roll_s = 5
     sql = f"""
         SELECT name, ts_utc, value_bool
@@ -440,10 +341,7 @@ def _fetch_series(names: List[str], window_s: int) -> Dict[str, List[Tuple[datet
         ORDER BY ts_utc ASC
     """
     rows = fetch_all(sql, (*names, ref_ts, window_s + pre_roll_s, ref_ts))
-
-    # Corte: início real da janela (sem pré-rolo)
     start_real = _coerce_to_datetime(ref_ts) - timedelta(seconds=window_s)
-
     out: Dict[str, List[Tuple[datetime,int]]] = {str(n): [] for n in names}
     last_before: Dict[str, Tuple[datetime,int] | None] = {str(n): None for n in names}
 
@@ -458,7 +356,6 @@ def _fetch_series(names: List[str], window_s: int) -> Dict[str, List[Tuple[datet
             v = 1 if int(vb_raw) else 0
         except Exception:
             v = 1 if bool(vb_raw) else 0
-
         if dt < start_real:
             last_before[nm] = (dt, v)
         else:
@@ -467,16 +364,6 @@ def _fetch_series(names: List[str], window_s: int) -> Dict[str, List[Tuple[datet
     for nm in list(out.keys()):
         if last_before[nm] is not None:
             out[nm].insert(0, last_before[nm])
-
-    return out
-
-def _dedup(seq: List[Tuple[datetime,int]]) -> List[Tuple[datetime,int]]:
-    if not seq:
-        return []
-    out = [seq[0]]
-    for t, v in seq[1:]:
-        if v != out[-1][1]:
-            out.append((t, v))
     return out
 
 def _derive_open_closed_from_S1S2(
@@ -510,10 +397,10 @@ def _derive_open_closed_from_S1S2(
     for t in times:
         v1 = val_at(s1, t)
         v2 = val_at(s2, t)
-        if v1 == 0 and v2 == 1:
+        if v1 == 1 and v2 == 0:
             cur_open, cur_close = 1, 0
             prev_open = 1
-        elif v1 == 1 and v2 == 0:
+        elif v1 == 0 and v2 == 1:
             cur_open, cur_close = 0, 1
             prev_open = 0
         else:
@@ -533,20 +420,11 @@ def _rising_edges(seq: List[Tuple[datetime,int]]) -> List[datetime]:
             edges.append(seq[i][0])
     return edges
 
-def _last_pulse_duration(
-    seq: List[Tuple[datetime,int]],
-    now_dt: Optional[datetime] = None
-) -> Optional[float]:
-    """
-    Duração (s) do último pulso 0->1->0.
-    Se a série termina em 1, retorna (now_dt - last_on).
-    now_dt permite usar a MESMA âncora temporal da série (ex.: MAX(ts_utc)).
-    """
+def _last_pulse_duration(seq: List[Tuple[datetime,int]], now_dt: Optional[datetime] = None) -> Optional[float]:
     if not seq:
         return None
     if now_dt is None:
         now_dt = datetime.now(timezone.utc)
-
     last_on = None
     last_pulse = None
     for i in range(1, len(seq)):
@@ -554,7 +432,6 @@ def _last_pulse_duration(
             last_on = seq[i][0]
         if seq[i-1][1] == 1 and seq[i][1] == 0 and last_on:
             last_pulse = (last_on, seq[i][0])
-
     if last_pulse:
         t_on, t_off = last_pulse
         return (t_off - t_on).total_seconds()
@@ -562,40 +439,158 @@ def _last_pulse_duration(
         return (now_dt - last_on).total_seconds()
     return None
 
-# =============================================================================
-# Payload builders (contratos WS)
-# =============================================================================
+# -----------------------------------------------------------------------------
+# LIVE cache (amostrador desacoplado do WS)
+# -----------------------------------------------------------------------------
+_LIVE_CACHE: dict = {
+    "ts": None,   # datetime
+    "vals": {},   # { name: {value_bool, ts_utc}, ... }
+}
+
+def _fetch_latest_rows_fast(names: tuple[str, ...]) -> dict[str, dict]:
+    if not names:
+        return {}
+    placeholders = ", ".join(["%s"] * len(names))
+    try:
+        sql = f"""
+        SELECT name, value_bool, ts_utc
+        FROM (
+            SELECT name, value_bool, ts_utc,
+                   ROW_NUMBER() OVER (PARTITION BY name ORDER BY ts_utc DESC) AS rn
+            FROM {OPC_TABLE}
+            WHERE name IN ({placeholders})
+        ) t
+        WHERE rn = 1
+        """
+        rows = fetch_all(sql, names) or []
+        out = {}
+        for r in rows:
+            n = str(col(r, "name") or r[0])  # type: ignore
+            vb = col(r, "value_bool") if isinstance(r, dict) else r[1]  # type: ignore
+            ts = col(r, "ts_utc")     if isinstance(r, dict) else r[2]  # type: ignore
+            out[n] = {"value_bool": (None if vb is None else int(vb)), "ts_utc": ts}
+        for n in names:
+            out.setdefault(n, {"value_bool": None, "ts_utc": None})
+        return out
+    except Exception:
+        return _fetch_latest_rows(names)
+
+# -----------------------------------------------------------------------------
+# State inferência + log
+# -----------------------------------------------------------------------------
+_LATCH_STATE: Dict[int, Dict[str, Any]] = {
+    1: {"last_state": None, "last_confirmed_ts": None, "indef_since": None},
+    2: {"last_state": None, "last_confirmed_ts": None, "indef_since": None},
+}
+
+def _append_state_log(
+    aid: int,
+    cfg: _LatchCfg,
+    latest: Dict[str, Dict[str, Any]],
+    s1: int, s2: int,
+    t_s1: Optional[datetime], t_s2: Optional[datetime],
+    t_vav: Optional[datetime], t_vrc: Optional[datetime],
+    raw_state: Optional[str],
+    displayed: str,
+    pending: Optional[str],
+    note: str,
+):
+    try:
+        STATE_LOG.append({
+            "ts": _now_iso(),
+            "act": aid,
+            "names": {"S1": cfg.s_rec, "S2": cfg.s_adv, "VAV": cfg.v_av, "VREC": cfg.v_rec},
+            "vals": {
+                "S1": s1, "S2": s2,
+                "t_S1": dt_to_iso_utc(t_s1), "t_S2": dt_to_iso_utc(t_s2),
+                "t_VAV": dt_to_iso_utc(t_vav), "t_VREC": dt_to_iso_utc(t_vrc),
+            },
+            "raw_state": raw_state,
+            "displayed": displayed,
+            "pending": pending,
+            "note": note,
+        })
+    except Exception:
+        pass
+
+def _infer_state_from_latest(cfg: _LatchCfg, latest: Dict[str, Dict[str, Any]]):
+    now = datetime.now(timezone.utc)
+    s_adv = latest.get(cfg.s_adv, {})
+    s_rec = latest.get(cfg.s_rec, {})
+    vav   = latest.get(cfg.v_av, {})
+    vrc   = latest.get(cfg.v_rec, {})
+
+    s2 = int(s_adv.get("value_bool") or 0)
+    s1 = int(s_rec.get("value_bool") or 0)
+
+    t_vav = _coerce_to_datetime(vav.get("ts_utc"))
+    t_vrc = _coerce_to_datetime(vrc.get("ts_utc"))
+
+    aid = _aid_from_cfg(cfg)
+    st = _LATCH_STATE.get(aid) or {"last_state": None, "last_confirmed_ts": None, "indef_since": None}
+
+    raw_state: Optional[StableState] = None
+    if s1 == 1 and s2 == 0:
+        raw_state = "RECUADO"
+    elif s1 == 0 and s2 == 1:
+        raw_state = "AVANÇADO"
+
+    if raw_state is not None:
+        st["last_state"] = raw_state
+        st["last_confirmed_ts"] = now
+        st["indef_since"] = None
+    else:
+        if st.get("indef_since") is None:
+            st["indef_since"] = now
+
+    displayed = st["last_state"] or "RECUADO"
+
+    pending = None
+    last_cmd_ts = None
+    last_cmd_kind = None  # "AV" | "REC"
+    if t_vav and (not t_vrc or t_vav >= t_vrc):
+        last_cmd_ts = t_vav; last_cmd_kind = "AV"
+    elif t_vrc:
+        last_cmd_ts = t_vrc; last_cmd_kind = "REC"
+
+    if last_cmd_kind == "AV" and displayed != "AVANÇADO":
+        pending = "AV"
+    elif last_cmd_kind == "REC" and displayed != "RECUADO":
+        pending = "REC"
+
+    _LATCH_STATE[aid] = st
+
+    return {
+        "state": displayed,
+        "pending": pending,
+        "started_at": (last_cmd_ts.isoformat() if last_cmd_ts else None),
+    }
+
+# -----------------------------------------------------------------------------
+# Payload builders (WS contracts)
+# -----------------------------------------------------------------------------
 def build_live_payload() -> dict:
     latest = _LIVE_CACHE.get("vals") or {}
     if not latest:
         latest = _fetch_latest_rows_fast(_NAMES_LATCH)
-
     a1 = _infer_state_from_latest(_CFG_A1, latest)
     a2 = _infer_state_from_latest(_CFG_A2, latest)
-    items = [
-        {"id": 1, "state": a1["state"]},
-        {"id": 2, "state": a2["state"]},
-    ]
+    items = [{"id": 1, "state": a1["state"]}, {"id": 2, "state": a2["state"]}]
     return {"type": "live", "ts": _now_iso(), "actuators": items}
 
 def build_monitoring_payload() -> dict:
     WINDOW_S_PRIMARY  = int(os.getenv("MON_TIMING_WINDOW_S", "60"))
     WINDOW_S_FALLBACK = int(os.getenv("MON_TIMING_FALLBACK_S", "60"))
 
-    s_map = {
-        1: {"S1": _CFG_A1.s_adv, "S2": _CFG_A1.s_rec},
-        2: {"S1": _CFG_A2.s_adv, "S2": _CFG_A2.s_rec},
-    }
+    s_map = {1: {"S1": _CFG_A1.s_adv, "S2": _CFG_A1.s_rec},
+             2: {"S1": _CFG_A2.s_adv, "S2": _CFG_A2.s_rec}}
     names = [v for m in s_map.values() for v in (m["S1"], m["S2"])]
 
     ref_row = fetch_one(f"SELECT COALESCE(MAX(ts_utc), NOW(6)) AS ref_ts FROM {OPC_TABLE}")
-    ref_ts = _coerce_to_datetime(
-        col(ref_row, "ref_ts") if isinstance(ref_row, dict) else (ref_row[0] if ref_row else None)
-    ) or datetime.now(timezone.utc)
+    ref_ts = _coerce_to_datetime(col(ref_row, "ref_ts") if isinstance(ref_row, dict) else (ref_row[0] if ref_row else None)) or datetime.now(timezone.utc)
 
     def _nonneg(x: Optional[float]) -> Optional[float]:
-        if x is None:
-            return None
+        if x is None: return None
         return x if x >= 0 else 0.0
 
     def _timings_for_window(win_s: int):
@@ -606,11 +601,9 @@ def build_monitoring_payload() -> dict:
             s1 = compact.get(m["S1"], [])
             s2 = compact.get(m["S2"], [])
             opened, closed = _derive_open_closed_from_S1S2(s1, s2)
-
             t_abre  = _nonneg(_last_pulse_duration(opened, now_dt=ref_ts))
             t_fecha = _nonneg(_last_pulse_duration(closed, now_dt=ref_ts))
             t_ciclo = ((t_abre or 0.0) + (t_fecha or 0.0)) if (t_abre or t_fecha) else None
-
             timings.append({
                 "actuator_id": aid,
                 "last": {"dt_abre_s": t_abre, "dt_fecha_s": t_fecha, "dt_ciclo_s": t_ciclo},
@@ -618,10 +611,7 @@ def build_monitoring_payload() -> dict:
         return timings
 
     timings = _timings_for_window(WINDOW_S_PRIMARY)
-    need_fallback = all(
-        (t.get("last", {}).get("dt_abre_s") is None and t.get("last", {}).get("dt_fecha_s") is None)
-        for t in timings
-    )
+    need_fallback = all((t.get("last", {}).get("dt_abre_s") is None and t.get("last", {}).get("dt_fecha_s") is None) for t in timings)
     if need_fallback and WINDOW_S_FALLBACK > WINDOW_S_PRIMARY:
         timings = _timings_for_window(WINDOW_S_FALLBACK)
 
@@ -655,15 +645,8 @@ def build_monitoring_payload() -> dict:
     }
 
 def build_cpm_payload(window_s: int = 60) -> dict:
-    """
-    Calcula CPM por atuador em uma janela de `window_s` segundos.
-    Um ciclo é contado a cada transição para o estado FECHADO (rising de "closed").
-    """
-    s_map = {
-        1: {"S1": _CFG_A1.s_adv, "S2": _CFG_A1.s_rec},
-        2: {"S1": _CFG_A2.s_adv, "S2": _CFG_A2.s_rec},
-    }
-
+    s_map = {1: {"S1": _CFG_A1.s_adv, "S2": _CFG_A1.s_rec},
+             2: {"S1": _CFG_A2.s_adv, "S2": _CFG_A2.s_rec}}
     names = [v for m in s_map.values() for v in (m["S1"], m["S2"])]
     raw = _fetch_series(names, window_s)
     compact = {k: _dedup(v) for k, v in raw.items()}
@@ -672,20 +655,16 @@ def build_cpm_payload(window_s: int = 60) -> dict:
     for aid, m in s_map.items():
         s1 = compact.get(m["S1"], [])
         s2 = compact.get(m["S2"], [])
-
-        opened, closed = _derive_open_closed_from_S1S2(s1, s2)
-
+        _, closed = _derive_open_closed_from_S1S2(s1, s2)
         e_close = _rising_edges(closed)
         cycles = len(e_close)
-
         cpm = cycles * (60.0 / float(window_s)) if window_s > 0 else 0.0
         out.append({"id": aid, "cycles": cycles, "cpm": cpm, "window_s": window_s})
-
     return {"type": "cpm", "ts": _now_iso(), "window_s": window_s, "items": out}
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # Debug endpoints
-# =============================================================================
+# -----------------------------------------------------------------------------
 @app.get("/api/debug/state-log")
 def debug_state_log(limit: int = Query(200, ge=1, le=2000), act: int | None = Query(None)):
     data = list(STATE_LOG)[-limit:]
@@ -700,15 +679,10 @@ def debug_cpm(window_s: int = 60):
     s_map = {1: {"S1": _CFG_A1.s_adv, "S2": _CFG_A1.s_rec},
              2: {"S1": _CFG_A2.s_adv, "S2": _CFG_A2.s_rec}}
     names = [v for m in s_map.values() for v in (m["S1"], m["S2"])]
-
     ref_row = fetch_one(f"SELECT COALESCE(MAX(ts_utc), NOW(6)) AS ref_ts FROM {OPC_TABLE}")
     ref_ts = col(ref_row, "ref_ts") if isinstance(ref_row, dict) else (ref_row[0] if ref_row else None)
-
     series = _fetch_series(names, window_s)
-
-    def tail(lst, n=5):
-        return [{"ts": dt_to_iso_utc(t), "v": v} for (t, v) in lst[-n:]]
-
+    def tail(lst, n=5): return [{"ts": dt_to_iso_utc(t), "v": v} for (t, v) in lst[-n:]]
     payload = {
         "ref_ts": dt_to_iso_utc(ref_ts),
         "window_s": window_s,
@@ -724,15 +698,10 @@ def debug_cpm2(window_s: int = 60):
     s_map = {1: {"S1": _CFG_A1.s_adv, "S2": _CFG_A1.s_rec},
              2: {"S1": _CFG_A2.s_adv, "S2": _CFG_A2.s_rec}}
     names = [v for m in s_map.values() for v in (m["S1"], m["S2"])]
-
     ref_row = fetch_one(f"SELECT COALESCE(MAX(ts_utc), NOW(6)) AS ref_ts FROM {OPC_TABLE}")
     ref_ts = col(ref_row, "ref_ts") if isinstance(ref_row, dict) else (ref_row[0] if ref_row else None)
-
     series = _fetch_series(names, window_s)
-
-    def tail(lst, n=5):
-        return [{"ts": dt_to_iso_utc(t), "v": v} for (t, v) in lst[-n:]]
-
+    def tail(lst, n=5): return [{"ts": dt_to_iso_utc(t), "v": v} for (t, v) in lst[-n:]]
     return JSONResponse({
         "ref_ts": dt_to_iso_utc(ref_ts),
         "window_s": window_s,
@@ -742,14 +711,10 @@ def debug_cpm2(window_s: int = 60):
         "now": _now_iso(),
     }, headers={"Cache-Control": "no-store"})
 
-# --- PING rápido --------------------------------------------------------------
 @app.get("/__ping")
 def __ping():
     return {"ok": True, "ts": _now_iso()}
-# -----------------------------------------------------------------------------
 
-
-# --- LISTAR ROTAS -------------------------------------------------------------
 @app.get("/api/debug/routes")
 def list_routes():
     out = []
@@ -762,12 +727,10 @@ def list_routes():
         out.append({"path": path, "methods": methods})
     out.sort(key=lambda x: x["path"])
     return JSONResponse(out, headers={"Cache-Control":"no-store"})
+
 # -----------------------------------------------------------------------------
-
-
-# =============================================================================
-# Alerts helpers
-# =============================================================================
+# Alerts helpers + cache/etag  (refatorado para WS-first)
+# -----------------------------------------------------------------------------
 def maybe_alerts_from_vibration(vib_items: List[dict], threshold: float = 0.5) -> List[dict]:
     alerts = []
     for it in vib_items:
@@ -780,39 +743,48 @@ def maybe_alerts_from_vibration(vib_items: List[dict], threshold: float = 0.5) -
             })
     return alerts
 
-def _cfg_for_aid(aid: int) -> _LatchCfg:
-    return _CFG_A1 if aid == 1 else _CFG_A2
-
-def maybe_alerts_from_latch() -> List[dict]:
-    """
-    Gera alerta se um atuador ficar 'pending' além do timeout (expected_ms * timeout_factor).
-    Usa o último diagnóstico de _infer_state_from_latest via _LIVE_CACHE.
-    """
+def maybe_alerts_from_latch(cfg_override: Any = None) -> List[dict]:
     latest = _LIVE_CACHE.get("vals") or {}
     if not latest:
         return []
     alerts: List[dict] = []
     now = datetime.now(timezone.utc)
+
+    lt_factor = None
+    exp_A1 = None
+    exp_A2 = None
+    if cfg_override is not None:
+        lt_factor = float(getattr(cfg_override, "latch_timeout_factor", None) or 0) or None
+        exp_A1 = getattr(cfg_override, "expected_ms_A1", None)
+        exp_A2 = getattr(cfg_override, "expected_ms_A2", None)
+
     for aid, cfg in ((1, _CFG_A1), (2, _CFG_A2)):
-        diag = _infer_state_from_latest(cfg, latest)
+        loc_cfg = _LatchCfg(
+            id=cfg.id,
+            expected_ms=exp_A1 if (aid == 1 and exp_A1) else exp_A2 if (aid == 2 and exp_A2) else cfg.expected_ms,
+            debounce_ms=cfg.debounce_ms,
+            timeout_factor=lt_factor if lt_factor else cfg.timeout_factor,
+            v_av=cfg.v_av, v_rec=cfg.v_rec, s_adv=cfg.s_adv, s_rec=cfg.s_rec,
+        )
+        diag = _infer_state_from_latest(loc_cfg, latest)
         if not diag.get("pending"):
             continue
         started_at = _coerce_to_datetime(diag.get("started_at"))
         if not started_at:
             continue
-        elapsed_ms = (now - started_at).total_seconds() * 1000.0
-        limit_ms = cfg.expected_ms * cfg.timeout_factor
-        if elapsed_ms >= limit_ms:
+        elapsed_ms = int((now - started_at).total_seconds() * 1000)
+        timeout_ms = int(loc_cfg.expected_ms * loc_cfg.timeout_factor)
+        if elapsed_ms >= timeout_ms:
             alerts.append({
-                "type": "alert", "ts": _now_iso(),
-                "code": "LATCH_TIMEOUT", "severity": 4, "origin": f"A{aid}",
-                "message": f"Transição '{diag['pending']}' excedeu {int(limit_ms)} ms (t={int(elapsed_ms)} ms)",
+                "type": "alert",
+                "ts": _now_iso(),
+                "code": "TIMEOUT",
+                "severity": 4,
+                "origin": loc_cfg.id,
+                "message": f"Transição excedida ({elapsed_ms} ms ≥ {timeout_ms} ms)",
             })
     return alerts
 
-# =============================================================================
-# Alerts cache
-# =============================================================================
 _LAST_ALERTS_PAYLOAD: dict | None = None
 _LAST_ALERTS_ETAG: str | None = None
 _LAST_ALERTS_TS: datetime | None = None
@@ -824,41 +796,51 @@ def _alerts_signature(items: list[dict]) -> str:
 
 def _make_alerts_payload(items: list[dict], changed_at: datetime) -> tuple[dict, str]:
     etag = _alerts_signature(items)
-    payload = {"items": items, "ts": changed_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")}
+    payload = {"type": "alerts", "items": items, "ts": changed_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")}
     return payload, etag
 
-def _make_alerts_payload_from_mon(mon: dict, limit: int = 5) -> tuple[dict, str]:
-    items = maybe_alerts_from_vibration(mon.get("vibration", {}).get("items", []))
-    items = items[: max(1, min(limit, 100))]
-    payload = {"items": items, "ts": _now_iso()}
-    body = (repr(items) + "|" + payload["ts"]).encode("utf-8")
-    etag = sha1(body).hexdigest()
-    return payload, etag
-
-def _update_alerts_cache_from_mon(mon: dict) -> None:
+def _update_alerts_cache_from_mon(mon: dict) -> bool:
+    """
+    Atualiza cache a partir do payload de monitoring.
+    Retorna True se houve mudança (para acionar broadcast WS).
+    """
     global _LAST_ALERTS_PAYLOAD, _LAST_ALERTS_ETAG, _LAST_ALERTS_TS, _LAST_ALERTS_SIG
     items = maybe_alerts_from_vibration(mon.get("vibration", {}).get("items", []))
     items = items[:5]
     sig = _alerts_signature(items)
     if sig == _LAST_ALERTS_SIG and _LAST_ALERTS_PAYLOAD is not None:
-        return
+        return False  # nada novo
     changed_at = datetime.now(timezone.utc)
     payload, etag = _make_alerts_payload(items, changed_at)
     _LAST_ALERTS_SIG = sig
     _LAST_ALERTS_TS = changed_at
     _LAST_ALERTS_ETAG = etag
     _LAST_ALERTS_PAYLOAD = payload
+    return True
 
 def _get_cached_alerts(limit: int = 5) -> tuple[dict | None, str | None, datetime | None]:
     if _LAST_ALERTS_PAYLOAD is None:
         return None, None, None
     items = (_LAST_ALERTS_PAYLOAD.get("items") or [])[: max(1, min(limit, 100))]
-    payload = {"items": items, "ts": _LAST_ALERTS_PAYLOAD.get("ts")}
+    payload = {"type":"alerts", "items": items, "ts": _LAST_ALERTS_PAYLOAD.get("ts")}
     return payload, _LAST_ALERTS_ETAG, _LAST_ALERTS_TS
 
-# =============================================================================
-# WS Groups / Broadcast
-# =============================================================================
+def build_alerts_snapshot(limit: int = 5) -> dict:
+    """
+    Snapshot atual de alerts (para enviar no on-open do WS).
+    """
+    payload, _, _ = _get_cached_alerts(limit=limit)
+    if payload is not None:
+        return payload
+    # se ainda não existe cache, força cálculo a partir de monitoring
+    mon = build_monitoring_payload()
+    _update_alerts_cache_from_mon(mon)
+    payload, _, _ = _get_cached_alerts(limit=limit)
+    return payload or {"type":"alerts", "items": [], "ts": _now_iso()}
+
+# -----------------------------------------------------------------------------
+# WS infra
+# -----------------------------------------------------------------------------
 class WSGroup:
     def __init__(self, name: str):
         self.name = name
@@ -880,10 +862,7 @@ class WSGroup:
             return
         dead = []
         clients_snapshot = list(self.clients)
-        tasks = [
-            asyncio.wait_for(ws.send_json(payload), timeout=send_timeout)
-            for ws in clients_snapshot
-        ]
+        tasks = [asyncio.wait_for(ws.send_json(payload), timeout=send_timeout) for ws in clients_snapshot]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for ws, res in zip(clients_snapshot, results):
             if isinstance(res, Exception):
@@ -902,12 +881,25 @@ class WSGroup:
 WS_LIVE = WSGroup("live")
 WS_MON  = WSGroup("monitoring")
 WS_SLOW = WSGroup("slow")
-
+WS_ALERTS = WSGroup("alerts")  # NOVO canal de alerts (snapshot + push)
 _bg_tasks: "list[asyncio.Task]" = []
+# ---------------------------------------------------------------------
+# Producers
+# ---------------------------------------------------------------------
+async def live_sampler_loop():
+    names = _NAMES_LATCH
+    period = max(0.05, LIVE_TICK_MS / 1000.0)  # 50–200 ms
+    next_t = time.perf_counter()
+    while True:
+        next_t += period
+        try:
+            latest = await asyncio.to_thread(_fetch_latest_rows_fast, names)
+            _LIVE_CACHE["vals"] = latest
+            _LIVE_CACHE["ts"] = datetime.now(timezone.utc)
+        except Exception:
+            pass
+        await asyncio.sleep(max(0, next_t - time.perf_counter()))
 
-# =============================================================================
-# Producers (passo determinístico)
-# =============================================================================
 async def live_producer_loop():
     period = max(0.02, LIVE_TICK_MS / 1000.0)
     next_t = time.perf_counter()
@@ -924,28 +916,72 @@ async def live_producer_loop():
             })
         await asyncio.sleep(max(0, next_t - time.perf_counter()))
 
+# usa config dinâmica para thresholds/timeouts (somente UMA vez!)
+from .config.runtime import get_alerts_config, update_alerts_config  # helpers de runtime/config
+
 async def monitoring_producer_loop():
     period = max(0.2, MON_TICK_MS / 1000.0)
     next_t = time.perf_counter()
     while True:
         next_t += period
         try:
+            # 1) gera payload de monitoramento
             mon = await asyncio.to_thread(build_monitoring_payload)
-            _update_alerts_cache_from_mon(mon)
+
+            # 2) atualiza cache/snapshot e notifica canal /ws/alerts se mudou
+            changed = _update_alerts_cache_from_mon(mon)
+            if changed:
+                snap = await asyncio.to_thread(build_alerts_snapshot, 5)
+                await WS_ALERTS.broadcast_json(snap)
+
+            # 3) broadcast de monitoring
             await WS_MON.broadcast_json(mon)
 
-            alerts = maybe_alerts_from_vibration(mon.get("vibration", {}).get("items", [])) + maybe_alerts_from_latch()
+            # 4) aplica regras de alerta com config dinâmica
+            cfg = get_alerts_config()
+            alerts = (
+                maybe_alerts_from_vibration(
+                    mon.get("vibration", {}).get("items", []),
+                    threshold=float(cfg.vibration_overall_threshold)
+                )
+                + maybe_alerts_from_latch(cfg_override=cfg)
+            )
+
+            # 5) persistência + notificação de cada alerta
             if alerts:
                 for a in alerts:
-                    await WS_SLOW.broadcast_json(a)
+                    a.setdefault("type", "alert")
+                    a.setdefault("ts", _now_iso())
+                    a.setdefault("details_json", {
+                        "title": "IMU saturado" if a.get("code") == "LIMIT" else "Tempo de transição excedido",
+                        "causes": (
+                            ["Eixo(s) batendo no limite de medição"]
+                            if a.get("code") == "LIMIT"
+                            else ["Curso obstruído", "Baixa pressão pneumática"]
+                        ),
+                        "recommendations": ["Parada imediata", "Reduzir aceleração", "Inspecionar batidas mecânicas"],
+                    })
+                    if "actuator_id" not in a and isinstance(a.get("origin"), str) and a["origin"].startswith("A"):
+                        try:
+                            a["actuator_id"] = int(a["origin"][1:])
+                        except Exception:
+                            pass
+
+                    save_alert_event(a)          # grava no banco (dedupe por segundo)
+                    await WS_SLOW.broadcast_json(a)  # empurra para /ws/slow (front já escuta)
 
             await WS_MON.heartbeat_if_due()
+
         except Exception as e:
             await WS_MON.broadcast_json({
-                "type": "error", "channel": "monitoring",
-                "detail": str(e)[:180], "ts": _now_iso()
+                "type": "error",
+                "channel": "monitoring",
+                "detail": str(e)[:180],
+                "ts": _now_iso(),
             })
-        await asyncio.sleep(max(0, next_t - time.perf_counter()))
+        finally:
+            # garante fechamento do try e o período regular
+            await asyncio.sleep(max(0, next_t - time.perf_counter()))
 
 async def slow_producer_loop():
     period = max(1.0, SLOW_TICK_MS / 1000.0)
@@ -958,14 +994,17 @@ async def slow_producer_loop():
             await WS_SLOW.heartbeat_if_due()
         except Exception as e:
             await WS_SLOW.broadcast_json({
-                "type": "error", "channel": "slow",
-                "detail": str(e)[:180], "ts": _now_iso()
+                "type": "error",
+                "channel": "slow",
+                "detail": str(e)[:180],
+                "ts": _now_iso(),
             })
-        await asyncio.sleep(max(0, next_t - time.perf_counter()))
+        finally:
+            await asyncio.sleep(max(0, next_t - time.perf_counter()))
 
-# =============================================================================
-# Startup / Shutdown (garante rodar uma única vez)
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Startup / Shutdown
+# -----------------------------------------------------------------------------
 _started_flag = False
 
 @app.on_event("startup")
@@ -983,9 +1022,9 @@ async def _shutdown_ws_tasks():
         t.cancel()
     await asyncio.gather(*_bg_tasks, return_exceptions=True)
 
-# =============================================================================
-# Endpoints WebSocket
-# =============================================================================
+# -----------------------------------------------------------------------------
+# WS endpoints
+# -----------------------------------------------------------------------------
 @app.websocket("/ws/live")
 async def ws_live(ws: WebSocket):
     await WS_LIVE.connect(ws)
@@ -1028,9 +1067,32 @@ async def ws_slow(ws: WebSocket):
     finally:
         await WS_SLOW.disconnect(ws)
 
-# =============================================================================
+# --- NOVO: canal de Alerts (snapshot inicial + push on-change)
+@app.websocket("/ws/alerts")
+async def ws_alerts(ws: WebSocket):
+    await WS_ALERTS.connect(ws)
+    try:
+        # snapshot inicial logo na conexão
+        try:
+            snap = await asyncio.to_thread(build_alerts_snapshot, 5)
+            await ws.send_json(snap)
+        except Exception:
+            pass
+
+        # Conexão fica quieta; servidor envia quando houver mudança
+        while True:
+            try:
+                await ws.receive_text()
+            except WebSocketDisconnect:
+                break
+            except Exception:
+                await asyncio.sleep(1.0)
+    finally:
+        await WS_ALERTS.disconnect(ws)
+
+# -----------------------------------------------------------------------------
 # Snapshots HTTP (fallback)
-# =============================================================================
+# -----------------------------------------------------------------------------
 @app.get("/api/live/snapshot")
 def http_snapshot_live():
     return JSONResponse(build_live_payload(), headers={"Cache-Control":"no-store","Pragma":"no-cache"})
@@ -1043,17 +1105,16 @@ def http_snapshot_monitoring():
 def http_snapshot_slow():
     return JSONResponse(build_cpm_payload(), headers={"Cache-Control":"no-store","Pragma":"no-cache"})
 
-# =============================================================================
-# Helpers de janela/series para OPC
-# =============================================================================
+# -----------------------------------------------------------------------------
+# OPC endpoints
+# -----------------------------------------------------------------------------
 def _since_to_window_seconds(since: str, default_sec: int = 7200) -> int:
     if not since:
         return default_sec
     s = str(since).strip()
     m = _DURATION_RE.match(s)
     if m:
-        val = int(m.group(1))
-        unit = m.group(2).lower()
+        val = int(m.group(1)); unit = m.group(2).lower()
         mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
         return max(1, val * mult)
     dt = _coerce_to_datetime(s)
@@ -1072,25 +1133,12 @@ def _rows_for_names(names: List[str], window_s: int) -> Dict[str, List[Dict[str,
         out[nm] = [{"ts": dt_to_iso_utc(t), "value": int(v)} for (t, v) in compact if dt_to_iso_utc(t)]
     return out
 
-# =============================================================================
-# OPC Endpoints
-# =============================================================================
 @app.get("/api/opc/history/name")
-def http_opc_history_by_name(
-    name: str = Query(...),
-    since: str = Query("-120m"),
-    limit: int = Query(200),
-    asc: bool = Query(True),
-):
+def http_opc_history_by_name(name: str = Query(...), since: str = Query("-120m"), limit: int = Query(200), asc: bool = Query(True)):
     return http_opc_by_name(name=name, since=since, limit=limit, asc=asc)
 
 @app.get("/api/opc/by-name")
-def http_opc_by_name(
-    name: str = Query(...),
-    since: str = Query("-120m"),
-    limit: int = Query(200),
-    asc: bool = Query(True),
-):
+def http_opc_by_name(name: str = Query(...), since: str = Query("-120m"), limit: int = Query(200), asc: bool = Query(True)):
     window_s = _parse_since_to_seconds(since, 7200)
     safe_limit = max(1, min(int(limit), MAX_LIMIT))
     series = _fetch_series([name], window_s).get(name, [])
@@ -1106,61 +1154,50 @@ def http_opc_by_name(
     }, headers={"Cache-Control":"no-store","Pragma":"no-cache"})
 
 @app.get("/api/opc/query")
-def http_opc_query(
-    act: str | int = Query(..., description="1/2 ou A1/A2"),
-    facet: str = Query("S1", pattern="^(?i:S1|S2)$"),
-    since: str = Query("-120m"),
-    asc: bool = Query(True),
-):
+def http_opc_query(act: str | int = Query(..., description="1/2 ou A1/A2"),
+                   facet: str = Query("S1", pattern="^(?i:S1|S2)$"),
+                   since: str = Query("-120m"), asc: bool = Query(True)):
     name = _resolve_signal_by_facet(act, facet)
     if not name:
         raise HTTPException(status_code=422, detail="act/facet inválidos")
     return http_opc_by_name(name=name, since=since, limit=MAX_LIMIT, asc=asc)
 
 @app.get("/api/opc/by-facet")
-def http_opc_by_facet(
-    act: str | int = Query(...),
-    facet: str = Query(...),
-    since: str = Query("-120m"),
-    asc: bool = Query(True),
-):
+def http_opc_by_facet(act: str | int = Query(...), facet: str = Query(...),
+                      since: str = Query("-120m"), asc: bool = Query(True)):
     name = _resolve_signal_by_facet(act, facet)
     if not name:
         raise HTTPException(status_code=422, detail="act/facet inválidos")
     return http_opc_by_name(name=name, since=since, limit=MAX_LIMIT, asc=asc)
 
 @app.get("/api/opc/history/facet")
-def http_opc_history_facet(
-    act: str | int = Query(...),
-    facet: str = Query(...),
-    since: str = Query("-120m"),
-    asc: bool = Query(True),
-):
+def http_opc_history_facet(act: str | int = Query(...), facet: str = Query(...),
+                           since: str = Query("-120m"), asc: bool = Query(True)):
     return http_opc_by_facet(act=act, facet=facet, since=since, asc=asc)
 
-# Aliases SEM /api (compat)
+# compat GET
 @app.get("/opc/history/name")
-def compat_opc_history_name_legacy(**kwargs): return http_opc_history_by_name(**kwargs)
+def compat_opc_history_name_legacy(**kwargs):
+    return http_opc_history_by_name(**kwargs)
 
 @app.get("/opc/by-name")
-def compat_opc_by_name_legacy(**kwargs): return http_opc_by_name(**kwargs)
+def compat_opc_by_name_legacy(**kwargs):
+    return http_opc_by_name(**kwargs)
 
 @app.get("/opc/query")
-def compat_opc_query_legacy(**kwargs): return http_opc_query(**kwargs)
+def compat_opc_query_legacy(**kwargs):
+    return http_opc_query(**kwargs)
 
 @app.get("/opc/by-facet")
-def compat_opc_by_facet_legacy(**kwargs): return http_opc_by_facet(**kwargs)
+def compat_opc_by_facet_legacy(**kwargs):
+    return http_opc_by_facet(**kwargs)
 
 @app.get("/opc/history/facet")
-def compat_opc_history_facet_legacy(**kwargs): return http_opc_history_facet(**kwargs)
-
-# POST compat
+def compat_opc_history_facet_legacy(**kwargs):
+    return http_opc_history_facet(**kwargs)
+# compat POST
 @app.post("/api/opc/history/name")
 def http_opc_history_by_name_post(body: dict = Body(...)):
-    return http_opc_by_name_post(body)
-
-@app.post("/api/opc/by-name")
-def http_opc_by_name_post(body: dict = Body(...)):
     return http_opc_by_name(
         name=str(body.get("name")),
         since=str(body.get("since", "-120m")),
@@ -1168,15 +1205,15 @@ def http_opc_by_name_post(body: dict = Body(...)):
         asc=bool(body.get("asc", True)),
     )
 
+@app.post("/api/opc/by-name")
+def http_opc_by_name_post(body: dict = Body(...)):
+    return http_opc_history_by_name_post(body)
+
 @app.get("/api/opc/history")
-def http_opc_history_alias(
-    name: str | None = Query(None),
-    act: str | int | None = Query(None),
-    facet: str | None = Query(None),
-    since: str = "-120m",
-    limit: int = 200,
-    asc: bool = True,
-):
+def http_opc_history_alias(name: str | None = Query(None),
+                           act: str | int | None = Query(None),
+                           facet: str | None = Query(None),
+                           since: str = "-120m", limit: int = 200, asc: bool = True):
     if name:
         return http_opc_history_by_name(name=name, since=since, limit=limit, asc=asc)
     if act is not None and facet:
@@ -1192,9 +1229,26 @@ def http_opc_history_alias_post(body: dict = Body(...)):
         asc=bool(body.get("asc", True)),
     )
 
-# =============================================================================
-# (NOVO) MPU HISTORY – cobre os 405 do front
-# =============================================================================
+@app.post("/api/opc/by-facet")
+def http_opc_by_facet_post(body: dict = Body(...)):
+    return http_opc_by_facet(
+        act=body.get("act"),
+        facet=body.get("facet"),
+        since=str(body.get("since", "-120m")),
+        asc=bool(body.get("asc", True)),
+    )
+
+@app.post("/opc/by-facet")
+def compat_opc_by_facet_post(body: dict = Body(...)):
+    return http_opc_by_facet_post(body)
+
+@app.post("/opc/history/facet")
+def compat_opc_history_facet_post(body: dict = Body(...)):
+    return http_opc_by_facet_post(body)
+
+# -----------------------------------------------------------------------------
+# MPU history (compat 405)
+# -----------------------------------------------------------------------------
 def _since_str_to_dt(since: str, default="-10m") -> datetime:
     s = since or default
     s = s.strip()
@@ -1207,16 +1261,10 @@ def _since_str_to_dt(since: str, default="-10m") -> datetime:
     return datetime.now(timezone.utc) - timedelta(seconds=secs)
 
 @app.get("/api/mpu/history")
-def api_mpu_history(
-    id: int = Query(..., description="actuator_id (1=A1, 2=A2)"),
-    since: str = Query("-10m"),
-    limit: int = Query(2000, ge=1, le=200000),
-    asc: int = Query(1, description="1=crescente, 0=decrescente")
-) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    Histórico bruto do MPU filtrado por actuator_id.
-    Campos: ts, ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps
-    """
+def api_mpu_history(id: int = Query(..., description="actuator_id (1=A1, 2=A2)"),
+                    since: str = Query("-10m"),
+                    limit: int = Query(2000, ge=1, le=200000),
+                    asc: int = Query(1, description="1=crescente, 0=decrescente")) -> Dict[str, List[Dict[str, Any]]]:
     since_dt = _since_str_to_dt(since)
     order = "ASC" if asc else "DESC"
     sql = f"""
@@ -1239,17 +1287,12 @@ def api_mpu_history(
     return {"data": data}
 
 @app.get("/mpu/history")
-def mpu_history_compat(
-    id: int = Query(...),
-    since: str = Query("-10m"),
-    limit: int = Query(2000),
-    asc: int = Query(1)
-):
+def mpu_history_compat(id: int = Query(...), since: str = Query("-10m"), limit: int = Query(2000), asc: int = Query(1)):
     return api_mpu_history(id=id, since=since, limit=limit, asc=asc)
 
-# =============================================================================
-# Endpoints compat do live (HTTP)
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Endpoints compat live (HTTP)
+# -----------------------------------------------------------------------------
 @app.get("/api/live/actuators/cpm")
 def compat_actuators_cpm(window_s: int = Query(60, ge=10, le=600)):
     payload = build_cpm_payload(window_s=window_s)
@@ -1328,49 +1371,43 @@ def compat_live_vibration(window_s: int = Query(2, ge=1, le=60)):
             "rms_az": float(rms_az),
             "overall": overall,
         })
-
     return JSONResponse({"items": items}, headers={"Cache-Control":"no-store","Pragma":"no-cache"})
 
-# =============================================================================
-# Alerts (HTTP) com cache/ETag
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Alerts (HTTP) com cache/ETag – DEPRECATED no front; usar /ws/alerts
+# -----------------------------------------------------------------------------
 @app.get("/alerts")
 @app.get("/api/alerts")
-def compat_alerts(
-    request: Request,
-    limit: int = Query(5, ge=1, le=100),
-    max_age_s: int = Query(1, ge=0, le=60),
-):
-    payload, etag, last_ts = _get_cached_alerts(limit=limit)
-    if payload is None:
-        mon = build_monitoring_payload()
-        _update_alerts_cache_from_mon(mon)
-        payload, etag, last_ts = _get_cached_alerts(limit=limit)
-
+def api_list_alerts(request: Request, limit: int = Query(5, ge=1, le=100), max_age_s: int = Query(1, ge=0, le=60)):
+    items = list_recent_alerts(limit=limit)
+    # payload no formato que o front espera (compat)
+    payload = {
+        "items": [
+            {
+                "type": "alert",
+                "ts": it["ts"],
+                "code": it["code"],
+                "severity": it["severity"],
+                "origin": it["origin"],
+                "message": it["message"],
+                # passam detalhes ricos ao front
+                "details": it.get("details"),
+                "id": it["id"],
+                "status": it.get("status","open"),
+            } for it in items
+        ],
+        "ts": _now_iso()
+    }
+    etag = _alerts_signature([{k: v for k, v in it.items() if k in ("id","code","ts")} for it in payload["items"]])
+    headers = {"Cache-Control": f"public, max-age={max_age_s}", "ETag": f'"{etag}"'}
     inm = request.headers.get("if-none-match")
-    if etag and inm and inm.strip('"') == etag:
-        return Response(status_code=304)
-
-    ims = request.headers.get("if-modified-since")
-    if ims and last_ts:
-        try:
-            ims_dt = _coerce_to_datetime(ims)
-            if ims_dt and ims_dt >= last_ts.replace(microsecond=0):
-                return Response(status_code=304)
-        except Exception:
-            pass
-
-    headers = {"Cache-Control": f"public, max-age={max_age_s}"}
-    if etag:
-        headers["ETag"] = f'"{etag}"'
-    if last_ts:
-        headers["Last-Modified"] = last_ts.strftime("%a, %d %b %Y %H:%M:%S GMT")
-
+    if inm and inm.strip('"') == etag:
+        return Response(status_code=304, headers=headers)
     return JSONResponse(payload, headers=headers)
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # Health
-# =============================================================================
+# -----------------------------------------------------------------------------
 @app.get("/health")
 def health():
     row = fetch_one("SELECT NOW(6) AS now6")
@@ -1391,9 +1428,24 @@ def health():
 def api_health():
     return health()
 
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Config dinâmico (reexport HTTP aqui usando helpers de runtime)
+# -----------------------------------------------------------------------------
+@app.get("/api/alerts/config")
+def read_alerts_config():
+    return get_alerts_config().model_dump()
+
+@app.post("/api/alerts/config")
+def write_alerts_config(patch: Dict[str, Any] = Body(...)):
+    try:
+        cfg = update_alerts_config(patch or {})
+        return cfg.model_dump()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+# -----------------------------------------------------------------------------
 # Simulation (catalog + draw)
-# =============================================================================
+# -----------------------------------------------------------------------------
 @app.get("/api/simulation/catalog")
 def http_simulation_catalog():
     rows = fetch_all("""
@@ -1419,7 +1471,6 @@ def http_simulation_draw(body: dict = Body(...)):
     code = str(body.get("code") or "").strip()
     if mode != "by_code" or not code:
         raise HTTPException(status_code=422, detail="Use {mode:'by_code', code:'...'}")
-
     row = fetch_one("""
         SELECT id, code, name, grp, COALESCE(severity, 0) AS severity, default_actions, description
         FROM error_catalog
@@ -1453,104 +1504,111 @@ def http_simulation_draw(body: dict = Body(...)):
     payload = {
         "scenario_id": f"{err_code}-{int(time.time()*1000)%100000}",
         "actuator": 1 if actuator == 1 else 2,
-        "error": {
-            "id": err_id,
-            "code": err_code,
-            "name": err_name,
-            "grp": err_grp,
-            "severity": err_sev,
-        },
+        "error": {"id": err_id, "code": err_code, "name": err_name, "grp": err_grp, "severity": err_sev},
         "cause": desc or f"Cenário simulado para {err_code}",
         "actions": actions or ["Parada controlada", "Inspecionar equipamento"],
-        "params": {
-            "seed": int(time.time() * 1000) % 1_000_000,
-            "code": err_code,
-        },
-        "ui": {
-            "halt_sim": True,
-            "halt_3d": (err_sev >= 4),
-            "show_popup": True,
-        },
+        "params": {"seed": int(time.time() * 1000) % 1_000_000, "code": err_code},
+        "ui": {"halt_sim": True, "halt_3d": (err_sev >= 4), "show_popup": True},
         "resume_allowed": (err_sev <= 3),
     }
     return JSONResponse(payload, headers={"Cache-Control":"no-store","Pragma":"no-cache"})
 
 @app.get("/simulation/catalog")
-def compat_sim_catalog(): return http_simulation_catalog()
+def compat_sim_catalog():
+    return http_simulation_catalog()
 
 @app.post("/simulation/draw")
-def compat_sim_draw(body: dict = Body(...)): return http_simulation_draw(body)
+def compat_sim_draw(body: dict = Body(...)):
+    return http_simulation_draw(body)
 
-# POST com act/facet (com e sem /api)
-@app.post("/api/opc/by-facet")
-def http_opc_by_facet_post(body: dict = Body(...)):
-    return http_opc_by_facet(
-        act=body.get("act"),
-        facet=body.get("facet"),
-        since=str(body.get("since", "-120m")),
-        asc=bool(body.get("asc", True)),
-    )
+# -------------------- Persistência de alertas --------------------
+def _mk_dedupe_key(alert: dict) -> str:
+    # junta por ~1s pra evitar flood do mesmo evento
+    # (se quiser por minuto, arredonde de outra forma)
+    ts = _coerce_to_datetime(alert.get("ts")) or datetime.now(timezone.utc)
+    bucket = int(ts.timestamp())  # segundo
+    basis = f"{alert.get('code')}|{alert.get('origin')}|{bucket}"
+    return sha1(basis.encode("utf-8")).hexdigest()
 
-@app.post("/opc/by-facet")
-def compat_opc_by_facet_post(body: dict = Body(...)):
-    return http_opc_by_facet_post(body)
-
-@app.post("/opc/history/facet")
-def compat_opc_history_facet_post(body: dict = Body(...)):
-    return http_opc_by_facet_post(body)
-
-# ===== LIVE CACHE (amostrador desacoplado do WS) =============================
-_LIVE_CACHE = {
-    "ts": None,       # datetime da última leitura
-    "vals": {},       # {"Recuado_1S1": {"value_bool":0/1,"ts_utc":datetime}, ...}
-}
-
-def _fetch_latest_rows_fast(names: tuple[str, ...]) -> dict[str, dict]:
+def save_alert_event(alert: dict) -> int | None:
     """
-    MySQL 8+: pega a última linha por 'name' numa tacada só (ROW_NUMBER()).
-    Cai para a consulta antiga se der erro (ex.: MySQL < 8).
+    Persiste 1 alerta em gmdigital.alert_events (dedupe por segundo).
+    Retorna id inserido (ou None se duplicado).
+    Campos esperados:
+      type, ts, code, severity, origin, message, details_json(optional), actuator_id(optional)
     """
-    if not names:
-        return {}
-    placeholders = ", ".join(["%s"] * len(names))
+    ts_dt = _coerce_to_datetime(alert.get("ts")) or datetime.now(timezone.utc)
+    dedupe = _mk_dedupe_key(alert)
+    sql = """
+      INSERT INTO alert_events
+        (ts, type, rule_code, status, severity, actuator_id, origin, message, dedupe_key, details_json)
+      VALUES
+        (%s, %s, %s, 'open', %s, %s, %s, %s, %s, %s)
+      ON DUPLICATE KEY UPDATE id = id
+    """
+    details = alert.get("details_json")
     try:
-        sql = f"""
-        SELECT name, value_bool, ts_utc
-        FROM (
-            SELECT name, value_bool, ts_utc,
-                   ROW_NUMBER() OVER (PARTITION BY name ORDER BY ts_utc DESC) AS rn
-            FROM {OPC_TABLE}
-            WHERE name IN ({placeholders})
-        ) t
-        WHERE rn = 1
-        """
-        rows = fetch_all(sql, names) or []
-        out = {}
-        for r in rows:
-            n = str(col(r, "name") or r[0])  # type: ignore
-            vb = col(r, "value_bool") if isinstance(r, dict) else r[1]  # type: ignore
-            ts = col(r, "ts_utc")     if isinstance(r, dict) else r[2]  # type: ignore
-            out[n] = {"value_bool": (None if vb is None else int(vb)), "ts_utc": ts}
-        for n in names:
-            out.setdefault(n, {"value_bool": None, "ts_utc": None})
-        return out
-    except Exception:
-        return _fetch_latest_rows(names)
-
-async def live_sampler_loop():
-    """
-    Lê só os 8 sinais de latch (A1/A2: S1/S2 e V12/V14) e guarda em memória.
-    Faz 1 query rápida por tick usando o índice idx_opc_name_ts.
-    """
-    names = _NAMES_LATCH
-    period = max(0.05, LIVE_TICK_MS / 1000.0)  # 50–200 ms
-    next_t = time.perf_counter()
-    while True:
-        next_t += period
+        db = get_db_safe()
         try:
-            latest = await asyncio.to_thread(_fetch_latest_rows_fast, names)
-            _LIVE_CACHE["vals"] = latest
-            _LIVE_CACHE["ts"] = datetime.now(timezone.utc)
+            db.execute(sql, (
+                ts_dt, alert.get("type","alert"), alert.get("code"),
+                int(alert.get("severity") or 1),
+                alert.get("actuator_id"),
+                alert.get("origin"), alert.get("message"),
+                dedupe,
+                json.dumps(details, ensure_ascii=False) if isinstance(details, (dict, list)) else details
+            ))
+            # pega o id só se inseriu novo
+            db.execute("SELECT id FROM alert_events WHERE dedupe_key=%s", (dedupe,))
+            row = db.fetchone()
+            return int(col(row, "id") or row[0]) if row else None
+        finally:
+            db.close()
+    except Exception:
+        return None
+
+def list_recent_alerts(limit: int = 5) -> list[dict]:
+    rows = fetch_all("""
+      SELECT id, ts, type, rule_code, status, severity, actuator_id, origin, message, details_json, created_at
+      FROM alert_events
+      ORDER BY created_at DESC
+      LIMIT %s
+    """, (limit,))
+    out = []
+    for r in rows or []:
+        details = col(r, "details_json") if isinstance(r, dict) else r[9]
+        try:
+            details = _json_loads(details) if isinstance(details, (str, bytes)) else (details or None)
         except Exception:
-            pass
-        await asyncio.sleep(max(0, next_t - time.perf_counter()))
+            details = None
+        out.append({
+            "id": int(col(r,"id") or r[0]),
+            "ts": dt_to_iso_utc(col(r,"ts") or r[1]),
+            "type": col(r,"type") or r[2],
+            "code": col(r,"rule_code") or r[3],
+            "status": (col(r,"status") or r[4] or "open").lower(),
+            "severity": int(col(r,"severity") or r[5] or 1),
+            "actuator_id": col(r,"actuator_id") or r[6],
+            "origin": col(r,"origin") or r[7],
+            "message": col(r,"message") or r[8],
+            "details": details,
+        })
+    return out
+
+@app.post("/api/alerts/{alert_id}/ack")
+def api_alert_ack(alert_id: int):
+    db = get_db_safe()
+    try:
+        db.execute("UPDATE alert_events SET status='ack' WHERE id=%s", (alert_id,))
+        return {"ok": True}
+    finally:
+        db.close()
+
+@app.post("/api/alerts/{alert_id}/close")
+def api_alert_close(alert_id: int):
+    db = get_db_safe()
+    try:
+        db.execute("UPDATE alert_events SET status='closed' WHERE id=%s", (alert_id,))
+        return {"ok": True}
+    finally:
+        db.close()
