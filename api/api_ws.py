@@ -448,8 +448,8 @@ def _last_pulse_duration(seq: List[Tuple[datetime,int]], now_dt: Optional[dateti
         return None
     if now_dt is None:
         now_dt = datetime.now(timezone.utc)
-    last_on = None
-    last_pulse = None
+    last_on: Optional[datetime] = None
+    last_pulse: Optional[Tuple[datetime, datetime]] = None
     for i in range(1, len(seq)):
         if seq[i-1][1] == 0 and seq[i][1] == 1:
             last_on = seq[i][0]
@@ -536,19 +536,32 @@ def _append_state_log(
     except Exception:
         pass
 
+# --- SUBSTITUA a função inteira por esta versão ---
 def _infer_state_from_latest(cfg: _LatchCfg, latest: Dict[str, Dict[str, Any]]):
+    """
+    Regra chave:
+      - Comando atual (derivado de válvulas) define se podemos COMMITAR o estado.
+      - Em STOP (v_av==0 e v_rec==0), NÃO atualizamos last_state com S1/S2,
+        apenas mantemos o último estado confirmado (evita “meio ciclo invertido” ao parar).
+      - Exceção: se ainda não temos last_state (boot), permitimos inicializar pelo sensor.
+    """
     now = datetime.now(timezone.utc)
 
-    # >>> resolve nomes exatos de S1 e S2 a partir do CFG (robusto) <<<
+    # resolve nomes S1/S2
     s1_name, s2_name = _facet_names(cfg)
     s1_row = latest.get(s1_name, {})
     s2_row = latest.get(s2_name, {})
 
-    vav   = latest.get(cfg.v_av, {})
-    vrc   = latest.get(cfg.v_rec, {})
+    vav = latest.get(cfg.v_av, {})
+    vrc = latest.get(cfg.v_rec, {})
 
-    s1 = int(s1_row.get("value_bool") or 0)  # S1 = Recuado (normalmente)
-    s2 = int(s2_row.get("value_bool") or 0)  # S2 = Avançado (normalmente)
+    # sensores (0/1)
+    s1 = int(s1_row.get("value_bool") or 0)
+    s2 = int(s2_row.get("value_bool") or 0)
+
+    # válvulas (0/1)
+    v1 = int(vav.get("value_bool") or 0)  # AV
+    v2 = int(vrc.get("value_bool") or 0)  # REC
 
     t_s1 = _coerce_to_datetime(s1_row.get("ts_utc"))
     t_s2 = _coerce_to_datetime(s2_row.get("ts_utc"))
@@ -558,41 +571,50 @@ def _infer_state_from_latest(cfg: _LatchCfg, latest: Dict[str, Dict[str, Any]]):
     aid = _aid_from_cfg(cfg)
     st = _LATCH_STATE.get(aid) or {"last_state": None, "last_confirmed_ts": None, "indef_since": None}
 
+    # 1) estado instantâneo pelos sensores (apenas leitura)
     raw_state: Optional[StableState] = None
     if s1 == 1 and s2 == 0:
         raw_state = "RECUADO"
     elif s1 == 0 and s2 == 1:
         raw_state = "AVANÇADO"
+    else:
+        raw_state = None  # entre cursos / conflito / ambos 0/1
 
+    # 2) comando atual pelas válvulas
+    if v1 and not v2:
+        cmd = "AV";  last_cmd_ts = t_vav
+    elif v2 and not v1:
+        cmd = "REC"; last_cmd_ts = t_vrc
+    else:
+        cmd = "STOP"; last_cmd_ts = None
+
+    # 3) COMMIT de estado:
+    #    - Se cmd != STOP e raw_state é definido, comitamos (normal)
+    #    - Se cmd == STOP, NÃO comitar (congelar), exceto se ainda não temos last_state (boot)
     if raw_state is not None:
-        st["last_state"] = raw_state
-        st["last_confirmed_ts"] = now
-        st["indef_since"] = None
+        if cmd != "STOP" or st["last_state"] is None:
+            st["last_state"] = raw_state
+            st["last_confirmed_ts"] = now
+            st["indef_since"] = None
     else:
         if st.get("indef_since") is None:
             st["indef_since"] = now
 
     displayed = st["last_state"] or "RECUADO"
 
-    pending = None
-    last_cmd_ts = None
-    last_cmd_kind = None  # "AV" | "REC"
-    if t_vav and (not t_vrc or t_vav >= t_vrc):
-        last_cmd_ts = t_vav; last_cmd_kind = "AV"
-    elif t_vrc:
-        last_cmd_ts = t_vrc; last_cmd_kind = "REC"
-
-    if last_cmd_kind == "AV" and displayed != "AVANÇADO":
+    # 4) pending só quando existe comando ativo e estado ainda não bate
+    if cmd == "AV" and displayed != "AVANÇADO":
         pending = "AV"
-    elif last_cmd_kind == "REC" and displayed != "RECUADO":
+    elif cmd == "REC" and displayed != "RECUADO":
         pending = "REC"
+    else:
+        pending = None  # inclui STOP
 
     _LATCH_STATE[aid] = st
 
-    # log (opcional – mantém como antes)
     _append_state_log(
         aid, cfg, latest, s1, s2, t_s1, t_s2, t_vav, t_vrc,
-        raw_state, displayed, pending, note="infer_state"
+        raw_state, displayed, pending, note=f"infer_state cmd={cmd}"
     )
 
     return {
@@ -776,7 +798,7 @@ def debug_cpm2(window_s: int = 60):
              2: {"S1": _SMAP[2]["S1"], "S2": _SMAP[2]["S2"]}}
     names = [v for m in s_map.values() for v in (m["S1"], m["S2"])]
     ref_row = fetch_one(f"SELECT COALESCE(MAX(ts_utc), NOW(6)) AS ref_ts FROM {OPC_TABLE}")
-    ref_ts = col(ref_row, "ref_ts") if isinstance(ref_row, dict) else (ref_row[0] if ref_row else None)
+    ref_ts = col(ref_row, "ref_ts") if isinstance(ref_row, dict) else (ref_row[0] if row else None)
     series = _fetch_series(names, window_s)
     def tail(lst, n=5): return [{"ts": dt_to_iso_utc(t), "v": v} for (t, v) in lst[-n:]]
     return JSONResponse({
