@@ -7,10 +7,7 @@ import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Any, Dict, Tuple
-import json  
-
-
-
+import json
 
 from dotenv import load_dotenv, find_dotenv
 from fastapi import FastAPI, Request, HTTPException, Query, WebSocket, WebSocketDisconnect, Body
@@ -232,9 +229,10 @@ class _LatchCfg:
     timeout_factor: float
     v_av: str
     v_rec: str
-    s_adv: str
-    s_rec: str
+    s_adv: str  # pode conter S1 ou S2 (nomes vem do OPC)
+    s_rec: str  # idem
 
+# **Mantenho suas configs exatamente como enviou (testadas em campo)**
 _CFG_A1 = _LatchCfg(
     id="A1", expected_ms=1500, debounce_ms=80, timeout_factor=1.5,
     v_av="V1_14", v_rec="V1_12", s_adv="Recuado_1S1", s_rec="Avancado_1S2",
@@ -243,14 +241,39 @@ _CFG_A2 = _LatchCfg(
     id="A2", expected_ms=500, debounce_ms=80, timeout_factor=1.5,
     v_av="V2_14", v_rec="V2_12", s_adv="Recuado_2S1", s_rec="Avancado_2S2",
 )
+
+# --- Helpers robustos p/ descobrir qual é S1 e S2 olhando o NOME ---
+_S1_RE = re.compile(r"(?:^|[_-])S1\b", re.IGNORECASE)
+_S2_RE = re.compile(r"(?:^|[_-])S2\b", re.IGNORECASE)
+
+def _facet_names(cfg: _LatchCfg) -> Tuple[str, str]:
+    """
+    Retorna (name_S1, name_S2) olhando os sufixos do nome.
+    Evita depender de 's_adv'/'s_rec' estarem “alinhados”.
+    """
+    cands = [cfg.s_adv, cfg.s_rec]
+    s1 = next((n for n in cands if _S1_RE.search(n)), None)
+    s2 = next((n for n in cands if _S2_RE.search(n)), None)
+    if not s1 or not s2:
+        # fallback (mantém comportamento atual se não achar pelos sufixos)
+        # S1 := s_adv, S2 := s_rec (como estava no _SMAP original)
+        s1 = s1 or cfg.s_adv
+        s2 = s2 or cfg.s_rec
+    return (s1, s2)
+
+def _build_smap() -> Dict[int, Dict[str, str]]:
+    a1_s1, a1_s2 = _facet_names(_CFG_A1)
+    a2_s1, a2_s2 = _facet_names(_CFG_A2)
+    return {
+        1: {"S1": a1_s1, "S2": a1_s2},
+        2: {"S1": a2_s1, "S2": a2_s2},
+    }
+
+_SMAP = _build_smap()
 _NAMES_LATCH = (
-    _CFG_A1.v_av, _CFG_A1.v_rec, _CFG_A1.s_adv, _CFG_A1.s_rec,
-    _CFG_A2.v_av, _CFG_A2.v_rec, _CFG_A2.s_adv, _CFG_A2.s_rec
+    _CFG_A1.v_av, _CFG_A1.v_rec, _SMAP[1]["S1"], _SMAP[1]["S2"],
+    _CFG_A2.v_av, _CFG_A2.v_rec, _SMAP[2]["S1"], _SMAP[2]["S2"],
 )
-_SMAP = {
-    1: {"S1": _CFG_A1.s_adv, "S2": _CFG_A1.s_rec},
-    2: {"S1": _CFG_A2.s_adv, "S2": _CFG_A2.s_rec},
-}
 
 def _aid_from_cfg(cfg: _LatchCfg) -> int:
     try:
@@ -499,7 +522,7 @@ def _append_state_log(
         STATE_LOG.append({
             "ts": _now_iso(),
             "act": aid,
-            "names": {"S1": cfg.s_rec, "S2": cfg.s_adv, "VAV": cfg.v_av, "VREC": cfg.v_rec},
+            "names": {"S1": _SMAP[aid]["S1"], "S2": _SMAP[aid]["S2"], "VAV": cfg.v_av, "VREC": cfg.v_rec},
             "vals": {
                 "S1": s1, "S2": s2,
                 "t_S1": dt_to_iso_utc(t_s1), "t_S2": dt_to_iso_utc(t_s2),
@@ -515,14 +538,20 @@ def _append_state_log(
 
 def _infer_state_from_latest(cfg: _LatchCfg, latest: Dict[str, Dict[str, Any]]):
     now = datetime.now(timezone.utc)
-    s_adv = latest.get(cfg.s_adv, {})
-    s_rec = latest.get(cfg.s_rec, {})
+
+    # >>> resolve nomes exatos de S1 e S2 a partir do CFG (robusto) <<<
+    s1_name, s2_name = _facet_names(cfg)
+    s1_row = latest.get(s1_name, {})
+    s2_row = latest.get(s2_name, {})
+
     vav   = latest.get(cfg.v_av, {})
     vrc   = latest.get(cfg.v_rec, {})
 
-    s2 = int(s_adv.get("value_bool") or 0)
-    s1 = int(s_rec.get("value_bool") or 0)
+    s1 = int(s1_row.get("value_bool") or 0)  # S1 = Recuado (normalmente)
+    s2 = int(s2_row.get("value_bool") or 0)  # S2 = Avançado (normalmente)
 
+    t_s1 = _coerce_to_datetime(s1_row.get("ts_utc"))
+    t_s2 = _coerce_to_datetime(s2_row.get("ts_utc"))
     t_vav = _coerce_to_datetime(vav.get("ts_utc"))
     t_vrc = _coerce_to_datetime(vrc.get("ts_utc"))
 
@@ -560,11 +589,51 @@ def _infer_state_from_latest(cfg: _LatchCfg, latest: Dict[str, Dict[str, Any]]):
 
     _LATCH_STATE[aid] = st
 
+    # log (opcional – mantém como antes)
+    _append_state_log(
+        aid, cfg, latest, s1, s2, t_s1, t_s2, t_vav, t_vrc,
+        raw_state, displayed, pending, note="infer_state"
+    )
+
     return {
         "state": displayed,
         "pending": pending,
         "started_at": (last_cmd_ts.isoformat() if last_cmd_ts else None),
     }
+
+# -----------------------------------------------------------------------------
+# MPU live (snapshot curtíssimo para o /ws/live)
+# -----------------------------------------------------------------------------
+def _mpu_live_snapshot(window_s: float = 0.4) -> list[dict]:
+    """
+    Agregado leve dos últimos ~window_s segundos: RMS overall por MPU.
+    Retorna: [{"id": mpu_id, "rms": float}, ...]
+    """
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(seconds=window_s)
+    rows = fetch_all(
+        f"SELECT mpu_id, ax_g, ay_g, az_g FROM {MPU_TABLE} WHERE ts_utc >= %s AND ts_utc <= %s",
+        (start, now),
+    ) or []
+    if not rows:
+        return []
+    acc: Dict[int, Dict[str, float]] = {}
+    cnt: Dict[int, int] = {}
+    for r in rows:
+        mid = int(col(r, "mpu_id") or col(r, 0))
+        ax = float(col(r, "ax_g") or 0.0); ay = float(col(r, "ay_g") or 0.0); az = float(col(r, "az_g") or 0.0)
+        d = acc.setdefault(mid, {"ax2": 0.0, "ay2": 0.0, "az2": 0.0})
+        d["ax2"] += ax*ax; d["ay2"] += ay*ay; d["az2"] += az*az
+        cnt[mid] = cnt.get(mid, 0) + 1
+    out = []
+    for mid, d in acc.items():
+        n = max(1, cnt.get(mid, 1))
+        rms_ax = (d["ax2"]/n) ** 0.5
+        rms_ay = (d["ay2"]/n) ** 0.5
+        rms_az = (d["az2"]/n) ** 0.5
+        overall = float((rms_ax*rms_ax + rms_ay*rms_ay + rms_az*rms_az) ** 0.5)
+        out.append({"id": mid, "rms": overall})
+    return out
 
 # -----------------------------------------------------------------------------
 # Payload builders (WS contracts)
@@ -575,15 +644,23 @@ def build_live_payload() -> dict:
         latest = _fetch_latest_rows_fast(_NAMES_LATCH)
     a1 = _infer_state_from_latest(_CFG_A1, latest)
     a2 = _infer_state_from_latest(_CFG_A2, latest)
-    items = [{"id": 1, "state": a1["state"]}, {"id": 2, "state": a2["state"]}]
-    return {"type": "live", "ts": _now_iso(), "actuators": items}
+    items = [
+        {"id": 1, "state": a1["state"], "pending": a1.get("pending")},
+        {"id": 2, "state": a2["state"], "pending": a2.get("pending")},
+    ]
+    # MPU leve anexado no mesmo pacote
+    try:
+        mpu = _mpu_live_snapshot(window_s=0.4)
+    except Exception:
+        mpu = []
+    return {"type": "live", "ts": _now_iso(), "actuators": items, "mpu": mpu}
 
 def build_monitoring_payload() -> dict:
     WINDOW_S_PRIMARY  = int(os.getenv("MON_TIMING_WINDOW_S", "60"))
     WINDOW_S_FALLBACK = int(os.getenv("MON_TIMING_FALLBACK_S", "60"))
 
-    s_map = {1: {"S1": _CFG_A1.s_adv, "S2": _CFG_A1.s_rec},
-             2: {"S1": _CFG_A2.s_adv, "S2": _CFG_A2.s_rec}}
+    s_map = {1: {"S1": _SMAP[1]["S1"], "S2": _SMAP[1]["S2"]},
+             2: {"S1": _SMAP[2]["S1"], "S2": _SMAP[2]["S2"]}}
     names = [v for m in s_map.values() for v in (m["S1"], m["S2"])]
 
     ref_row = fetch_one(f"SELECT COALESCE(MAX(ts_utc), NOW(6)) AS ref_ts FROM {OPC_TABLE}")
@@ -645,8 +722,8 @@ def build_monitoring_payload() -> dict:
     }
 
 def build_cpm_payload(window_s: int = 60) -> dict:
-    s_map = {1: {"S1": _CFG_A1.s_adv, "S2": _CFG_A1.s_rec},
-             2: {"S1": _CFG_A2.s_adv, "S2": _CFG_A2.s_rec}}
+    s_map = {1: {"S1": _SMAP[1]["S1"], "S2": _SMAP[1]["S2"]},
+             2: {"S1": _SMAP[2]["S1"], "S2": _SMAP[2]["S2"]}}
     names = [v for m in s_map.values() for v in (m["S1"], m["S2"])]
     raw = _fetch_series(names, window_s)
     compact = {k: _dedup(v) for k, v in raw.items()}
@@ -676,8 +753,8 @@ def debug_state_log(limit: int = Query(200, ge=1, le=2000), act: int | None = Qu
 
 @app.get("/api/debug/cpm")
 def debug_cpm(window_s: int = 60):
-    s_map = {1: {"S1": _CFG_A1.s_adv, "S2": _CFG_A1.s_rec},
-             2: {"S1": _CFG_A2.s_adv, "S2": _CFG_A2.s_rec}}
+    s_map = {1: {"S1": _SMAP[1]["S1"], "S2": _SMAP[1]["S2"]},
+             2: {"S1": _SMAP[2]["S1"], "S2": _SMAP[2]["S2"]}}
     names = [v for m in s_map.values() for v in (m["S1"], m["S2"])]
     ref_row = fetch_one(f"SELECT COALESCE(MAX(ts_utc), NOW(6)) AS ref_ts FROM {OPC_TABLE}")
     ref_ts = col(ref_row, "ref_ts") if isinstance(ref_row, dict) else (ref_row[0] if ref_row else None)
@@ -695,8 +772,8 @@ def debug_cpm(window_s: int = 60):
 
 @app.get("/api/debug/cpm2")
 def debug_cpm2(window_s: int = 60):
-    s_map = {1: {"S1": _CFG_A1.s_adv, "S2": _CFG_A1.s_rec},
-             2: {"S1": _CFG_A2.s_adv, "S2": _CFG_A2.s_rec}}
+    s_map = {1: {"S1": _SMAP[1]["S1"], "S2": _SMAP[1]["S2"]},
+             2: {"S1": _SMAP[2]["S1"], "S2": _SMAP[2]["S2"]}}
     names = [v for m in s_map.values() for v in (m["S1"], m["S2"])]
     ref_row = fetch_one(f"SELECT COALESCE(MAX(ts_utc), NOW(6)) AS ref_ts FROM {OPC_TABLE}")
     ref_ts = col(ref_row, "ref_ts") if isinstance(ref_row, dict) else (ref_row[0] if ref_row else None)
@@ -1543,7 +1620,7 @@ def save_alert_event(alert: dict) -> int | None:
       INSERT INTO alert_events
         (ts, type, rule_code, status, severity, actuator_id, origin, message, dedupe_key, details_json)
       VALUES
-        (%s, %s, %s, 'open', %s, %s, %s, %s, %s, %s)
+        (%s, %s, %s, 'open', %s, %s, %s, %s, %s)
       ON DUPLICATE KEY UPDATE id = id
     """
     details = alert.get("details_json")
