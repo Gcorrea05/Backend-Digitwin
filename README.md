@@ -1,4 +1,10 @@
-README — Coletor Festo DT (OPC UA + MPU6050 via ESP32)
+Gabriel Henrique de Paula Vilas Boas Correa - RM: 551395
+
+Pedro Nezi Godoy - RM: 550370
+
+Gustavo Kenji Tsuruoka - RM: 550818
+
+# README — Coletor Festo DT (OPC UA + MPU6050 via ESP32)
 
 Este backend coleta dois fluxos de dados em paralelo e grava no MySQL (produção) ou CSV (teste):
 
