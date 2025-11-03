@@ -1,677 +1,467 @@
-# app.py — DUAL “idêntico ao OPCUA” + MPU gravando amostras brutas (sem windows)
-# Tabelas: gmdigital.opc_samples, gmdigital.mpu_samples
-# Modos: SIMULATE | OPCUA | SERIAL_MPU | DUAL | DEV | DEV_DUAL
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Collector DUAL (OPC-UA + MPU Serial)
+- Apenas modo DUAL (remove OPCUA-only / MPU-only / simulate / dev etc.)
+- Batch insert em MySQL
+- Optional push_bit_update (...) para hot-path do /ws/live (se disponível)
+"""
 
-import os, csv, json, time, signal, sys, threading
-from typing import List, Dict, Any, Iterable, Optional
-from datetime import datetime
-from dotenv import load_dotenv
-load_dotenv()
+import os
+import sys
+import json
+import time
+import csv
+import signal
+import queue
+import threading
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 
-# ===== Imports DEV =====
+from dotenv import load_dotenv, find_dotenv
+import mysql.connector
+from mysql.connector.pooling import MySQLConnectionPool
+
+# ---- Opcional (se não instalados, seguimos sem) ----
 try:
-    from dev_reader import DevReader
+    from opcua import Client as OPCClient
+    from opcua import ua
 except Exception:
-    DevReader = None
+    OPCClient = None  # type: ignore
+    ua = None         # type: ignore
 
 try:
-    from dev_mpu_reader import DevMpuReader
+    import serial
+    import serial.tools.list_ports
 except Exception:
-    DevMpuReader = None
+    serial = None  # type: ignore
 
-# ===== UTC helpers =====
-def _get_utc():
-    try:
-        from datetime import UTC
-        return UTC
-    except Exception:
-        from datetime import timezone
-        return timezone.utc
-UTC = _get_utc()
-
-def now_utc() -> datetime:
-    from datetime import datetime as _dt
-    return _dt.now(UTC)
-
-def now_utc_iso() -> str:
-    return now_utc().isoformat()
-
-def iso_to_mysql_dt6(iso_str: str) -> str:
-    s = iso_str.replace("T", " ")
-    if "+" in s: s = s.split("+", 1)[0]
-    if s.endswith("Z"): s = s[:-1]
-    if "." not in s: s += ".000000"
-    else:
-        head, frac = s.split(".", 1)
-        s = f"{head}.{(frac + '000000')[:6]}"
-    return s
-
-# ===== Config =====
-DATA_MODE = os.getenv("DATA_MODE", "DUAL").upper()      # SIMULATE | OPCUA | SERIAL_MPU | DUAL | DEV | DEV_DUAL
-SINK_MODE = os.getenv("SINK_MODE", "MYSQL").upper()     # MYSQL | CSV
-
-# OPC UA
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "0.2"))  # legado; ignorado fora do DEV
-OPCUA_ENDPOINT = os.getenv("OPCUA_ENDPOINT", "opc.tcp://192.168.0.40:4840")
-OPCUA_USER = os.getenv("OPCUA_USER", "")
-OPCUA_PASS = os.getenv("OPCUA_PASS", "")
-NODES_CSV = os.getenv("NODES_CSV", "nodes.csv")
-OPCUA_CONNECT_ASYNC = os.getenv("OPCUA_CONNECT_ASYNC", "1").lower() in {"1","true","yes","on"}
-OPCUA_RECONNECT_SEC = float(os.getenv("OPCUA_RECONNECT_SEC", "2.0"))
-
-# Serial MPU
-SERIAL_PORT = os.getenv("SERIAL_PORT", "COM3")
-SERIAL_BAUD = int(os.getenv("SERIAL_BAUD", "115200"))
-SERIAL_TIMEOUT = float(os.getenv("SERIAL_TIMEOUT", "0.2"))
-
-# CSV
-CSV_OPC_PATH = os.getenv("CSV_OPC_PATH", "bank_opc.csv")
-CSV_MPU_PATH = os.getenv("CSV_MPU_PATH", "bank_mpu.csv")
-
-# MySQL
-MYSQL_HOST = os.getenv("MYSQL_HOST", "localhost")
-MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
-MYSQL_DB   = os.getenv("MYSQL_DB", "gmdigital")
-MYSQL_USER = os.getenv("MYSQL_USER", "root")
-MYSQL_PASS = os.getenv("MYSQL_PASS", "")
-# aceitar MYSQL_NAME como alias de MYSQL_DB (legado)
-MYSQL_DB = os.getenv("MYSQL_DB", os.getenv("MYSQL_NAME", MYSQL_DB))
-
-# Cadências (ativáveis por ENV — independentes de DEV)
-OPC_PERIOD = max(0.01, float(os.getenv("OPC_PERIOD_MS", "200")) / 1000.0)   # 200 ms
-MPU_PERIOD = max(0.05, float(os.getenv("MPU_PERIOD_MS", "1000")) / 1000.0)  # 1 s
-
-# Fail-safe replay (quando faltar sinal, regravar último estado)
-FAILSAFE_REPLAY = os.getenv("INGEST_FAILSAFE_REPLAY", "1").lower() in {"1","true","yes","on"}
-SEED_FROM_DB    = os.getenv("INGEST_SEED_FROM_DB", "1").lower() in {"1","true","yes","on"}
-LOG_FAILSAFE_EVERY_SEC = int(os.getenv("LOG_FAILSAFE_EVERY_SEC", "5"))
-
-# Live bus (Redis)
-REDIS_ENABLE = os.getenv("REDIS_ENABLE", "true").lower() in {"1","true","yes","on"}
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-_rcli = None
-if REDIS_ENABLE:
-    try:
-        import redis
-        _rcli = redis.from_url(REDIS_URL, decode_responses=True)
-    except Exception:
-        _rcli = None
-
-# ===== nodes.csv loader (robusto) =====
-def load_nodes(csv_path: str) -> List[Dict[str, str]]:
-    import os as _os
-    full = csv_path if _os.path.isabs(csv_path) else _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), csv_path)
-    print(f"[DEBUG] nodes.csv: {full}")
-    if not _os.path.exists(full):
-        raise FileNotFoundError(full)
-    out: List[Dict[str, str]] = []
-    with open(full, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            out.append({"name": row["name"].strip(),
-                        "nodeid": row.get("nodeid","").strip(),
-                        "datatype": row.get("datatype","Boolean").strip()})
-    if not out: raise RuntimeError("nodes.csv vazio")
-    return out
-
-# ===== Fontes =====
-class Simulator:
-    def __init__(self, items: List[Dict[str, str]]):
-        self.state = {i["name"]: False for i in items}
-    def read_all(self) -> Dict[str, Any]:
-        for k in list(self.state.keys()):
-            self.state[k] = not self.state[k]
-        return dict(self.state)
-
-class OpcUaReader:
-    def __init__(self, endpoint: str, items: List[Dict[str, str]]):
-        self.endpoint = endpoint; self.items = items; self.client = None
-    def connect(self):
-        try:
-            from opcua import Client
-        except Exception as e:
-            print("Instale: pip install opcua"); raise e
-        self.client = Client(self.endpoint)
-        if OPCUA_USER and OPCUA_PASS:
-            self.client.set_user(OPCUA_USER); self.client.set_password(OPCUA_PASS)
-        self.client.application_uri = "opcua-py-runner"
-        self.client.secure_channel_timeout = 600000
-        self.client.session_timeout = 600000
-        try: self.client.set_keepalive(20000)
-        except Exception: pass
-        self.client.connect()
-    def disconnect(self):
-        if self.client:
-            try: self.client.disconnect()
-            except Exception: pass
-            self.client = None
-    def read_all(self) -> Dict[str, Any]:
-        out = {}
-        for it in self.items:
-            node = self.client.get_node(it["nodeid"])
-            try: val = node.get_value()
-            except Exception: val = None
-            out[it["name"]] = val
-        return out
-
-class SerialMpuReader:
-    def __init__(self, port: str, baud: int, timeout: float):
-        try:
-            import serial
-        except Exception as e:
-            print("Instale: pip install pyserial"); raise e
-        self.serial_module = serial
-        self.port = port; self.baud = baud; self.timeout = timeout; self.ser = None
-    def connect(self):
-        print(f"[MPU] Abrindo {self.port} @ {self.baud}...")
-        self.ser = self.serial_module.Serial(self.port, self.baud, timeout=self.timeout)
-        self.ser.reset_input_buffer(); print("[MPU] Conectado.")
-    def disconnect(self):
-        if self.ser:
-            try: self.ser.close(); print("[MPU] Desconectado.")
-            except Exception: pass
-            self.ser = None
-    def _extract_json(self, s: str) -> Optional[str]:
-        i = s.find("{"); j = s.rfind("}")
-        if i >= 0 and j > i: return s[i:j+1]
+# ---- Tentativa de hot-path para o backend (não é obrigatório) ----
+try:
+    # se o collector está no mesmo repo/venv do backend:
+    from api.api_ws import push_bit_update  # type: ignore
+except Exception:
+    def push_bit_update(*args, **kwargs):  # noqa: E301
         return None
-    def read_one(self) -> Optional[Dict[str, Any]]:
-        if not self.ser: return None
-        line = self.ser.readline()
-        if not line: return None
-        try:
-            s = line.decode("utf-8", errors="ignore").strip()
-            if not s: return None
-            obj = json.loads(self._extract_json(s) or s)
-        except Exception: return None
-        sensor = str(obj.get("id", obj.get("sensor", ""))).strip().upper()
-        if sensor not in {"MPUA1","MPUA2"}: return None
-        mpu_id = 1 if sensor == "MPUA1" else 2
-        try:
-            ax = float(obj["ax"]); ay = float(obj["ay"]); az = float(obj["az"])
-        except Exception: return None
-        rec: Dict[str, Any] = {"mpu_id": mpu_id, "ax_g": ax, "ay_g": ay, "az_g": az}
-        for k_src, k_dst in [("gx","gx_dps"),("gy","gy_dps"),("gz","gz_dps"),
-                             ("gx_dps","gx_dps"),("gy_dps","gy_dps"),("gz_dps","gz_dps")]:
-            if k_src in obj:
-                try: rec[k_dst] = float(obj[k_src])
-                except Exception: pass
-        if "temp" in obj:
-            try: rec["temp_c"] = float(obj["temp"])
-            except Exception: pass
-        return rec
 
-# ===== Sinks =====
-class CsvOpcSink:
-    def __init__(self, path: str, fieldnames: Iterable[str]):
-        self.path = path; self.fields = ["ts_utc", *fieldnames]
-        if not os.path.exists(self.path):
-            with open(self.path, "w", newline="", encoding="utf-8") as f:
-                csv.DictWriter(f, fieldnames=self.fields).writeheader()
-    def write_row(self, row: Dict[str, Any]):
-        with open(self.path, "a", newline="", encoding="utf-8") as f:
-            csv.DictWriter(f, fieldnames=self.fields).writerow(row)
-    def close(self): pass
 
-class CsvMpuSink:
-    def __init__(self, path: str):
-        self.path = path
-        self.fields = ["ts_utc","mpu_id","ax_g","ay_g","az_g","gx_dps","gy_dps","gz_dps","temp_c"]
-        if not os.path.exists(self.path):
-            with open(self.path, "w", newline="", encoding="utf-8") as f:
-                csv.DictWriter(f, fieldnames=self.fields).writeheader()
-    def write_sample(self, sample: Dict[str, Any]):
-        with open(self.path, "a", newline="", encoding="utf-8") as f:
-            csv.DictWriter(f, fieldnames=self.fields).writerow(sample)
-    def close(self): pass
+# =============================================================================
+# ENV / CONFIG
+# =============================================================================
+load_dotenv(find_dotenv())
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
-# ===== MySQL base robusto =====
-class MySqlBase:
-    def __init__(self):
-        import mysql.connector
-        self.mysql = mysql.connector
-        print(f"[MySQL] target={MYSQL_HOST}:{MYSQL_PORT} db={MYSQL_DB} user={MYSQL_USER}")
-        self.conn = self.mysql.connect(
-            host=MYSQL_HOST, port=MYSQL_PORT, database=MYSQL_DB,
-            user=MYSQL_USER, password=MYSQL_PASS, connection_timeout=5,
-            autocommit=True
-        )
+DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
+DB_PORT = int(os.getenv("DB_PORT", "3306"))
+DB_USER = os.getenv("DB_USER", "root")
+DB_PASS = os.getenv("DB_PASS", "")
+DB_NAME = os.getenv("DB_NAME", "gmdigital")
+
+OPC_ENDPOINT = os.getenv("OPC_ENDPOINT", "opc.tcp://127.0.0.1:4840")
+OPC_NODES_CSV = os.getenv("OPC_NODES_CSV", os.path.join(os.path.dirname(__file__), "nodes.csv"))
+OPC_TABLE = os.getenv("OPC_TABLE", "opc_samples")
+
+SERIAL_PORT = os.getenv("SERIAL_PORT", "COM3")           # ex: /dev/ttyUSB0 no Linux
+SERIAL_BAUD = int(os.getenv("SERIAL_BAUD", "115200"))
+MPU_TABLE = os.getenv("MPU_TABLE", "mpu_samples")
+
+# Batching & flush
+BATCH_MAX = int(os.getenv("BATCH_MAX", "800"))          # máximo de registros por flush
+FLUSH_MS = int(os.getenv("FLUSH_MS", "500"))            # período padrão de flush
+OPC_POLL_MS = int(os.getenv("OPC_POLL_MS", "200"))      # usado se subscription indisponível
+SER_LINE_TIMEOUT_S = float(os.getenv("SER_LINE_TIMEOUT_S", "0.2"))  # timeout leitura Serial
+
+# Afinidades / tolerâncias
+PRINT_EVERY = int(os.getenv("PRINT_EVERY", "2000"))     # prints de progresso
+TZ_UTC = timezone.utc
+
+# Ajuste de horário (ex.: -10800 para -3h em DEV)
+DEV_TIME_OFFSET_SEC = int(os.getenv("DEV_TIME_OFFSET_SEC", "0") or "0")
+
+
+# =============================================================================
+# MySQL Pool
+# =============================================================================
+POOL_NAME = "gmdigital_pool"
+POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "6"))
+
+def _mk_pool() -> MySQLConnectionPool:
+    return MySQLConnectionPool(
+        pool_name=POOL_NAME,
+        pool_size=POOL_SIZE,
+        pool_reset_session=True,
+        host=DB_HOST,
+        port=DB_PORT,
+        user=DB_USER,
+        password=DB_PASS,
+        database=DB_NAME,
+        autocommit=True,
+        charset="utf8mb4",
+        collation="utf8mb4_0900_ai_ci",
+    )
+
+DB_POOL = _mk_pool()
+
+def db_exec_many(sql: str, rows: List[Tuple[Any, ...]]) -> int:
+    if not rows:
+        return 0
+    conn = DB_POOL.get_connection()
+    try:
+        cur = conn.cursor()
+        cur.executemany(sql, rows)
+        conn.commit()
+        return cur.rowcount or 0
+    finally:
         try:
-            self.conn.ping(reconnect=True, attempts=1, delay=0)
+            cur.close()
         except Exception:
             pass
-    def cursor(self):
+        conn.close()
+
+
+# =============================================================================
+# Buffers & Shutdown
+# =============================================================================
+shutdown_flag = threading.Event()
+
+# buffers protegidos por lock
+opc_buf: List[Tuple[Any, ...]] = []
+mpu_buf: List[Tuple[Any, ...]] = []
+opc_lock = threading.Lock()
+mpu_lock = threading.Lock()
+
+def _utcnow() -> datetime:
+    """
+    Retorna agora em UTC já com o offset de DEV aplicado.
+    Use DEV_TIME_OFFSET_SEC=-10800 para "-3h".
+    """
+    return datetime.now(TZ_UTC) + timedelta(seconds=DEV_TIME_OFFSET_SEC)
+
+def _utc_iso(dt: datetime) -> str:
+    return dt.astimezone(TZ_UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+# =============================================================================
+# OPC-UA (subscription se possível; fallback pra polling)
+# =============================================================================
+class _OPCHandler:  # callback para subscription
+    def __init__(self, node_map: Dict[str, Any], name_by_nodeid: Dict[str, str]):
+        self.node_map = node_map
+        self.name_by_nodeid = name_by_nodeid
+
+    def datachange_notification(self, node, val, data):
+        # Mapear para nosso esquema (assumimos booleano; se numérico, converta)
         try:
-            self.conn.ping(reconnect=True, attempts=1, delay=0)
+            nodeid = str(node.nodeid)  # "ns=2;i=10853" etc
+            name = self.name_by_nodeid.get(nodeid) or nodeid
+            vbool = None
+            if isinstance(val, (bool, int)):
+                vbool = 1 if bool(val) else 0
+            elif isinstance(val, float):
+                # heurística: >0.5 = 1
+                vbool = 1 if val >= 0.5 else 0
+
+            ts = _utcnow()
+            with opc_lock:
+                opc_buf.append((name, vbool, ts))
+
+            # hot-path pro backend
+            if vbool is not None:
+                push_bit_update(name, bool(vbool), ts_ms=int(ts.timestamp() * 1000))
         except Exception:
+            pass
+
+
+def opc_thread():
+    if OPCClient is None:
+        print("[OPC] python-opcua não instalado; pulando OPC.", file=sys.stderr)
+        return
+
+    print(f"[OPC] Conectando a {OPC_ENDPOINT} ...")
+    client = OPCClient(OPC_ENDPOINT, timeout=4)
+    sub = None
+    subs_created = False
+
+    # carregar CSV com colunas: name,nodeid  (aceita cabeçalho)
+    node_rows: List[Tuple[str, str]] = []
+    try:
+        with open(OPC_NODES_CSV, "r", newline="", encoding="utf-8") as f:
+            rd = csv.DictReader(f)
+            if "name" in rd.fieldnames and "nodeid" in rd.fieldnames:
+                for r in rd:
+                    nm = r["name"].strip()
+                    nid = r["nodeid"].strip()
+                    if nm and nid:
+                        node_rows.append((nm, nid))
+            else:
+                # fallback sem cabeçalho
+                f.seek(0)
+                rd2 = csv.reader(f)
+                for row in rd2:
+                    if len(row) >= 2:
+                        node_rows.append((row[0].strip(), row[1].strip()))
+    except Exception as e:
+        print(f"[OPC] Falha lendo CSV {OPC_NODES_CSV}: {e}", file=sys.stderr)
+
+    if not node_rows:
+        print("[OPC] Nenhum node configurado (CSV vazio).", file=sys.stderr)
+        return
+
+    name_by_nodeid: Dict[str, str] = {}
+    node_map: Dict[str, Any] = {}
+
+    try:
+        client.connect()
+        print("[OPC] conectado.")
+        # cria objetos Node
+        for (name, nodeid) in node_rows:
             try:
-                self.conn.reconnect(attempts=2, delay=0)
-            except Exception:
-                pass
-        return self.conn.cursor()
-    def close(self):
-        try: self.conn.close()
-        except Exception: pass
+                node = client.get_node(nodeid)
+                node_map[name] = node
+                name_by_nodeid[str(node.nodeid)] = name
+            except Exception as e:
+                print(f"[OPC] Falha get_node({nodeid}): {e}", file=sys.stderr)
 
-class MySqlOpcSink(MySqlBase):
-    def __init__(self):
-        super().__init__()
-        cur = self.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS opc_samples (
-              id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
-              ts_utc DATETIME(6) NOT NULL,
-              name VARCHAR(128) NOT NULL,
-              value_bool TINYINT(1) NULL,
-              actuator_id TINYINT UNSIGNED NULL,
-              facet VARCHAR(8) NULL,
-              INDEX idx_opc_name_ts (name, ts_utc),
-              INDEX idx_opc_ts (ts_utc),
-              INDEX idx_opc_actuator_ts (actuator_id, ts_utc)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-        """); cur.close()
-    def write_many(self, ts_iso: str, values: Dict[str, Any]):
-        ts_mysql = iso_to_mysql_dt6(ts_iso)
-        cur = self.cursor()
-        cur.executemany(
-            "INSERT INTO opc_samples (ts_utc,name,value_bool) VALUES (%s,%s,%s)",
-            [(ts_mysql, name, (None if v is None else int(bool(v)))) for name, v in values.items()]
-        )
-        cur.close()
-
-class MySqlMpuSink(MySqlBase):
-    def __init__(self):
-        super().__init__()
-        cur = self.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS mpu_samples (
-              id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
-              ts_utc DATETIME(6) NOT NULL,
-              mpu_id TINYINT UNSIGNED NOT NULL,
-              ax_g DOUBLE NOT NULL, ay_g DOUBLE NOT NULL, az_g DOUBLE NOT NULL,
-              gx_dps DOUBLE NULL, gy_dps DOUBLE NULL, gz_dps DOUBLE NULL,
-              INDEX idx_mpu_id_ts (mpu_id, ts_utc),
-              INDEX idx_mpu_ts (ts_utc)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-        """); cur.close()
-    def write_sample(self, ts_iso: str, rec: Dict[str, Any]):
-        ts_mysql = iso_to_mysql_dt6(ts_iso)
-        cur = self.cursor()
-        cur.execute("""
-            INSERT INTO mpu_samples
-              (ts_utc,mpu_id,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-        """, (
-            ts_mysql, int(rec["mpu_id"]),
-            float(rec["ax_g"]), float(rec["ay_g"]), float(rec["az_g"]),
-            (None if rec.get("gx_dps") is None else float(rec["gx_dps"])),
-            (None if rec.get("gy_dps") is None else float(rec["gy_dps"])),
-            (None if rec.get("gz_dps") is None else float(rec["gz_dps"]))
-        ))
-        cur.close()
-
-# ===== Fail-safe helpers =====
-from collections import defaultdict
-
-class _LastState:
-    """Guarda último estado por chave; gera linhas com ts atualizado para replay."""
-    def __init__(self, key_idx: int):
-        self.key_idx = key_idx
-        self._d = {}          # key -> (ts, key, value)
-        self._last_log = 0.0
-    def update_many(self, rows):
-        for r in rows:
-            self._d[r[self.key_idx]] = r
-    def as_replayed(self, now_iso: str):
-        out = []
-        for k,(ts,k2,val) in self._d.items():
-            out.append((now_iso, k2, val))
-        return out
-    def log_if_needed(self, tag: str):
-        now = time.time()
-        if now - self._last_log >= LOG_FAILSAFE_EVERY_SEC:
-            print(f"[{tag}] sem sinal — gravando no estado atual")
-            self._last_log = now
-
-def _seed_last_from_db_opc(conn, limit: int = 200):
-    try:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT ts_utc, name, value_bool
-            FROM opc_samples
-            ORDER BY ts_utc DESC
-            LIMIT %s
-        """, (limit,))
-        rows = cur.fetchall(); cur.close()
-        return rows
-    except Exception:
-        return []
-
-def _seed_last_from_db_mpu(conn, limit: int = 200):
-    try:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT t.ts_utc, t.mpu_id, t.ax_g, t.ay_g, t.az_g, t.gx_dps, t.gy_dps, t.gz_dps
-            FROM (
-              SELECT * FROM mpu_samples ORDER BY ts_utc DESC LIMIT %s
-            ) t
-            ORDER BY t.ts_utc DESC
-        """, (limit,))
-        rows = cur.fetchall(); cur.close()
-        # reduz para última por mpu_id
-        last_by_id = {}
-        for (ts, mpu_id, ax, ay, az, gx, gy, gz) in rows:
-            if mpu_id not in last_by_id:
-                last_by_id[mpu_id] = {"mpu_id": mpu_id, "ax_g": ax, "ay_g": ay, "az_g": az,
-                                      "gx_dps": gx, "gy_dps": gy, "gz_dps": gz}
-        return last_by_id
-    except Exception:
-        return {}
-
-# ===== Live publish =====
-from threading import Event
-STOP = Event()
-def handle_stop(signum, frame): STOP.set()
-signal.signal(signal.SIGINT, handle_stop); signal.signal(signal.SIGTERM, handle_stop)
-
-def _publish_opc_events(ts_iso: str, values: Dict[str, Any]):
-    if not _rcli: return
-    for name, v in values.items():
-        evt = {"type":"opc_event","ts_utc":ts_iso,"name":name,"value_bool":(None if v is None else int(bool(v)))}
-        try: _rcli.publish("opc_samples", json.dumps(evt))
-        except Exception: pass
-
-def _publish_mpu_sample(sample: Dict[str, Any]):
-    if not _rcli: return
-    try:
-        id_str = "MPUA1" if int(sample["mpu_id"]) == 1 else "MPUA2"
-        msg = {"type":"mpu_sample","ts_utc":sample["ts_utc"],"id":id_str,
-               "ax_g":sample["ax_g"],"ay_g":sample["ay_g"],"az_g":sample["az_g"],
-               "gx_dps":sample.get("gx_dps"),"gy_dps":sample.get("gy_dps"),
-               "gz_dps":sample.get("gz_dps"),"temp_c":sample.get("temp_c")}
-        _rcli.publish("mpu_samples", json.dumps(msg))
-    except Exception: pass
-
-# ===== Reconexão OPC assíncrona =====
-class _AsyncOpcConnector:
-    def __init__(self, reader, period_sec: float):
-        self.reader = reader
-        self.period = max(0.5, period_sec)
-        self.connected = False
-        self._stop = threading.Event()
-        self._th = threading.Thread(target=self._run, name="opc_reconnector", daemon=True)
-    def start(self):
-        self._th.start()
-    def stop(self):
-        self._stop.set()
-    def _run(self):
-        while not self._stop.is_set():
-            if not self.connected:
-                try:
-                    self.reader.connect()
-                    self.connected = True
-                    print("[OPC] conectado")
-                except Exception as e:
-                    print(f"[OPC] Conexão falhou: {e}. Retentando em {self.period:.1f}s...")
-            self._stop.wait(self.period)
-
-# ===== Loops =====
-def opc_loop():
-    items = load_nodes(NODES_CSV)
-    names = [i["name"] for i in items]
-
-    # ===== Fonte =====
-    if DATA_MODE in ("DEV", "DEV_DUAL"):
-        if DevReader is None:
-            raise RuntimeError("DevReader não encontrado. Garanta dev_reader.py disponível.")
-        reader = DevReader(NODES_CSV)
-        connector = None
-    elif DATA_MODE == "SIMULATE":
-        reader = Simulator(items)
-        connector = None
-    else:
-        reader = OpcUaReader(OPCUA_ENDPOINT, items)
-        connector = _AsyncOpcConnector(reader, period_sec=OPCUA_RECONNECT_SEC) if OPCUA_CONNECT_ASYNC else None
-
-    # ===== Sink =====
-    sink = MySqlOpcSink() if SINK_MODE == "MYSQL" else CsvOpcSink(CSV_OPC_PATH, names)
-
-    # ===== Intervalo (fora do DEV usa OPC_PERIOD) =====
-    if DATA_MODE in ("DEV", "DEV_DUAL"):
-        dev_tick_ms = float(os.getenv("DEV_TICK_MS", "200"))
-        interval = max(0.001, dev_tick_ms / 1000.0)
-    else:
-        interval = OPC_PERIOD
-    print(f"[OPC] interval={interval:.6f}s  mode={DATA_MODE}  sink={SINK_MODE}")
-
-    # cache last-state para fallback
-    last = _LastState(key_idx=1)  # (ts,name,value)
-    if isinstance(sink, MySqlOpcSink) and FAILSAFE_REPLAY and SEED_FROM_DB:
+        # tenta assinatura
         try:
-            seed = _seed_last_from_db_opc(sink.conn, limit=200)
-            if seed: last.update_many(seed)
-        except Exception:
-            pass
-
-    if connector:
-        connector.start()
-
-    t_prev = time.perf_counter()
-    tick = 0
-    try:
-        next_t = time.perf_counter()
-        while not STOP.is_set():
-            next_t += interval
-
-            # Leitura (não bloqueante)
-            values: Dict[str, Any] = {}
-            is_connected = True
-            if connector is not None:
-                is_connected = connector.connected
-
-            if is_connected and connector is not None:
+            handler = _OPCHandler(node_map, name_by_nodeid)
+            sub = client.create_subscription(200, handler)  # 200ms publishing
+            for (_, nodeid) in node_rows:
                 try:
-                    values = reader.read_all()
-                except Exception as e:
-                    print(f"[OPC] Erro leitura: {e}")
-                    try: reader.disconnect()
-                    except Exception: pass
-                    connector.connected = False
-                    values = {}
-            elif DATA_MODE in ("DEV", "DEV_DUAL", "SIMULATE"):
-                try:
-                    values = reader.read_all()
+                    sub.subscribe_data_change(client.get_node(nodeid))
                 except Exception:
-                    values = {}
+                    pass
+            subs_created = True
+            print("[OPC] Subscription criada.")
+        except Exception as e:
+            print(f"[OPC] Subscription indisponível: {e}. Usando polling...", file=sys.stderr)
+            subs_created = False
 
-            ts = now_utc_iso()
+        # loop principal: se sem subscription, faz polling
+        last_print = 0
+        while not shutdown_flag.is_set():
+            if not subs_created:
+                # polling
+                for (name, nid) in node_rows:
+                    try:
+                        node = client.get_node(nid)
+                        val = node.get_value()
+                        ts = _utcnow()
+                        if isinstance(val, (bool, int)):
+                            vbool = 1 if bool(val) else 0
+                        elif isinstance(val, float):
+                            vbool = 1 if val >= 0.5 else 0
+                        else:
+                            vbool = None
+                        with opc_lock:
+                            opc_buf.append((name, vbool, ts))
+                        if vbool is not None:
+                            push_bit_update(name, bool(vbool), ts_ms=int(ts.timestamp() * 1000))
+                    except Exception:
+                        # ignora pontual
+                        pass
+                time.sleep(OPC_POLL_MS / 1000.0)
+            else:
+                # subscription -> apenas dorme curto
+                time.sleep(0.05)
 
-            # Fallback
-            if not values and FAILSAFE_REPLAY and isinstance(sink, MySqlOpcSink):
-                replay_rows = last.as_replayed(ts)
-                if replay_rows:
-                    cur = sink.cursor()
-                    cur.executemany(
-                        "INSERT INTO opc_samples (ts_utc,name,value_bool) VALUES (%s,%s,%s)",
-                        [(iso_to_mysql_dt6(ts), name, val) for (ts,name,val) in replay_rows]
-                    )
-                    cur.close()
-                    last.log_if_needed("OPC")
-                    _publish_opc_events(ts, {name: val for (_ts,name,val) in replay_rows})
-            elif values:
-                # Gravação normal
-                try:
-                    if isinstance(sink, MySqlOpcSink): sink.write_many(ts, values)
-                    else: sink.write_row({"ts_utc": ts, **values})
-                except Exception as e:
-                    print(f"[OPC] Erro gravação: {e}")
-                if FAILSAFE_REPLAY and isinstance(sink, MySqlOpcSink):
-                    rows = [(ts, name, (None if v is None else int(bool(v)))) for name, v in values.items()]
-                    last.update_many(rows)
-                _publish_opc_events(ts, values)
+            last_print += 1
+            if last_print % 200 == 0:
+                with opc_lock:
+                    n = len(opc_buf)
+                print(f"[OPC] buffer={n}")
 
-            # Métricas
-            tick += 1
-            if tick % 1000 == 0:
-                t_now = time.perf_counter()
-                elapsed = t_now - t_prev
-                print(f"[OPC] 1000 ticks em {elapsed:.3f}s  (média {elapsed/1000:.6f}s/tick)")
-                t_prev = t_now
-
-            # Scheduler (200 ms estáveis)
-            rem = next_t - time.perf_counter()
-            if rem > 0: time.sleep(rem)
-            else: next_t = time.perf_counter()
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        print(f"[OPC] erro geral: {e}", file=sys.stderr)
     finally:
-        try: sink.close()
-        except Exception: pass
         try:
-            if connector: connector.stop()
-        except Exception: pass
-        if hasattr(reader, "disconnect"):
-            try: reader.disconnect()
-            except Exception: pass
-
-def mpu_loop_forever():
-    ser = SerialMpuReader(SERIAL_PORT, SERIAL_BAUD, SERIAL_TIMEOUT)
-    sink = MySqlMpuSink() if SINK_MODE == "MYSQL" else CsvMpuSink(CSV_MPU_PATH)
-
-    # cache de último estado por mpu_id
-    last_by_id: Dict[int, Dict[str, Any]] = {}
-    last_log = 0.0
-
-    # seed opcional via DB
-    if isinstance(sink, MySqlMpuSink) and FAILSAFE_REPLAY and SEED_FROM_DB:
-        try:
-            last_by_id.update(_seed_last_from_db_mpu(sink.conn, limit=200))
+            if sub:
+                sub.delete()
         except Exception:
             pass
+        try:
+            client.disconnect()
+        except Exception:
+            pass
+        print("[OPC] finalizado.")
 
+
+# =============================================================================
+# MPU (Serial JSON por linha)
+# =============================================================================
+def _auto_serial_port(default: str) -> str:
+    if serial is None:
+        return default
     try:
-        # conecta serial com retry
-        while True:
+        ports = list(serial.tools.list_ports.comports())
+        # heurística: se default não existir, pegue o primeiro disponível
+        names = [p.device for p in ports]
+        if default in names:
+            return default
+        return names[0] if names else default
+    except Exception:
+        return default
+
+def mpu_thread():
+    if serial is None:
+        print("[MPU] pyserial não instalado; pulando MPU.", file=sys.stderr)
+        return
+
+    port = _auto_serial_port(SERIAL_PORT)
+    print(f"[MPU] Abrindo {port} @ {SERIAL_BAUD} ...")
+    try:
+        ser = serial.Serial(port=port, baudrate=SERIAL_BAUD, timeout=SER_LINE_TIMEOUT_S)
+    except Exception as e:
+        print(f"[MPU] Falha ao abrir serial {port}: {e}", file=sys.stderr)
+        return
+
+    line_no = 0
+    try:
+        while not shutdown_flag.is_set():
+            raw = ser.readline()
+            if not raw:
+                continue
+            line_no += 1
             try:
-                ser.connect(); break
-            except Exception as e:
-                print(f"[MPU] Falha porta {SERIAL_PORT}: {e}. Retentando em 2s...")
-                time.sleep(2.0)
-
-        # writer determinístico de 1 s; leitor rápido
-        next_t = time.perf_counter()
-        while True:
-            rec = ser.read_one()
-            if rec is not None:
-                last_by_id[rec["mpu_id"]] = rec  # atualiza cache
-
-            nowp = time.perf_counter()
-            if nowp >= next_t:
-                next_t += MPU_PERIOD
-                ts_iso = now_utc_iso()
-
-                if last_by_id:
-                    for mpu_id in sorted(last_by_id.keys()):
-                        base = last_by_id[mpu_id]
-                        sample = {
-                            "ts_utc": ts_iso, "mpu_id": mpu_id,
-                            "ax_g": base.get("ax_g", 0.0),
-                            "ay_g": base.get("ay_g", 0.0),
-                            "az_g": base.get("az_g", 1.0),
-                            "gx_dps": base.get("gx_dps"),
-                            "gy_dps": base.get("gy_dps"),
-                            "gz_dps": base.get("gz_dps"),
-                            "temp_c": base.get("temp_c")
-                        }
-                        try:
-                            if isinstance(sink, MySqlMpuSink): sink.write_sample(ts_iso, sample)
-                            else: sink.write_sample(sample)
-                        except Exception as e:
-                            print(f"[MPU] Erro gravação: {e}")
-                        _publish_mpu_sample(sample)
+                s = raw.decode("utf-8", errors="ignore").strip()
+                if not s:
+                    continue
+                obj = json.loads(s)
+                # esperado: {"id":"MPUA1","ax":..,"ay":..,"az":..} etc (em g)
+                mpu_id = obj.get("id") or obj.get("mpu_id") or obj.get("sensor")
+                if isinstance(mpu_id, str):
+                    # normaliza "MPUA1" / "MPUA2" -> 1 / 2
+                    mpu_id_norm = 1 if mpu_id.upper().endswith("A1") else 2 if mpu_id.upper().endswith("A2") else None
                 else:
-                    if FAILSAFE_REPLAY:
-                        nowt = time.time()
-                        if nowt - last_log >= LOG_FAILSAFE_EVERY_SEC:
-                            print("[MPU] sem sinal — gravando no estado atual (aguardando primeira amostra)")
-                            last_log = nowt
+                    mpu_id_norm = int(mpu_id) if mpu_id is not None else None
 
-            time.sleep(0.005)
+                ax = float(obj.get("ax") or obj.get("ax_g") or 0.0)
+                ay = float(obj.get("ay") or obj.get("ay_g") or 0.0)
+                az = float(obj.get("az") or obj.get("az_g") or 0.0)
+                gx = float(obj.get("gx") or obj.get("gx_dps") or 0.0)
+                gy = float(obj.get("gy") or obj.get("gy_dps") or 0.0)
+                gz = float(obj.get("gz") or obj.get("gz_dps") or 0.0)
+
+                # também aceitamos "actuator_id"
+                actuator_id = obj.get("actuator_id")
+                if actuator_id is None and mpu_id_norm in (1, 2):
+                    actuator_id = mpu_id_norm
+
+                ts = _utcnow()
+                with mpu_lock:
+                    mpu_buf.append((actuator_id, ts, ax, ay, az, gx, gy, gz))
+
+            except Exception:
+                # linha inválida, ignore
+                pass
+
+            if line_no % PRINT_EVERY == 0:
+                with mpu_lock:
+                    n = len(mpu_buf)
+                print(f"[MPU] lin={line_no} buf={n}")
+
     except KeyboardInterrupt:
         pass
+    except Exception as e:
+        print(f"[MPU] erro geral: {e}", file=sys.stderr)
     finally:
         try:
-            if hasattr(sink, "close"): sink.close()
-        except Exception: pass
-        ser.disconnect()
+            ser.close()
+        except Exception:
+            pass
+        print("[MPU] finalizado.")
 
-def mpu_loop_dev():
-    reader = DevMpuReader()
-    sink = MySqlMpuSink() if SINK_MODE == "MYSQL" else CsvMpuSink(CSV_MPU_PATH)
-    dev_tick_ms = float(os.getenv("DEV_TICK_MS_MPU", os.getenv("DEV_TICK_MS", "200")))
-    interval = max(0.001, dev_tick_ms / 1000.0)
-    try:
-        next_t = time.perf_counter()
-        while True:
-            next_t += interval
-            s1, s2 = reader.read_tick()
-            ts_iso = now_utc_iso()
-            s1_row = { "ts_utc": ts_iso, **s1 }
-            s2_row = { "ts_utc": ts_iso, **s2 }
-            try:
-                if isinstance(sink, MySqlMpuSink):
-                    sink.write_sample(ts_iso, s1_row); sink.write_sample(ts_iso, s2_row)
-                else:
-                    sink.write_sample(s1_row); sink.write_sample(s2_row)
-            except Exception as e:
-                print(f"[MPU-DEV] Erro gravação: {e}")
-            _publish_mpu_sample(s1_row); _publish_mpu_sample(s2_row)
-            rem = next_t - time.perf_counter()
-            if rem > 0: time.sleep(rem)
-            else: next_t = time.perf_counter()
-    except KeyboardInterrupt:
-        pass
-    finally:
+
+# =============================================================================
+# Flusher (MySQL)
+# =============================================================================
+SQL_OPC = f"""
+INSERT INTO {OPC_TABLE} (name, value_bool, ts_utc)
+VALUES (%s, %s, %s)
+"""
+
+SQL_MPU = f"""
+INSERT INTO {MPU_TABLE} (actuator_id, ts_utc, ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+"""
+
+def flusher_thread():
+    last = time.monotonic()
+    while not shutdown_flag.is_set():
+        now = time.monotonic()
+        elapsed_ms = (now - last) * 1000.0
+        if elapsed_ms < FLUSH_MS:
+            time.sleep(max(0.01, (FLUSH_MS - elapsed_ms) / 1000.0))
+            continue
+        last = time.monotonic()
+
+        # Drena buffers
         try:
-            if hasattr(sink, "close"): sink.close()
-        except Exception: pass
+            with opc_lock:
+                chunk_opc = opc_buf[:BATCH_MAX]
+                del opc_buf[:len(chunk_opc)]
+            with mpu_lock:
+                chunk_mpu = mpu_buf[:BATCH_MAX]
+                del mpu_buf[:len(chunk_mpu)]
 
-# ===== Execução =====
-def run_dual():
-    # OPC no processo principal; MPU em outro processo.
-    from multiprocessing import Process
-    p_mpu = Process(target=mpu_loop_forever, name="mpu_proc", daemon=True)
-    p_mpu.start()
-    try:
-        opc_loop()
-    finally:
-        if p_mpu.is_alive():
-            p_mpu.terminate()
-            p_mpu.join(timeout=3.0)
+            if chunk_opc:
+                n = db_exec_many(SQL_OPC, chunk_opc)
+                if n and n > 0:
+                    print(f"[FLUSH] opc +{n}")
 
-def run_dev_dual():
-    # OPC (DevReader) no processo principal; MPU (DevMpuReader) em outro processo.
-    from multiprocessing import Process
-    p_mpu = Process(target=mpu_loop_dev, name="mpu_dev_proc", daemon=True)
-    p_mpu.start()
-    try:
-        opc_loop()
-    finally:
-        if p_mpu.is_alive():
-            p_mpu.terminate()
-            p_mpu.join(timeout=3.0)
+            if chunk_mpu:
+                n = db_exec_many(SQL_MPU, chunk_mpu)
+                if n and n > 0:
+                    print(f"[FLUSH] mpu +{n}")
 
-def run_opc_only(): opc_loop()
-def run_mpu_only(): mpu_loop_forever()
+        except Exception as e:
+            print(f"[FLUSH] erro: {e}", file=sys.stderr)
+            # Em erro, evitamos recolocar no buffer pra não duplicar; confiamos na próxima leva
+
+
+# =============================================================================
+# Main
+# =============================================================================
+def _handle_sig(*_):
+    shutdown_flag.set()
 
 def main():
-    mode = DATA_MODE
-    if mode == "DUAL": run_dual()
-    elif mode == "DEV_DUAL": run_dev_dual()
-    elif mode in ("OPCUA","SIMULATE","DEV"): run_opc_only()
-    elif mode == "SERIAL_MPU": run_mpu_only()
-    else:
-        print(f"[ERRO] DATA_MODE inválido: {mode} (use SIMULATE | OPCUA | SERIAL_MPU | DUAL | DEV | DEV_DUAL)")
-        sys.exit(2)
+    print("=== Collector DUAL (OPC + MPU) ===")
+    print(f"DB: {DB_USER}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
+    print(f"OPC: {OPC_ENDPOINT} | CSV: {OPC_NODES_CSV}")
+    print(f"SER: {SERIAL_PORT} @ {SERIAL_BAUD}")
+    print(f"Flush: {FLUSH_MS} ms | Batch: {BATCH_MAX}")
+    if DEV_TIME_OFFSET_SEC:
+        print(f"[TIME] DEV_TIME_OFFSET_SEC={DEV_TIME_OFFSET_SEC} (aplicado a ts_utc)")
+
+    # sinais
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _handle_sig)
+        except Exception:
+            pass
+
+    th_opc = threading.Thread(target=opc_thread, name="opc", daemon=True)
+    th_mpu = threading.Thread(target=mpu_thread, name="mpu", daemon=True)
+    th_flush = threading.Thread(target=flusher_thread, name="flush", daemon=True)
+
+    th_opc.start()
+    th_mpu.start()
+    th_flush.start()
+
+    try:
+        while not shutdown_flag.is_set():
+            time.sleep(0.3)
+    except KeyboardInterrupt:
+        shutdown_flag.set()
+
+    print("Aguardando threads finalizarem...")
+    th_opc.join(timeout=3.0)
+    th_mpu.join(timeout=3.0)
+    th_flush.join(timeout=3.0)
+    print("Collector DUAL finalizado.")
 
 if __name__ == "__main__":
     main()
-
-

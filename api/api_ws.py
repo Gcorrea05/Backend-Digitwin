@@ -27,7 +27,7 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 # -----------------------------------------------------------------------------
 # FastAPI + CORS
 # -----------------------------------------------------------------------------
-app = FastAPI(title="Festo DT API (WS-first)", version="4.2.0")
+app = FastAPI(title="Festo DT API (WS-first)", version="4.3.0")
 
 ALLOWED_ORIGINS = [
     o.strip()
@@ -90,7 +90,6 @@ from .database import fetch_all as db_fetch_all
 
 # rotas auxiliares já existentes
 from .routes import metrics as metrics_routes
-app.include_router(metrics_routes.router)          # sem /api
 app.include_router(metrics_routes.router, prefix="/api")
 
 # -----------------------------------------------------------------------------
@@ -108,6 +107,69 @@ OPC_TABLE = os.getenv("OPC_TABLE", "opc_samples")
 MPU_TABLE = os.getenv("MPU_TABLE", "mpu_samples")
 _DURATION_RE = re.compile(r"^-(\d+)\s*([smhd])$", re.IGNORECASE)
 MAX_LIMIT = 50000
+
+# -----------------------------------------------------------------------------
+# HOT queue (eventos do coletor) -> _LIVE_CACHE
+# -----------------------------------------------------------------------------
+# O coletor chama push_bit_update(name,value,ts_ms) e pode enfileirar eventos em HOT.
+# Se não existir (outro módulo já definiu), criamos aqui.
+try:
+    HOT  # type: ignore
+    LATEST_BITS  # type: ignore
+except NameError:
+    HOT = deque(maxlen=20000)      # cada item: {"name": str, "value": bool, "ts_ms": int}
+    LATEST_BITS = {}               # espelho simples (debug)
+
+import threading
+_HOT_LOCK = threading.Lock()
+
+def _coerce_to_datetime(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, (int, float)):
+        dt = datetime.fromtimestamp(value, tz=timezone.utc)
+    elif isinstance(value, str):
+        s = value.strip()
+        try:
+            s2 = s.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(s2)
+        except Exception:
+            dt = None
+            for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+                try:
+                    dt = datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+                    break
+                except Exception:
+                    continue
+            if dt is None:
+                return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        return None
+    return dt.astimezone(timezone.utc)
+
+def _ingest_hot_item(item: dict) -> None:
+    """Converte um item do HOT em entrada do _LIVE_CACHE['vals']."""
+    name = str(item.get("name"))
+    v = 1 if bool(item.get("value")) else 0
+    ts_ms = int(item.get("ts_ms") or int(time.time() * 1000))
+    ts = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
+
+    vals = _LIVE_CACHE.get("vals")
+    if not isinstance(vals, dict):
+        _LIVE_CACHE["vals"] = vals = {}
+
+    cur = vals.get(name)
+    def _coerce_ts(obj):
+        return _coerce_to_datetime(obj.get("ts_utc")) if isinstance(obj, dict) else None
+    cur_ts = _coerce_ts(cur)
+    if cur_ts and ts <= cur_ts:
+        return  # não retrocede tempo
+    vals[name] = {"value_bool": v, "ts_utc": ts}
+    _LIVE_CACHE["ts"] = datetime.now(timezone.utc)
 
 # -----------------------------------------------------------------------------
 # DB helpers
@@ -179,34 +241,6 @@ def get_mpu_ids_compat() -> Dict[str, List[Any]]:
 # -----------------------------------------------------------------------------
 # Utils de tempo/ISO
 # -----------------------------------------------------------------------------
-def _coerce_to_datetime(value: Any) -> Optional[datetime]:
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        dt = value
-    elif isinstance(value, (int, float)):
-        dt = datetime.fromtimestamp(value, tz=timezone.utc)
-    elif isinstance(value, str):
-        s = value.strip()
-        try:
-            s2 = s.replace("Z", "+00:00")
-            dt = datetime.fromisoformat(s2)
-        except Exception:
-            dt = None
-            for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
-                try:
-                    dt = datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
-                    break
-                except Exception:
-                    continue
-            if dt is None:
-                return None
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-    else:
-        return None
-    return dt.astimezone(timezone.utc)
-
 def dt_to_iso_utc(value: Any) -> Optional[str]:
     dt = _coerce_to_datetime(value)
     if dt is None:
@@ -274,6 +308,9 @@ _NAMES_LATCH = (
     _CFG_A1.v_av, _CFG_A1.v_rec, _SMAP[1]["S1"], _SMAP[1]["S2"],
     _CFG_A2.v_av, _CFG_A2.v_rec, _SMAP[2]["S1"], _SMAP[2]["S2"],
 )
+
+# Controles explícitos vindos do seu CSV
+CONTROL_NAMES = ("INICIA", "PARA")
 
 def _aid_from_cfg(cfg: _LatchCfg) -> int:
     try:
@@ -486,25 +523,50 @@ def _fetch_latest_rows_fast(names: tuple[str, ...]) -> dict[str, dict]:
         WHERE rn = 1
         """
         rows = fetch_all(sql, names) or []
-        out = {}
-        for r in rows:
-            n = str(col(r, "name") or r[0])  # type: ignore
-            vb = col(r, "value_bool") if isinstance(r, dict) else r[1]  # type: ignore
-            ts = col(r, "ts_utc")     if isinstance(r, dict) else r[2]  # type: ignore
-            out[n] = {"value_bool": (None if vb is None else int(vb)), "ts_utc": ts}
-        for n in names:
-            out.setdefault(n, {"value_bool": None, "ts_utc": None})
-        return out
     except Exception:
-        return _fetch_latest_rows(names)
+        # fallback sem janela
+        sql = f"""
+            SELECT s.name, s.value_bool, s.ts_utc
+            FROM {OPC_TABLE} s
+            JOIN (
+                SELECT name, MAX(ts_utc) AS ts_utc
+                FROM {OPC_TABLE}
+                WHERE name IN ({placeholders})
+                GROUP BY name
+            ) m ON m.name = s.name AND m.ts_utc = s.ts_utc
+        """
+        rows = fetch_all(sql, names) or []
 
-# -----------------------------------------------------------------------------
-# State inferência + log
-# -----------------------------------------------------------------------------
-_LATCH_STATE: Dict[int, Dict[str, Any]] = {
-    1: {"last_state": None, "last_confirmed_ts": None, "indef_since": None},
-    2: {"last_state": None, "last_confirmed_ts": None, "indef_since": None},
-}
+    # Filtro defensivo: descarta leituras "no futuro"
+    out: dict[str, dict] = {}
+    now_utc = datetime.now(timezone.utc)
+    FUTURE_GRACE = timedelta(seconds=5)
+
+    for r in rows:
+        n = str(col(r, "name") or r[0])  # type: ignore
+        vb = col(r, "value_bool") if isinstance(r, dict) else r[1]  # type: ignore
+        ts = col(r, "ts_utc")     if isinstance(r, dict) else r[2]  # type: ignore
+
+        # Coerção e checagem de "futuro"
+        try:
+            ts_dt = ts if isinstance(ts, datetime) else datetime.fromisoformat(str(ts))
+            if ts_dt.tzinfo is None:
+                ts_dt = ts_dt.replace(tzinfo=timezone.utc)
+            ts_dt = ts_dt.astimezone(timezone.utc)
+            if ts_dt - now_utc > FUTURE_GRACE:
+                continue  # ignora esta leitura
+        except Exception:
+            # se não conseguir parsear, mantém (não bloqueia)
+            pass
+
+        out[n] = {"value_bool": (None if vb is None else int(vb)), "ts_utc": ts}
+
+    # garante chaves ausentes
+    for n in names:
+        out.setdefault(n, {"value_bool": None, "ts_utc": None})
+
+    return out
+
 
 def _append_state_log(
     aid: int,
@@ -536,32 +598,38 @@ def _append_state_log(
     except Exception:
         pass
 
-# --- SUBSTITUA a função inteira por esta versão ---
+# --- SUBSTITUÍDO: versão com STOP por 'PARA' ---
 def _infer_state_from_latest(cfg: _LatchCfg, latest: Dict[str, Dict[str, Any]]):
     """
-    Regra chave:
-      - Comando atual (derivado de válvulas) define se podemos COMMITAR o estado.
-      - Em STOP (v_av==0 e v_rec==0), NÃO atualizamos last_state com S1/S2,
-        apenas mantemos o último estado confirmado (evita “meio ciclo invertido” ao parar).
-      - Exceção: se ainda não temos last_state (boot), permitimos inicializar pelo sensor.
+    Regras atualizadas:
+      - STOP apenas quando PARA==1 (comando explícito de parada).
+      - Se válvulas estão neutras (ambas 0) => IDLE (não bloqueia atualização).
+      - Em STOP, não comita novo estado via S1/S2 (só inicializa se vazio).
+      - Auto-inicializa _LATCH_STATE para evitar NameError.
     """
+    # garante existência do cache de estado
+    global _LATCH_STATE
+    try:
+        _LATCH_STATE
+    except NameError:
+        _LATCH_STATE = {
+            1: {"last_state": None, "last_confirmed_ts": None, "indef_since": None},
+            2: {"last_state": None, "last_confirmed_ts": None, "indef_since": None},
+        }
+
     now = datetime.now(timezone.utc)
 
-    # resolve nomes S1/S2
+    # nomes e leituras
     s1_name, s2_name = _facet_names(cfg)
-    s1_row = latest.get(s1_name, {})
-    s2_row = latest.get(s2_name, {})
+    s1_row = latest.get(s1_name, {});  s2_row = latest.get(s2_name, {})
+    vav = latest.get(cfg.v_av, {});    vrc = latest.get(cfg.v_rec, {})
+    bit_para = latest.get("PARA", {})
 
-    vav = latest.get(cfg.v_av, {})
-    vrc = latest.get(cfg.v_rec, {})
-
-    # sensores (0/1)
     s1 = int(s1_row.get("value_bool") or 0)
     s2 = int(s2_row.get("value_bool") or 0)
-
-    # válvulas (0/1)
-    v1 = int(vav.get("value_bool") or 0)  # AV
-    v2 = int(vrc.get("value_bool") or 0)  # REC
+    v1 = int(vav.get("value_bool") or 0)   # AV
+    v2 = int(vrc.get("value_bool") or 0)   # REC
+    para = int(bit_para.get("value_bool") or 0)
 
     t_s1 = _coerce_to_datetime(s1_row.get("ts_utc"))
     t_s2 = _coerce_to_datetime(s2_row.get("ts_utc"))
@@ -571,26 +639,25 @@ def _infer_state_from_latest(cfg: _LatchCfg, latest: Dict[str, Dict[str, Any]]):
     aid = _aid_from_cfg(cfg)
     st = _LATCH_STATE.get(aid) or {"last_state": None, "last_confirmed_ts": None, "indef_since": None}
 
-    # 1) estado instantâneo pelos sensores (apenas leitura)
-    raw_state: Optional[StableState] = None
+    # estado pelos sensores (leitura instantânea)
     if s1 == 1 and s2 == 0:
-        raw_state = "RECUADO"
+        raw_state: Optional[StableState] = "RECUADO"
     elif s1 == 0 and s2 == 1:
         raw_state = "AVANÇADO"
     else:
-        raw_state = None  # entre cursos / conflito / ambos 0/1
+        raw_state = None  # em trânsito / conflito
 
-    # 2) comando atual pelas válvulas
-    if v1 and not v2:
-        cmd = "AV";  last_cmd_ts = t_vav
+    # comando atual
+    if para == 1:
+        cmd, last_cmd_ts = "STOP", _coerce_to_datetime(bit_para.get("ts_utc"))
+    elif v1 and not v2:
+        cmd, last_cmd_ts = "AV", t_vav
     elif v2 and not v1:
-        cmd = "REC"; last_cmd_ts = t_vrc
+        cmd, last_cmd_ts = "REC", t_vrc
     else:
-        cmd = "STOP"; last_cmd_ts = None
+        cmd, last_cmd_ts = "IDLE", None  # válvulas neutras não bloqueiam atualização
 
-    # 3) COMMIT de estado:
-    #    - Se cmd != STOP e raw_state é definido, comitamos (normal)
-    #    - Se cmd == STOP, NÃO comitar (congelar), exceto se ainda não temos last_state (boot)
+    # commit de estado
     if raw_state is not None:
         if cmd != "STOP" or st["last_state"] is None:
             st["last_state"] = raw_state
@@ -602,13 +669,13 @@ def _infer_state_from_latest(cfg: _LatchCfg, latest: Dict[str, Dict[str, Any]]):
 
     displayed = st["last_state"] or "RECUADO"
 
-    # 4) pending só quando existe comando ativo e estado ainda não bate
+    # pending só quando há comando ativo (AV/REC) e não bate com o mostrado
     if cmd == "AV" and displayed != "AVANÇADO":
         pending = "AV"
     elif cmd == "REC" and displayed != "RECUADO":
         pending = "REC"
     else:
-        pending = None  # inclui STOP
+        pending = None  # STOP/IDLE não geram pending
 
     _LATCH_STATE[aid] = st
 
@@ -663,7 +730,7 @@ def _mpu_live_snapshot(window_s: float = 0.4) -> list[dict]:
 def build_live_payload() -> dict:
     latest = _LIVE_CACHE.get("vals") or {}
     if not latest:
-        latest = _fetch_latest_rows_fast(_NAMES_LATCH)
+        latest = _fetch_latest_rows_fast(_NAMES_LATCH + CONTROL_NAMES)
     a1 = _infer_state_from_latest(_CFG_A1, latest)
     a2 = _infer_state_from_latest(_CFG_A2, latest)
     items = [
@@ -798,7 +865,7 @@ def debug_cpm2(window_s: int = 60):
              2: {"S1": _SMAP[2]["S1"], "S2": _SMAP[2]["S2"]}}
     names = [v for m in s_map.values() for v in (m["S1"], m["S2"])]
     ref_row = fetch_one(f"SELECT COALESCE(MAX(ts_utc), NOW(6)) AS ref_ts FROM {OPC_TABLE}")
-    ref_ts = col(ref_row, "ref_ts") if isinstance(ref_row, dict) else (ref_row[0] if row else None)
+    ref_ts = col(ref_row, "ref_ts") if isinstance(ref_row, dict) else (ref_row[0] if ref_row else None)
     series = _fetch_series(names, window_s)
     def tail(lst, n=5): return [{"ts": dt_to_iso_utc(t), "v": v} for (t, v) in lst[-n:]]
     return JSONResponse({
@@ -808,7 +875,17 @@ def debug_cpm2(window_s: int = 60):
         "sizes": {k: len(v) for k, v in series.items()},
         "tails": {k: tail(v, 5) for k, v in series.items()},
         "now": _now_iso(),
-    }, headers={"Cache-Control": "no-store"})
+    }, headers={"Cache-Control":"no-store"})
+
+@app.get("/api/debug/hot")
+def debug_hot():
+    vals = _LIVE_CACHE.get("vals") or {}
+    out = []
+    for k in list(vals.keys())[-200:]:
+        v = vals[k]
+        out.append({"name": k, "value": (v.get("value_bool") if isinstance(v, dict) else None),
+                    "ts": dt_to_iso_utc(v.get("ts_utc") if isinstance(v, dict) else None)})
+    return JSONResponse({"count": len(vals), "items": out[-100:]}, headers={"Cache-Control": "no-store"})
 
 @app.get("/__ping")
 def __ping():
@@ -982,11 +1059,33 @@ WS_MON  = WSGroup("monitoring")
 WS_SLOW = WSGroup("slow")
 WS_ALERTS = WSGroup("alerts")  # NOVO canal de alerts (snapshot + push)
 _bg_tasks: "list[asyncio.Task]" = []
+
 # ---------------------------------------------------------------------
 # Producers
 # ---------------------------------------------------------------------
+async def hot_drain_loop():
+    """Drena HOT em alta frequência e atualiza _LIVE_CACHE imediatamente."""
+    period = 0.01  # 10 ms
+    while True:
+        try:
+            batch = []
+            for _ in range(512):
+                try:
+                    item = HOT.popleft()
+                except IndexError:
+                    break
+                else:
+                    batch.append(item)
+            if batch:
+                for it in batch:
+                    _ingest_hot_item(it)
+        except Exception:
+            pass
+        await asyncio.sleep(period)
+
 async def live_sampler_loop():
-    names = _NAMES_LATCH
+    # agora também monitora os controles INICIA/PARA como fallback
+    names = _NAMES_LATCH + CONTROL_NAMES
     period = max(0.05, LIVE_TICK_MS / 1000.0)  # 50–200 ms
     next_t = time.perf_counter()
     while True:
@@ -1112,7 +1211,7 @@ async def _startup_ws_tasks_once():
     if _started_flag:
         return
     _started_flag = True
-    for fn in (live_sampler_loop, live_producer_loop, monitoring_producer_loop, slow_producer_loop):
+    for fn in (hot_drain_loop, live_sampler_loop, live_producer_loop, monitoring_producer_loop, slow_producer_loop):
         _bg_tasks.append(asyncio.create_task(fn()))
 
 @app.on_event("shutdown")
@@ -1294,6 +1393,7 @@ def compat_opc_by_facet_legacy(**kwargs):
 @app.get("/opc/history/facet")
 def compat_opc_history_facet_legacy(**kwargs):
     return http_opc_history_facet(**kwargs)
+
 # compat POST
 @app.post("/api/opc/history/name")
 def http_opc_history_by_name_post(body: dict = Body(...)):
@@ -1498,7 +1598,7 @@ def api_list_alerts(request: Request, limit: int = Query(5, ge=1, le=100), max_a
         "ts": _now_iso()
     }
     etag = _alerts_signature([{k: v for k, v in it.items() if k in ("id","code","ts")} for it in payload["items"]])
-    headers = {"Cache-Control": f"public, max-age={max_age_s}", "ETag": f'"{etag}"'}
+    headers = {"Cache-Control": f"public, max-age={max_age_s}", "ETag": f'"{etag}""'}
     inm = request.headers.get("if-none-match")
     if inm and inm.strip('"') == etag:
         return Response(status_code=304, headers=headers)
