@@ -506,66 +506,133 @@ _LIVE_CACHE: dict = {
     "ts": None,   # datetime
     "vals": {},   # { name: {value_bool, ts_utc}, ... }
 }
+# --- helpers para montar a lista de tags relevantes a partir das configs ---
+# --- helpers para montar a lista de tags relevantes a partir das configs ---
+def _latch_names(cfg) -> list[str]:
+    return [cfg.s_adv, cfg.s_rec, cfg.v_av, cfg.v_rec]
 
-def _fetch_latest_rows_fast(names: tuple[str, ...]) -> dict[str, dict]:
-    if not names:
+_LATCH_NAMES = list({*(_latch_names(_CFG_A1) + _latch_names(_CFG_A2))})
+# esperado: ['Avancado_1S2','Recuado_1S1','V1_14','V1_12','Avancado_2S2','Recuado_2S1','V2_14','V2_12']
+
+
+def _ensure_mysql_connection(conn_like):
+    """
+    Normaliza vários formatos para uma conexão MySQL *real*.
+    Aceita:
+      - conexão mysql (tem .cursor)
+      - (conn, cursor)
+      - pool com .get_connection()
+      - DSN string "mysql://user:pass@host:port/db"
+      - qualquer string -> usa ENV (DB_HOST/DB_PORT/DB_USER/DB_PASS/DB_NAME)
+    Retorna: (conn, must_close: bool)
+    """
+    # 1) (conn, cursor) tupla/lista
+    if isinstance(conn_like, (tuple, list)) and conn_like:
+        return _ensure_mysql_connection(conn_like[0])
+
+    # 2) conexão já aberta
+    if hasattr(conn_like, "cursor"):
+        return conn_like, False
+
+    # 3) pool com get_connection()
+    if hasattr(conn_like, "get_connection"):
+        c = conn_like.get_connection()
+        return c, True
+
+    # 4) DSN string ou qualquer string -> tenta DSN, senão ENV
+    if isinstance(conn_like, str):
+        dsn = conn_like.strip()
+        params = {}
+        try:
+            # parse DSN basiquinho: mysql://user:pass@host:port/db
+            if dsn.startswith("mysql://"):
+                import re
+                m = re.match(r"^mysql://([^:]+):([^@]+)@([^:/]+):?(\d+)?/([^?]+)", dsn)
+                if m:
+                    params = {
+                        "user": m.group(1),
+                        "password": m.group(2),
+                        "host": m.group(3),
+                        "port": int(m.group(4) or "3306"),
+                        "database": m.group(5),
+                    }
+        except Exception:
+            params = {}
+
+        if not params:
+            # fallback ENV
+            params = {
+                "host": os.getenv("DB_HOST", "localhost"),
+                "port": int(os.getenv("DB_PORT", "3306")),
+                "user": os.getenv("DB_USER", "entry"),
+                "password": os.getenv("DB_PASS", "root"),
+                "database": os.getenv("DB_NAME", "gmdigital"),
+            }
+
+        import mysql.connector
+        c = mysql.connector.connect(**params)
+        return c, True
+
+    # 5) último recurso: ENV
+    import mysql.connector
+    c = mysql.connector.connect(
+        host=os.getenv("DB_HOST", "locahost"),
+        port=int(os.getenv("DB_PORT", "3306")),
+        user=os.getenv("DB_USER", "entry"),
+        password=os.getenv("DB_PASS", "root"),
+        database=os.getenv("DB_NAME", "gmdigital"),
+    )
+    return c, True
+
+
+def _fetch_latest_rows_fast(conn_like) -> dict[str, int]:
+    """
+    Busca o ÚLTIMO value_bool por 'name' para TODAS as tags relevantes
+    (sensores + válvulas) em uma query só, com janela de 10 min.
+
+    Aceita: conexão, (conn, cur), pool, DSN string, ou string genérica.
+    Retorna: dict { name: 0/1 }
+    """
+    # normaliza o que veio para uma conexão real
+    conn, must_close_conn = _ensure_mysql_connection(conn_like)
+
+    if not _LATCH_NAMES:
+        if must_close_conn:
+            try: conn.close()
+            except Exception: pass
         return {}
-    placeholders = ", ".join(["%s"] * len(names))
-    try:
-        sql = f"""
-        SELECT name, value_bool, ts_utc
+
+    placeholders = ",".join(["%s"] * len(_LATCH_NAMES))
+    sql = f"""
+        SELECT name, value_bool
         FROM (
-            SELECT name, value_bool, ts_utc,
-                   ROW_NUMBER() OVER (PARTITION BY name ORDER BY ts_utc DESC) AS rn
-            FROM {OPC_TABLE}
+            SELECT
+                name,
+                value_bool,
+                ROW_NUMBER() OVER (PARTITION BY name ORDER BY ts_utc DESC) AS rn
+            FROM opc_samples
             WHERE name IN ({placeholders})
+              AND ts_utc >= NOW() - INTERVAL 10 MINUTE
         ) t
         WHERE rn = 1
-        """
-        rows = fetch_all(sql, names) or []
-    except Exception:
-        # fallback sem janela
-        sql = f"""
-            SELECT s.name, s.value_bool, s.ts_utc
-            FROM {OPC_TABLE} s
-            JOIN (
-                SELECT name, MAX(ts_utc) AS ts_utc
-                FROM {OPC_TABLE}
-                WHERE name IN ({placeholders})
-                GROUP BY name
-            ) m ON m.name = s.name AND m.ts_utc = s.ts_utc
-        """
-        rows = fetch_all(sql, names) or []
+    """
 
-    # Filtro defensivo: descarta leituras "no futuro"
-    out: dict[str, dict] = {}
-    now_utc = datetime.now(timezone.utc)
-    FUTURE_GRACE = timedelta(seconds=5)
-
-    for r in rows:
-        n = str(col(r, "name") or r[0])  # type: ignore
-        vb = col(r, "value_bool") if isinstance(r, dict) else r[1]  # type: ignore
-        ts = col(r, "ts_utc")     if isinstance(r, dict) else r[2]  # type: ignore
-
-        # Coerção e checagem de "futuro"
-        try:
-            ts_dt = ts if isinstance(ts, datetime) else datetime.fromisoformat(str(ts))
-            if ts_dt.tzinfo is None:
-                ts_dt = ts_dt.replace(tzinfo=timezone.utc)
-            ts_dt = ts_dt.astimezone(timezone.utc)
-            if ts_dt - now_utc > FUTURE_GRACE:
-                continue  # ignora esta leitura
-        except Exception:
-            # se não conseguir parsear, mantém (não bloqueia)
-            pass
-
-        out[n] = {"value_bool": (None if vb is None else int(vb)), "ts_utc": ts}
-
-    # garante chaves ausentes
-    for n in names:
-        out.setdefault(n, {"value_bool": None, "ts_utc": None})
-
-    return out
+    cur = conn.cursor()
+    try:
+        cur.execute(sql, _LATCH_NAMES)
+        out: dict[str, int] = {}
+        for name, v in cur.fetchall():
+            try:
+                out[name] = 1 if (v is not None and int(v) > 0) else 0
+            except Exception:
+                out[name] = 0
+        return out
+    finally:
+        try: cur.close()
+        except Exception: pass
+        if must_close_conn:
+            try: conn.close()
+            except Exception: pass
 
 
 def _append_state_log(
@@ -597,6 +664,10 @@ def _append_state_log(
         })
     except Exception:
         pass
+
+
+
+
 
 # --- SUBSTITUÍDO: versão com STOP por 'PARA' ---
 def _infer_state_from_latest(cfg: _LatchCfg, latest: Dict[str, Dict[str, Any]]):

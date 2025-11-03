@@ -13,7 +13,6 @@ import json
 import time
 import csv
 import signal
-import queue
 import threading
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -57,7 +56,7 @@ DB_USER = os.getenv("DB_USER", "root")
 DB_PASS = os.getenv("DB_PASS", "")
 DB_NAME = os.getenv("DB_NAME", "gmdigital")
 
-OPC_ENDPOINT = os.getenv("OPC_ENDPOINT", "opc.tcp://127.0.0.1:4840")
+OPC_ENDPOINT = os.getenv("OPC_ENDPOINT", "opc.tcp://192.168.0.40:4840")
 OPC_NODES_CSV = os.getenv("OPC_NODES_CSV", os.path.join(os.path.dirname(__file__), "nodes.csv"))
 OPC_TABLE = os.getenv("OPC_TABLE", "opc_samples")
 
@@ -66,17 +65,104 @@ SERIAL_BAUD = int(os.getenv("SERIAL_BAUD", "115200"))
 MPU_TABLE = os.getenv("MPU_TABLE", "mpu_samples")
 
 # Batching & flush
-BATCH_MAX = int(os.getenv("BATCH_MAX", "800"))          # máximo de registros por flush
-FLUSH_MS = int(os.getenv("FLUSH_MS", "500"))            # período padrão de flush
-OPC_POLL_MS = int(os.getenv("OPC_POLL_MS", "200"))      # usado se subscription indisponível
+BATCH_MAX = int(os.getenv("BATCH_MAX", "800"))           # máximo de registros por flush
+FLUSH_MS = int(os.getenv("FLUSH_MS", "500"))             # período padrão de flush
+OPC_POLL_MS = int(os.getenv("OPC_POLL_MS", "100"))       # polling a cada 100ms por padrão
 SER_LINE_TIMEOUT_S = float(os.getenv("SER_LINE_TIMEOUT_S", "0.2"))  # timeout leitura Serial
 
 # Afinidades / tolerâncias
-PRINT_EVERY = int(os.getenv("PRINT_EVERY", "2000"))     # prints de progresso
+PRINT_EVERY = int(os.getenv("PRINT_EVERY", "2000"))      # prints de progresso
 TZ_UTC = timezone.utc
 
-# Ajuste de horário (ex.: -10800 para -3h em DEV)
+# Ajuste de horário (ex.: -10800 para -3h em DEV) — aplicado por _now_for_db()
 DEV_TIME_OFFSET_SEC = int(os.getenv("DEV_TIME_OFFSET_SEC", "0") or "0")
+
+# COMO gravar no MySQL (DATETIME "naive"):
+# - LOCAL (padrão): grava horário "naive" já em UTC-3 (BRT)
+# - UTC:    grava horário "naive" em UTC
+STORE_TZ = (os.getenv("STORE_TZ", "LOCAL") or "LOCAL").upper()   # "LOCAL" | "UTC"
+# Offset do fuso local (UTC-3 = -10800). Pode ajustar para horário de verão, se precisar.
+LOCAL_TZ_OFFSET_SEC = int(os.getenv("LOCAL_TZ_OFFSET_SEC", "-10800") or "-10800")
+
+# ---------------------------
+# Coerção p/ bit e Watchlist
+# ---------------------------
+OPC_WATCH = set((os.getenv("OPC_WATCH", "") or "").replace(" ", "").split(",")) - {""}
+
+
+def _to_vbool(val) -> Optional[int]:
+    """Converte valores variados do OPC para 0/1.
+       Regras:
+       - bool -> 0/1
+       - num  -> 1 se > 0, senão 0  (cobre 0/1, 0/100, -1/1, 0/255 etc.)
+       - str  -> mapeia {'1','true','on','open','high','active','enabled'}=1,
+                {'0','false','off','closed','low','inactive','disabled'}=0,
+                ou tenta float com a mesma regra (>0 => 1).
+       - caso impossível, retorna None (logaremos para ajustar a origem).
+    """
+    if isinstance(val, bool):
+        return 1 if val else 0
+    if isinstance(val, (int, float)):
+        try:
+            return 1 if float(val) > 0.0 else 0
+        except Exception:
+            return None
+    if isinstance(val, str):
+        s = val.strip().lower()
+        if s in ("1", "true", "on", "open", "high", "active", "enabled"):
+            return 1
+        if s in ("0", "false", "off", "closed", "low", "inactive", "disabled"):
+            return 0
+        try:
+            f = float(s)
+            return 1 if f > 0.0 else 0
+        except Exception:
+            return None
+    return None
+
+
+# =============================================================================
+# Helpers de tempo (CENTRALIZADOS)
+# =============================================================================
+def _now_for_db() -> datetime:
+    """
+    Retorna datetime 'naive' (sem tzinfo) no fuso escolhido para gravar em MySQL DATETIME.
+    - STORE_TZ == 'LOCAL'  -> usa UTC-3 (BRT)
+    - STORE_TZ == 'UTC'    -> usa UTC
+    Aplica também DEV_TIME_OFFSET_SEC (se quiser simular).
+    """
+    t = datetime.utcnow()  # base em UTC
+    if STORE_TZ == "LOCAL":
+        t = t + timedelta(seconds=LOCAL_TZ_OFFSET_SEC)  # vai pra UTC-3
+    # offset extra de DEV (opcional)
+    t = t + timedelta(seconds=DEV_TIME_OFFSET_SEC)
+    return t.replace(tzinfo=None)
+
+
+def _epoch_ms_from_local_naive(ts_local_naive: datetime) -> int:
+    """
+    Converte um datetime 'naive' ASSUMIDO no fuso LOCAL (UTC-3 por padrão) para epoch ms correto.
+    Útil para notificar WS (push_bit_update) com timestamp absoluto.
+    """
+    brt = timezone(timedelta(seconds=LOCAL_TZ_OFFSET_SEC))
+    aware_local = ts_local_naive.replace(tzinfo=brt)
+    return int(aware_local.astimezone(timezone.utc).timestamp() * 1000)
+
+
+def _utc_iso_from_naive(db_naive: datetime) -> str:
+    """
+    Converte um 'naive' (gravado conforme STORE_TZ) para ISO em UTC (Z).
+    Só use se for realmente necessário serializar para logs/depuração.
+    """
+    if db_naive.tzinfo is not None:
+        aware = db_naive
+    else:
+        if STORE_TZ == "LOCAL":
+            brt = timezone(timedelta(seconds=LOCAL_TZ_OFFSET_SEC))
+            aware = db_naive.replace(tzinfo=brt)
+        else:
+            aware = db_naive.replace(tzinfo=timezone.utc)
+    return aware.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 # =============================================================================
@@ -130,76 +216,69 @@ mpu_buf: List[Tuple[Any, ...]] = []
 opc_lock = threading.Lock()
 mpu_lock = threading.Lock()
 
-def _utcnow() -> datetime:
-    """
-    Retorna agora em UTC já com o offset de DEV aplicado.
-    Use DEV_TIME_OFFSET_SEC=-10800 para "-3h".
-    """
-    return datetime.now(TZ_UTC) + timedelta(seconds=DEV_TIME_OFFSET_SEC)
-
-def _utc_iso(dt: datetime) -> str:
-    return dt.astimezone(TZ_UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
-
 
 # =============================================================================
-# OPC-UA (subscription se possível; fallback pra polling)
+# OPC-UA (polling contínuo; subscription opcional removida)
 # =============================================================================
-class _OPCHandler:  # callback para subscription
+class _OPCHandler:  # mantido apenas se você decidir reativar subscription depois
     def __init__(self, node_map: Dict[str, Any], name_by_nodeid: Dict[str, str]):
         self.node_map = node_map
         self.name_by_nodeid = name_by_nodeid
 
     def datachange_notification(self, node, val, data):
-        # Mapear para nosso esquema (assumimos booleano; se numérico, converta)
+        # Caso volte a usar subscription, o timestamp também deve ser o _now_for_db()
         try:
             nodeid = str(node.nodeid)  # "ns=2;i=10853" etc
             name = self.name_by_nodeid.get(nodeid) or nodeid
-            vbool = None
-            if isinstance(val, (bool, int)):
-                vbool = 1 if bool(val) else 0
-            elif isinstance(val, float):
-                # heurística: >0.5 = 1
-                vbool = 1 if val >= 0.5 else 0
+            vbool = _to_vbool(val)
 
-            ts = _utcnow()
+            ts = _now_for_db()
             with opc_lock:
                 opc_buf.append((name, vbool, ts))
 
-            # hot-path pro backend
+            # hot-path pro backend — agora com epoch ms correto
             if vbool is not None:
-                push_bit_update(name, bool(vbool), ts_ms=int(ts.timestamp() * 1000))
+                ts_ms = _epoch_ms_from_local_naive(ts) if STORE_TZ == "LOCAL" else int(
+                    ts.replace(tzinfo=timezone.utc).timestamp() * 1000
+                )
+                push_bit_update(name, bool(vbool), ts_ms=ts_ms)
         except Exception:
             pass
 
 
 def opc_thread():
+    """
+    OPC em modo *polling-contínuo* (sem subscription).
+    Lê TODAS as tags da lista a cada OPC_POLL_MS e empilha no buffer,
+    independentemente de mudança de valor.
+    """
     if OPCClient is None:
         print("[OPC] python-opcua não instalado; pulando OPC.", file=sys.stderr)
         return
 
-    print(f"[OPC] Conectando a {OPC_ENDPOINT} ...")
-    client = OPCClient(OPC_ENDPOINT, timeout=4)
-    sub = None
-    subs_created = False
+    poll_ms = max(10, OPC_POLL_MS)  # mínimo 10ms
+    print(f"[OPC] Polling contínuo habilitado: {poll_ms} ms")
 
-    # carregar CSV com colunas: name,nodeid  (aceita cabeçalho)
+    # carregar CSV com colunas: name,nodeid (aceita cabeçalho)
     node_rows: List[Tuple[str, str]] = []
     try:
         with open(OPC_NODES_CSV, "r", newline="", encoding="utf-8") as f:
             rd = csv.DictReader(f)
-            if "name" in rd.fieldnames and "nodeid" in rd.fieldnames:
+            if rd.fieldnames and "name" in rd.fieldnames and "nodeid" in rd.fieldnames:
                 for r in rd:
-                    nm = r["name"].strip()
-                    nid = r["nodeid"].strip()
+                    nm = (r.get("name") or "").strip()
+                    nid = (r.get("nodeid") or "").strip()
                     if nm and nid:
                         node_rows.append((nm, nid))
             else:
-                # fallback sem cabeçalho
                 f.seek(0)
                 rd2 = csv.reader(f)
                 for row in rd2:
                     if len(row) >= 2:
-                        node_rows.append((row[0].strip(), row[1].strip()))
+                        nm = (row[0] or "").strip()
+                        nid = (row[1] or "").strip()
+                        if nm and nid:
+                            node_rows.append((nm, nid))
     except Exception as e:
         print(f"[OPC] Falha lendo CSV {OPC_NODES_CSV}: {e}", file=sys.stderr)
 
@@ -207,85 +286,79 @@ def opc_thread():
         print("[OPC] Nenhum node configurado (CSV vazio).", file=sys.stderr)
         return
 
-    name_by_nodeid: Dict[str, str] = {}
-    node_map: Dict[str, Any] = {}
-
-    try:
-        client.connect()
-        print("[OPC] conectado.")
-        # cria objetos Node
-        for (name, nodeid) in node_rows:
-            try:
-                node = client.get_node(nodeid)
-                node_map[name] = node
-                name_by_nodeid[str(node.nodeid)] = name
-            except Exception as e:
-                print(f"[OPC] Falha get_node({nodeid}): {e}", file=sys.stderr)
-
-        # tenta assinatura
+    client = None
+    while not shutdown_flag.is_set():
         try:
-            handler = _OPCHandler(node_map, name_by_nodeid)
-            sub = client.create_subscription(200, handler)  # 200ms publishing
-            for (_, nodeid) in node_rows:
-                try:
-                    sub.subscribe_data_change(client.get_node(nodeid))
-                except Exception:
-                    pass
-            subs_created = True
-            print("[OPC] Subscription criada.")
-        except Exception as e:
-            print(f"[OPC] Subscription indisponível: {e}. Usando polling...", file=sys.stderr)
-            subs_created = False
+            # Conecta
+            print(f"[OPC] Conectando a {OPC_ENDPOINT} ...")
+            client = OPCClient(OPC_ENDPOINT, timeout=4)
+            client.connect()
+            print("[OPC] conectado.")
 
-        # loop principal: se sem subscription, faz polling
-        last_print = 0
-        while not shutdown_flag.is_set():
-            if not subs_created:
-                # polling
-                for (name, nid) in node_rows:
+            # Instancia objetos Node (uma vez por conexão)
+            nodes: List[Tuple[str, Any]] = []
+            for (name, nodeid) in node_rows:
+                try:
+                    node = client.get_node(nodeid)
+                    nodes.append((name, node))
+                except Exception as e:
+                    print(f"[OPC] get_node({nodeid}) falhou: {e}", file=sys.stderr)
+
+            if not nodes:
+                print("[OPC] Nenhum node válido após get_node(); abortando.", file=sys.stderr)
+                return
+
+            # Loop de polling contínuo
+            next_deadline = time.perf_counter()
+            while not shutdown_flag.is_set():
+                ts = _now_for_db()
+                # Lê todos os nodes e empilha no buffer
+                for (name, node) in nodes:
                     try:
-                        node = client.get_node(nid)
                         val = node.get_value()
-                        ts = _utcnow()
-                        if isinstance(val, (bool, int)):
-                            vbool = 1 if bool(val) else 0
-                        elif isinstance(val, float):
-                            vbool = 1 if val >= 0.5 else 0
-                        else:
-                            vbool = None
+                        vbool = _to_vbool(val)
+
+                        # Log dedicado para depuração (defina OPC_WATCH="S1_OPEN,S1_CLOSE" no .env)
+                        if name in OPC_WATCH:
+                            print(f"[OPC][{name}] raw={repr(val)}({type(val).__name__}) -> vbool={vbool}")
+
                         with opc_lock:
                             opc_buf.append((name, vbool, ts))
-                        if vbool is not None:
-                            push_bit_update(name, bool(vbool), ts_ms=int(ts.timestamp() * 1000))
+
+                        # Opcional: alerta ocasional quando vbool=None (evita flood)
+                        if vbool is None:
+                            if (hash(name) ^ int(time.time())) % 50 == 0:
+                                print(f"[OPC][warn] {name} -> vbool=None (raw={repr(val)})")
+
+                        # Importante: NÃO chamar push_bit_update a cada amostra de polling
+                        # (se precisar hot-path, reative apenas em mudança e usando _epoch_ms_from_local_naive)
                     except Exception:
-                        # ignora pontual
+                        # falha pontual de leitura: ignora e segue
                         pass
-                time.sleep(OPC_POLL_MS / 1000.0)
-            else:
-                # subscription -> apenas dorme curto
-                time.sleep(0.05)
 
-            last_print += 1
-            if last_print % 200 == 0:
-                with opc_lock:
-                    n = len(opc_buf)
-                print(f"[OPC] buffer={n}")
+                # Espera até o próximo slot (mantém a cadência)
+                next_deadline += poll_ms / 1000.0
+                delay = next_deadline - time.perf_counter()
+                if delay > 0:
+                    time.sleep(delay)
+                else:
+                    # se ficou atrasado, realinha pro próximo tick
+                    next_deadline = time.perf_counter()
 
-    except KeyboardInterrupt:
-        pass
-    except Exception as e:
-        print(f"[OPC] erro geral: {e}", file=sys.stderr)
-    finally:
-        try:
-            if sub:
-                sub.delete()
-        except Exception:
-            pass
-        try:
-            client.disconnect()
-        except Exception:
-            pass
-        print("[OPC] finalizado.")
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            print(f"[OPC] erro geral (reconectar em 2s): {e}", file=sys.stderr)
+            time.sleep(2.0)
+        finally:
+            try:
+                if client:
+                    client.disconnect()
+            except Exception:
+                pass
+            client = None
+
+    print("[OPC] finalizado.")
 
 
 # =============================================================================
@@ -303,6 +376,7 @@ def _auto_serial_port(default: str) -> str:
         return names[0] if names else default
     except Exception:
         return default
+
 
 def mpu_thread():
     if serial is None:
@@ -329,13 +403,16 @@ def mpu_thread():
                 if not s:
                     continue
                 obj = json.loads(s)
-                # esperado: {"id":"MPUA1","ax":..,"ay":..,"az":..} etc (em g)
+                # esperado: {"id":"MPUA1","ax":..,"ay":..,"az":..,"gx":..,"gy":..,"gz":..}
                 mpu_id = obj.get("id") or obj.get("mpu_id") or obj.get("sensor")
                 if isinstance(mpu_id, str):
-                    # normaliza "MPUA1" / "MPUA2" -> 1 / 2
-                    mpu_id_norm = 1 if mpu_id.upper().endswith("A1") else 2 if mpu_id.upper().endswith("A2") else None
+                    up = mpu_id.upper()
+                    mpu_id_norm = 1 if up.endswith("A1") else 2 if up.endswith("A2") else None
                 else:
                     mpu_id_norm = int(mpu_id) if mpu_id is not None else None
+
+                if mpu_id_norm not in (1, 2):
+                    continue
 
                 ax = float(obj.get("ax") or obj.get("ax_g") or 0.0)
                 ay = float(obj.get("ay") or obj.get("ay_g") or 0.0)
@@ -344,14 +421,12 @@ def mpu_thread():
                 gy = float(obj.get("gy") or obj.get("gy_dps") or 0.0)
                 gz = float(obj.get("gz") or obj.get("gz_dps") or 0.0)
 
-                # também aceitamos "actuator_id"
-                actuator_id = obj.get("actuator_id")
-                if actuator_id is None and mpu_id_norm in (1, 2):
-                    actuator_id = mpu_id_norm
+                # timestamp "naive" conforme STORE_TZ (LOCAL/UTC)
+                ts = _now_for_db()
 
-                ts = _utcnow()
                 with mpu_lock:
-                    mpu_buf.append((actuator_id, ts, ax, ay, az, gx, gy, gz))
+                    # ordem: ts, mpu_id, ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps
+                    mpu_buf.append((ts, mpu_id_norm, ax, ay, az, gx, gy, gz))
 
             except Exception:
                 # linha inválida, ignore
@@ -383,7 +458,7 @@ VALUES (%s, %s, %s)
 """
 
 SQL_MPU = f"""
-INSERT INTO {MPU_TABLE} (actuator_id, ts_utc, ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps)
+INSERT INTO {MPU_TABLE} (ts_utc, mpu_id, ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps)
 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
 """
 
@@ -433,8 +508,9 @@ def main():
     print(f"OPC: {OPC_ENDPOINT} | CSV: {OPC_NODES_CSV}")
     print(f"SER: {SERIAL_PORT} @ {SERIAL_BAUD}")
     print(f"Flush: {FLUSH_MS} ms | Batch: {BATCH_MAX}")
+    print(f"STORE_TZ={STORE_TZ} | LOCAL_TZ_OFFSET_SEC={LOCAL_TZ_OFFSET_SEC}")
     if DEV_TIME_OFFSET_SEC:
-        print(f"[TIME] DEV_TIME_OFFSET_SEC={DEV_TIME_OFFSET_SEC} (aplicado a ts_utc)")
+        print(f"[TIME] DEV_TIME_OFFSET_SEC={DEV_TIME_OFFSET_SEC} (aplicado em _now_for_db)")
 
     # sinais
     for sig in (signal.SIGINT, signal.SIGTERM):
