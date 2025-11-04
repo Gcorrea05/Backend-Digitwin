@@ -295,16 +295,16 @@ class _LatchState:
 # CFGs (NÃO ALTERAR CONFORME PEDIDO)
 # -----------------------------------------------------------------------------
 _CFG_A1 = _LatchCfg(
-    id="A1", expected_ms=1500, debounce_ms=80, timeout_factor=1.5,
-    v_av="V1_14", v_rec="V1_12",
-    s_rec="Recuado_1S1",  # (mantido conforme arquivo original)
-    s_adv="Avancado_1S2",
+    id="A1", expected_ms=500, debounce_ms=80, timeout_factor=1.5,
+    v_rec="V1_14", v_av="V1_12",
+    s_adv="Recuado_1S1",  # (mantido conforme arquivo original)
+    s_rec="Avancado_1S2",
 )
 _CFG_A2 = _LatchCfg(
     id="A2", expected_ms=500, debounce_ms=80, timeout_factor=1.5,
-    v_av="V2_14", v_rec="V2_12",
-    s_rec="Recuado_2S1",
-    s_adv="Avancado_2S2",
+    v_rec="V2_14", v_av="V2_12",
+    s_adv="Recuado_2S1",
+    s_rec="Avancado_2S2",
 )
 
 # -----------------------------------------------------------------------------
