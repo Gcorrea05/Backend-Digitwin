@@ -6,7 +6,7 @@ import math
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
-from typing import Optional, List, Any, Dict, Tuple, Deque
+from typing import Optional, List, Any, Dict, Iterable, Tuple, Deque
 import json
 
 from dotenv import load_dotenv, find_dotenv
@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse
 from mysql.connector.errors import PoolError
 from collections import deque
 from hashlib import sha1
+from bisect import bisect_right  # <-- novo (para a lógica de platôs)
 
 # -----------------------------------------------------------------------------
 # .env
@@ -68,7 +69,7 @@ SLOW_TICK_MS       = int(os.getenv("SLOW_TICK_MS", "60000"))
 WS_BUFFER_MAX      = int(os.getenv("WS_BUFFER_MAX", "500"))
 WS_HEARTBEAT_MS    = int(os.getenv("WS_HEARTBEAT_MS", "10000"))
 
-# Timings robustos (debounce + min/max)
+# Timings robustos (parâmetros usados por outras heurísticas; mantidos por compat)
 MON_TIMING_WINDOW_S = int(os.getenv("MON_TIMING_WINDOW_S", "60"))
 MON_DEBOUNCE_MS     = int(os.getenv("MON_DEBOUNCE_MS", "80"))
 MON_MIN_OPEN_MS     = int(os.getenv("MON_MIN_OPEN_MS", "80"))
@@ -102,7 +103,7 @@ def _coerce_to_datetime(v: Any) -> Optional[datetime]:
     if v is None:
         return None
     if isinstance(v, datetime):
-        return v
+        return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
     if isinstance(v, (int, float)):
         return datetime.fromtimestamp(float(v), tz=timezone.utc)
     s = str(v).strip()
@@ -313,6 +314,10 @@ def _fetch_latest_rows(names: Tuple[str, ...]) -> Dict[str, Dict[str, Any]]:
     return out
 
 def _fetch_series(names: List[str], window_s: int) -> Dict[str, List[Tuple[datetime,int]]]:
+    """
+    Lê séries históricas do opc_samples (tabela), janela relativa (UTC),
+    ordenado ASC. (Use apenas se seus ts_utc forem de fato UTC.)
+    """
     if not names:
         return {}
     placeholders = ", ".join(["%s"] * len(names))
@@ -327,10 +332,12 @@ def _fetch_series(names: List[str], window_s: int) -> Dict[str, List[Tuple[datet
     series: Dict[str, List[Tuple[datetime,int]]] = {}
     for name, vbool, ts in rows:
         series.setdefault(str(name), []).append((_coerce_to_datetime(ts) or datetime.now(timezone.utc), int(vbool or 0)))
+    for n in names:
+        series.setdefault(n, [])
     return series
 
 # -----------------------------------------------------------------------------
-# Helpers de séries / bordas com estabilidade (debounce)
+# Fallbacks/validações antigos (mantidos por compat para CPM etc.)
 # -----------------------------------------------------------------------------
 def _validated_edges(series: List[Tuple[datetime,int]], debounce_ms: int) -> Dict[str, List[datetime]]:
     rises: List[datetime] = []
@@ -348,7 +355,6 @@ def _validated_edges(series: List[Tuple[datetime,int]], debounce_ms: int) -> Dic
             hold_ms = 10_000.0
         else:
             hold_ms = (ts_next - ts).total_seconds() * 1000.0
-
         if hold_ms is None or hold_ms >= debounce_ms:
             if v_prev == 0 and v == 1:
                 rises.append(ts)
@@ -356,267 +362,270 @@ def _validated_edges(series: List[Tuple[datetime,int]], debounce_ms: int) -> Dic
                 falls.append(ts)
     return {"rises": rises, "falls": falls}
 
-def _pick_last_pair(dt_min_ms: int, dt_max_ms: int,
-                    starts: List[datetime], ends: List[datetime]) -> Optional[float]:
-    if not starts or not ends:
-        return None
-    j = len(starts) - 1
-    for i in range(len(ends)-1, -1, -1):
-        t_end = ends[i]
-        while j >= 0 and starts[j] > t_end:
-            j -= 1
-        if j < 0:
-            break
-        t_start = starts[j]
-        dt_ms = (t_end - t_start).total_seconds() * 1000.0
-        if dt_ms >= dt_min_ms and dt_ms <= dt_max_ms:
-            return dt_ms / 1000.0
-    return None
-
 # -----------------------------------------------------------------------------
-# Fallback herdado (versão antiga) — apenas para casos em que dt_* ficou None
+# >>> NOVO: Timings por "platôs" de estado (RECUADO/AVANÇADO visíveis na UI) <<<
 # -----------------------------------------------------------------------------
-def _dedup(seq: List[Tuple[datetime,int]]) -> List[Tuple[datetime,int]]:
-    """Remove repetições consecutivas (…,(t,0),(t,0),…) mantendo a última."""
+def _val_at_or_last(seq: List[Tuple[datetime, int]], t: datetime) -> int:
+    """Retorna o último valor <= t numa série [(ts, v)] ordenada ASC."""
     if not seq:
-        return seq
-    out = [seq[0]]
-    for t, v in seq[1:]:
-        if out[-1][1] != v:
-            out.append((t, v))
-        else:
-            out[-1] = (t, v)
-    return out
+        return 0
+    idx = bisect_right([x[0] for x in seq], t) - 1
+    if idx < 0:
+        return seq[0][1]
+    return seq[idx][1]
 
-def _derive_open_closed_from_S1S2(
-    s1: List[Tuple[datetime,int]],
-    s2: List[Tuple[datetime,int]],
-) -> Tuple[List[Tuple[datetime,int]], List[Tuple[datetime,int]]]:
+def _state_from_s1s2(
+    s1: List[Tuple[datetime, int]],
+    s2: List[Tuple[datetime, int]],
+) -> List[Tuple[datetime, str]]:
     """
-    Constrói duas séries booleanas:
-      - opened == 1 quando (S1=1 e S2=0)  -> movimento de ABRIR
-      - closed == 1 quando (S1=0 e S2=1)  -> movimento de FECHAR
+    Reconstrói a linha do tempo de ESTADO:
+      - 'RECUADO'  quando (S1=1, S2=0)
+      - 'AVANCADO' quando (S1=0, S2=1)
+      - 'TRANS'    nos demais casos (ambos 0 ou ambos 1)
+    Saída: [(ts, state)] ordenado por ts (apenas pontos onde o estado muda).
     """
     if not s1 and not s2:
-        return [], []
+        return []
 
-    times = sorted({t for t,_ in s1} | {t for t,_ in s2})
+    times = sorted({t for t, _ in s1} | {t for t, _ in s2})
     if not times:
-        return [], []
+        return []
 
-    def val_at(seq: List[Tuple[datetime,int]], t: datetime) -> int:
-        if not seq:
-            return 0
-        lo, hi = 0, len(seq) - 1
-        last = seq[0][1]
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            if seq[mid][0] <= t:
-                last = seq[mid][1]
-                lo = mid + 1
-            else:
-                hi = mid - 1
-        return last
-
-    opened: List[Tuple[datetime,int]] = []
-    closed: List[Tuple[datetime,int]] = []
-    prev_open: Optional[int] = None
+    out: List[Tuple[datetime, str]] = []
+    prev_state: Optional[str] = None
 
     for t in times:
-        v1 = val_at(s1, t)
-        v2 = val_at(s2, t)
+        v1 = _val_at_or_last(s1, t)
+        v2 = _val_at_or_last(s2, t)
         if v1 == 1 and v2 == 0:
-            cur_open, cur_close = 1, 0
-            prev_open = 1
+            st = "RECUADO"
         elif v1 == 0 and v2 == 1:
-            cur_open, cur_close = 0, 1
-            prev_open = 0
+            st = "AVANCADO"
         else:
-            if prev_open is None:
-                cur_open, cur_close = 0, 0
-            else:
-                cur_open = 1 if prev_open == 1 else 0
-                cur_close = 0 if prev_open == 1 else 1
-        opened.append((t, cur_open))
-        closed.append((t, cur_close))
-    return _dedup(opened), _dedup(closed)
+            st = "TRANS"
+        if st != prev_state:
+            out.append((t, st))
+            prev_state = st
 
-def _last_pulse_duration(seq: List[Tuple[datetime,int]], now_dt: Optional[datetime] = None) -> Optional[float]:
+    return out
+
+def _compress_runs(
+    states: List[Tuple[datetime, str]],
+    end_ts: Optional[datetime] = None,
+) -> List[Tuple[datetime, datetime, str]]:
     """
-    Duração do último ‘pulso’ (0→1→0). Se terminou em 1, mede até `now_dt`.
+    Comprime em segmentos estáveis (run-length):
+    Entrada:  [(t0, ST0), (t1, ST1), ..., (tn, STn)]
+    Saída:    [(start, end, ST), ...]  (end definido pelo próximo start; o último usa end_ts se passado)
     """
-    if not seq:
-        return None
-    if now_dt is None:
-        now_dt = datetime.now(timezone.utc)
-    last_on: Optional[datetime] = None
-    last_pulse: Optional[Tuple[datetime, datetime]] = None
-    for i in range(1, len(seq)):
-        if seq[i-1][1] == 0 and seq[i][1] == 1:
-            last_on = seq[i][0]
-        if seq[i-1][1] == 1 and seq[i][1] == 0 and last_on:
-            last_pulse = (last_on, seq[i][0])
-    if last_pulse:
-        t_on, t_off = last_pulse
-        return (t_off - t_on).total_seconds()
-    if seq[-1][1] == 1 and last_on:
-        return (now_dt - last_on).total_seconds()
-    return None
+    if not states:
+        return []
 
-# -----------------------------------------------------------------------------
-# Cálculo dos timings (robusto + fallback)
-# -----------------------------------------------------------------------------
-def _last_timing_for_actuator(aid: int,
-                              s1: List[Tuple[datetime, int]],
-                              s2: List[Tuple[datetime, int]]) -> Dict[str, Optional[float]]:
+    runs: List[Tuple[datetime, datetime, str]] = []
+    for i in range(len(states)):
+        t0, st = states[i]
+        t1 = states[i + 1][0] if i + 1 < len(states) else end_ts
+        if t1 is None:
+            break
+        if t1 > t0:
+            runs.append((t0, t1, st))
+    return runs
+
+def _last_plateau_timings(
+    runs: List[Tuple[datetime, datetime, str]],
+    min_plateau_s: float = 0.0,
+) -> Dict[str, Optional[float]]:
     """
-    1) Tenta calcular com bordas validadas (debounce):
-       dt_abre_s  = S1↓ -> S2↑
-       dt_fecha_s = S2↓ -> S1↑
-    2) Se qualquer um sair None, re-calcula apenas o que faltou com a
-       lógica antiga (opened/closed + last pulse).
+    Acha o último par útil de platôs consecutivos RECUADO ↔ AVANCADO e mede:
+      - dt_abre  = duração do platô RECUADO imediatamente anterior a um AVANCADO
+      - dt_fecha = duração do platô AVANCADO imediatamente anterior a um RECUADO
+      - dt_ciclo = dt_abre + dt_fecha (quando ambos existirem)
+    Ignora platôs 'TRANS'. Respeita limiar min_plateau_s (opcional).
     """
-    # --- caminho principal (bordas validadas)
-    edges1 = _validated_edges(s1, MON_DEBOUNCE_MS)
-    edges2 = _validated_edges(s2, MON_DEBOUNCE_MS)
+    if not runs:
+        return {"dt_abre_s": None, "dt_fecha_s": None, "dt_ciclo_s": None}
 
-    s1_falls = edges1["falls"]   # 1→0
-    s1_rises = edges1["rises"]   # 0→1
-    s2_falls = edges2["falls"]   # 1→0
-    s2_rises = edges2["rises"]   # 0→1
+    last_dt_abre: Optional[float] = None
+    last_dt_fecha: Optional[float] = None
 
-    dt_abre_s  = _pick_last_pair(MON_MIN_OPEN_MS,  MON_MAX_DT_MS, s1_falls, s2_rises)
-    dt_fecha_s = _pick_last_pair(MON_MIN_CLOSE_MS, MON_MAX_DT_MS, s2_falls, s1_rises)
+    useful = [
+        (t0, t1, st)
+        for (t0, t1, st) in runs
+        if st in ("RECUADO", "AVANCADO") and (t1 - t0).total_seconds() >= min_plateau_s
+    ]
+    if not useful:
+        return {"dt_abre_s": None, "dt_fecha_s": None, "dt_ciclo_s": None}
 
-    # --- fallback fino (só se faltou algo)
-    if dt_abre_s is None or dt_fecha_s is None:
-        opened, closed = _derive_open_closed_from_S1S2(s1, s2)
-        now_dt = datetime.now(timezone.utc)
+    # Procura do fim um padrão ... RECUADO -> AVANCADO -> RECUADO
+    for i in range(len(useful) - 2, -1, -1):
+        t0a, t1a, sta = useful[i]
+        t0b, t1b, stb = useful[i + 1]
+        if sta == "RECUADO" and stb == "AVANCADO":
+            dt_abre = (t1a - t0a).total_seconds()
+            # tenta fechar o ciclo com o próximo RECUADO
+            if i + 2 < len(useful):
+                t0c, t1c, stc = useful[i + 2]
+                if stc == "RECUADO":
+                    dt_fecha = (t1b - t0b).total_seconds()
+                    return {
+                        "dt_abre_s": round(dt_abre, 6),
+                        "dt_fecha_s": round(dt_fecha, 6),
+                        "dt_ciclo_s": round(dt_abre + dt_fecha, 6),
+                    }
+            # se não houver RECUADO seguinte, ainda assim guardamos o dt_abre
+            last_dt_abre = dt_abre
+            break
 
-        if dt_abre_s is None:
-            v = _last_pulse_duration(opened, now_dt=now_dt)
-            if v is not None:
-                ms = v * 1000.0
-                if MON_MIN_OPEN_MS <= ms <= MON_MAX_DT_MS:
-                    dt_abre_s = round(v, 6)
+    # Se não formou ciclo, tenta pegar o último AVANCADO -> RECUADO (para dt_fecha)
+    for i in range(len(useful) - 2, -1, -1):
+        t0a, t1a, sta = useful[i]
+        t0b, t1b, stb = useful[i + 1]
+        if sta == "AVANCADO" and stb == "RECUADO":
+            last_dt_fecha = (t1a - t0a).total_seconds()
+            break
 
-        if dt_fecha_s is None:
-            v = _last_pulse_duration(closed, now_dt=now_dt)
-            if v is not None:
-                ms = v * 1000.0
-                if MON_MIN_CLOSE_MS <= ms <= MON_MAX_DT_MS:
-                    dt_fecha_s = round(v, 6)
+    return {
+        "dt_abre_s": round(last_dt_abre, 6) if last_dt_abre is not None else None,
+        "dt_fecha_s": round(last_dt_fecha, 6) if last_dt_fecha is not None else None,
+        "dt_ciclo_s": (
+            round(last_dt_abre + last_dt_fecha, 6)
+            if (last_dt_abre is not None and last_dt_fecha is not None)
+            else None
+        ),
+    }
 
-    dt_ciclo_s: Optional[float] = None
-    if dt_abre_s is not None and dt_fecha_s is not None:
-        dt_ciclo_s = dt_abre_s + dt_fecha_s
-
-    return {"dt_abre_s": dt_abre_s, "dt_fecha_s": dt_fecha_s, "dt_ciclo_s": dt_ciclo_s}
+def _timings_from_plateaus(
+    s1_series: List[Tuple[datetime, int]],
+    s2_series: List[Tuple[datetime, int]],
+    end_ts: Optional[datetime] = None,
+    min_plateau_s: float = 0.2,   # ajuste fino anti-glitch
+) -> Dict[str, Optional[float]]:
+    """
+    Calcula dt_abre/dt_fecha/dt_ciclo a partir de PLATÔs (tempo visível em cada estado).
+    - dt_abre  = duração do platô RECUADO imediatamente antes de AVANCADO
+    - dt_fecha = duração do platô AVANCADO imediatamente antes de RECUADO
+    - dt_ciclo = soma dos dois quando obtidos do mesmo bloco consecutivo
+    """
+    if end_ts is None:
+        end_ts = datetime.utcnow().replace(tzinfo=timezone.utc)
+    states = _state_from_s1s2(s1_series, s2_series)
+    runs = _compress_runs(states, end_ts=end_ts)
+    return _last_plateau_timings(runs, min_plateau_s=min_plateau_s)
 
 # -----------------------------------------------------------------------------
 # >>> VIBRAÇÃO (RMS por eixo + overall) conforme tabela atual (mpu_id/ts_utc) <<<
 # -----------------------------------------------------------------------------
-def _fetch_mpu_window(window_s: int, conn_like=None) -> List[Tuple[int, float, float, float]]:
+def fetch_mpu_window_local(window_s: int, tz_offset_sec: int = -10800):
     """
-    Lê amostras do MPU na janela recente (ts_utc >= UTC_TIMESTAMP(6)-window_s).
-    Retorna [(mpu_id, ax_g, ay_g, az_g), ...]
+    Lê mpu_samples assumindo ts_utc gravado em UTC-3.
+    A janela é (UTC_TIMESTAMP() + offset) - window_s.
+    Retorna [{"mpu_id": mid, "overall": último_overall}, ...]
     """
-    c, created = _ensure_mysql_connection(conn_like)
-    try:
-        cur = c.cursor()
-        cur.execute(f"""
-        SELECT mpu_id, ax_g, ay_g, az_g
-        FROM {MPU_TABLE}
-        WHERE ts_utc >= (UTC_TIMESTAMP(6) - INTERVAL %s SECOND)
-        ORDER BY ts_utc ASC
-        """, (int(window_s),))
-        rows = cur.fetchall() or []
-        out: List[Tuple[int, float, float, float]] = []
-        for mpu_id, ax_g, ay_g, az_g in rows:
-            out.append((int(mpu_id), float(ax_g or 0.0), float(ay_g or 0.0), float(az_g or 0.0)))
-        return out
-    finally:
-        try: cur.close()
-        except Exception: pass
-        if created:
-            try: c.close()
-            except Exception: pass
+    sql = """
+    SELECT ts_utc, mpu_id, ax_g, ay_g, az_g
+    FROM mpu_samples
+    WHERE ts_utc >= (UTC_TIMESTAMP() + INTERVAL %s SECOND) - INTERVAL %s SECOND
+      AND mpu_id IN (1,2)
+    ORDER BY ts_utc
+    """
+    rows = fetch_all(sql, (tz_offset_sec, window_s)) or []
+
+    by_id: Dict[int, List[Dict[str, Any]]] = {}
+    for ts, mid, ax, ay, az in rows:
+        try:
+            overall = (float(ax)*float(ax) + float(ay)*float(ay) + float(az)*float(az)) ** 0.5
+        except Exception:
+            continue
+        mid = int(mid)
+        by_id.setdefault(mid, []).append({"ts": ts, "overall": overall})
+
+    out = []
+    for mid in sorted(by_id.keys()):
+        serie = by_id[mid]
+        out.append({"mpu_id": mid, "overall": serie[-1]["overall"] if serie else None})
+    return out
 
 def _vibration_items(window_s: int) -> List[Dict[str, float]]:
     """
-    Calcula RMS por eixo e overall por sensor na janela dada.
-    overall = sqrt(RMSx^2 + RMSy^2 + RMSz^2)
-    Retorna: [{"mpu_id": <int>, "overall": <float>}, ...]
+    Calcula overall por sensor na janela dada.
+    Usa fetch_mpu_window_local (ajuste UTC-3 apenas para MPU).
     """
-    rows = _fetch_mpu_window(window_s, "ENV")
+    rows = fetch_mpu_window_local(window_s, -10800)
     if not rows:
         return []
-    by: Dict[int, Dict[str, List[float]]] = {}
-    for mpu_id, ax, ay, az in rows:
-        d = by.setdefault(int(mpu_id), {"ax": [], "ay": [], "az": []})
-        d["ax"].append(ax); d["ay"].append(ay); d["az"].append(az)
-
-    items: List[Dict[str, float]] = []
-    for mpu_id, d in by.items():
-        def _rms(vals: List[float]) -> float:
-            n = max(1, len(vals))
-            return (sum(v*v for v in vals) / n) ** 0.5
-        rms_ax = _rms(d["ax"])
-        rms_ay = _rms(d["ay"])
-        rms_az = _rms(d["az"])
-        overall = float((rms_ax*rms_ax + rms_ay*rms_ay + rms_az*rms_az) ** 0.5)
-        items.append({"mpu_id": int(mpu_id), "overall": overall})
-    return items
+    return rows
 
 # -----------------------------------------------------------------------------
-# Monitoring payload (com timings robustos + VIBRAÇÃO)
+# OPC histórico assumindo ts_utc gravado em UTC-3 (somente aqui)
 # -----------------------------------------------------------------------------
-def build_monitoring_payload() -> dict:
-    window_s = max(2, int(os.getenv("MON_TIMING_WINDOW_S", str(MON_TIMING_WINDOW_S))))
+def fetch_opc_window_local(window_s: int, tz_offset_sec: int = -10800):
+    """
+    Lê opc_samples assumindo que ts_utc foi gravado em UTC-3.
+    Janela: (UTC_TIMESTAMP() + offset) - window_s.
+    Retorna {1: {'s1': [(ts,v)...], 's2': [...]}, 2: {...}}.
+    """
+    names = (
+        'Recuado_1S1','Avancado_1S2',
+        'Recuado_2S1','Avancado_2S2',
+    )
+    placeholders = ','.join(['%s'] * len(names))
+    sql = f"""
+    SELECT name, CAST(value_bool AS UNSIGNED) AS v, ts_utc
+    FROM opc_samples
+    WHERE name IN ({placeholders})
+      AND ts_utc >= (UTC_TIMESTAMP() + INTERVAL %s SECOND) - INTERVAL %s SECOND
+    ORDER BY ts_utc
+    """
+    rows = fetch_all(sql, (*names, tz_offset_sec, window_s)) or []
 
-    a1_s1, a1_s2 = _facet_names(_CFG_A1)
-    a2_s1, a2_s2 = _facet_names(_CFG_A2)
+    out = {1: {'s1': [], 's2': []}, 2: {'s1': [], 's2': []}}
+    for name, v, ts in rows:
+        v = 1 if int(v) else 0
+        ts_dt = _coerce_to_datetime(ts) or datetime.now(timezone.utc)  # <-- garantir tz-aware
+        if   name == 'Recuado_1S1':  out[1]['s1'].append((ts_dt, v))
+        elif name == 'Avancado_1S2': out[1]['s2'].append((ts_dt, v))
+        elif name == 'Recuado_2S1':  out[2]['s1'].append((ts_dt, v))
+        elif name == 'Avancado_2S2': out[2]['s2'].append((ts_dt, v))
+    return out
 
-    names = [a1_s1, a1_s2, a2_s1, a2_s2]
-    series = _fetch_series(names, window_s)
+# -----------------------------------------------------------------------------
+# Monitoring payload (PLATÔs + vibração)
+# -----------------------------------------------------------------------------
+def build_monitoring_payload(window_s: int = 60):
+    """
+    Monitoring:
+      - OPC histórico (UTC-3) -> items + timings (PLATÔs)
+      - MPU histórico (UTC-3, curto) -> vibration.items (window_s=2)
+    Não altera o 'Live'.
+    """
+    # OPC (UTC-3 apenas nesta leitura histórica)
+    opc = fetch_opc_window_local(window_s=window_s, tz_offset_sec=-10800)
 
-    a1_last = _last_timing_for_actuator(1, series.get(a1_s1, []), series.get(a1_s2, []))
-    a2_last = _last_timing_for_actuator(2, series.get(a2_s1, []), series.get(a2_s2, []))
+    # MPU (UTC-3 apenas nesta leitura histórica curta)
+    vib_items = _vibration_items(2)
 
-    ref_ts = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+    items = [
+        {"id": 1, "s1": opc[1]["s1"], "s2": opc[1]["s2"]},
+        {"id": 2, "s1": opc[2]["s1"], "s2": opc[2]["s2"]},
+    ]
 
-    # vibração tolerante a erro
-    vib_window = int(os.getenv("MON_VIB_WINDOW_S", str(MON_VIB_WINDOW_S)))
-    try:
-        vib_items = _vibration_items(vib_window)
-    except Exception as e:
-        print(f"[monitoring] vibration calc failed: {e}")
-        vib_items = []
+    timings = []
+    for aid in (1, 2):
+        last = _timings_from_plateaus(
+            opc[aid]["s1"], opc[aid]["s2"],
+            end_ts=datetime.utcnow().replace(tzinfo=timezone.utc),
+            min_plateau_s=0.2,
+        )
+        timings.append({"actuator_id": aid, "last": last})
 
     return {
         "type": "monitoring",
-        "ref_ts": ref_ts,
-        "window_s": window_s,
-        "items": [
-            {
-                "id": 1,
-                "s1": [(ts.isoformat(), v) for (ts, v) in series.get(a1_s1, [])],
-                "s2": [(ts.isoformat(), v) for (ts, v) in series.get(a1_s2, [])],
-            },
-            {
-                "id": 2,
-                "s1": [(ts.isoformat(), v) for (ts, v) in series.get(a2_s1, [])],
-                "s2": [(ts.isoformat(), v) for (ts, v) in series.get(a2_s2, [])],
-            },
-        ],
-        "timings": [
-            {"actuator_id": 1, "last": a1_last},
-            {"actuator_id": 2, "last": a2_last},
-        ],
-        "vibration": {
-            "window_s": vib_window,
-            "items": vib_items,   # [{mpu_id, overall}]
-        },
+        "ref_ts": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(),
+        "window_s": int(window_s),
+        "items": items,
+        "timings": timings,
+        "vibration": {"window_s": 2, "items": vib_items},
     }
 
 # -----------------------------------------------------------------------------
@@ -624,19 +633,12 @@ def build_monitoring_payload() -> dict:
 # -----------------------------------------------------------------------------
 @app.get("/api/live/actuators/timings")
 async def api_live_actuators_timings(window_s: int = Query(60, ge=5, le=3600)):
-    prev = os.getenv("MON_TIMING_WINDOW_S")
     try:
-        os.environ["MON_TIMING_WINDOW_S"] = str(window_s)
-        snap = build_monitoring_payload()
+        snap = build_monitoring_payload(window_s=window_s)
         return {"ts": snap.get("ref_ts"), "timings": snap.get("timings", [])}
     except Exception as e:
         print(f"[/api/live/actuators/timings] error: {e}")
         raise HTTPException(status_code=500, detail=f"erro ao montar timings: {e}")
-    finally:
-        if prev is not None:
-            os.environ["MON_TIMING_WINDOW_S"] = prev
-        else:
-            os.environ.pop("MON_TIMING_WINDOW_S", None)
 
 # -----------------------------------------------------------------------------
 # LIVE fast-paths
@@ -829,19 +831,29 @@ def _cpm_from_edges(window_s: int,
     cpm = advances * (60.0 / float(window_s))
     return round(cpm, 2)
 
+
 def build_cpm_payload(window_s: Optional[int] = None) -> dict:
     """
     Monta payload {type:'cpm', window_s, items:[{actuator_id, cpm}, ...]}.
-    Usa as mesmas séries do monitoring.
+
+    *** Importante ***
+    Agora lê o histórico via fetch_opc_window_local(...) com tz_offset_sec=-10800
+    (UTC-3), mantendo consistência com o Monitoring. Assim evitamos janela vazia
+    quando os ts_utc do banco estão em UTC-3.
     """
     w = int(window_s or MON_CPM_WINDOW_S)
-    a1_s1, a1_s2 = _facet_names(_CFG_A1)
-    a2_s1, a2_s2 = _facet_names(_CFG_A2)
-    names = [a1_s1, a1_s2, a2_s1, a2_s2]
-    series = _fetch_series(names, w)
 
-    cpm1 = _cpm_from_edges(w, series.get(a1_s1, []), series.get(a1_s2, []))
-    cpm2 = _cpm_from_edges(w, series.get(a2_s1, []), series.get(a2_s2, []))
+    # Usa a mesma leitura do Monitoring (UTC-3 no banco)
+    opc = fetch_opc_window_local(window_s=w, tz_offset_sec=-10800)
+
+    # Conta subidas validadas (0→1) de S2 (estado AVANÇADO) como 1 ciclo
+    def _cpm_from_s2(series_s2: List[Tuple[datetime, int]]) -> float:
+        e2 = _validated_edges(series_s2, MON_DEBOUNCE_MS)
+        advances = len(e2["rises"])
+        return round(advances * (60.0 / float(w)), 2)
+
+    cpm1 = _cpm_from_s2(opc[1]["s2"])
+    cpm2 = _cpm_from_s2(opc[2]["s2"])
 
     return {
         "type": "cpm",
@@ -852,7 +864,6 @@ def build_cpm_payload(window_s: Optional[int] = None) -> dict:
             {"actuator_id": 2, "cpm": cpm2},
         ],
     }
-
 # -----------------------------------------------------------------------------
 # WebSocket infra (buffer limitado = backpressure)
 # -----------------------------------------------------------------------------
@@ -962,24 +973,31 @@ async def monitoring_producer_loop():
         await asyncio.sleep(max(0, next_t - time.perf_counter()))
 
 async def slow_producer_loop():
-    period = max(1.0, SLOW_TICK_MS / 1000.0)
+    period = max(1.0, SLOW_TICK_MS / 1000.0)        # cadência do “slow”
+    cpm_period = max(2.0, int(os.getenv("CPM_TICK_MS", "10000")) / 1000.0)  # cadência do CPM
     next_t = time.perf_counter()
+    next_cpm = time.perf_counter()  # dispara já no começo
+
     while True:
         next_t += period
         try:
-            # pacote leve (compat)
+            # pacote leve (marcador de atividade do canal)
             payload = {"type": "slow", "ts": datetime.utcnow().isoformat() + "Z"}
             WS_SLOW.buf.append(payload)
             await WS_SLOW.broadcast(json.dumps(payload))
 
-            # 🔹 NOVO: envia CPM (usado pela tela Monitoring)
-            cpm_payload = build_cpm_payload(MON_CPM_WINDOW_S)
-            WS_SLOW.buf.append(cpm_payload)
-            await WS_SLOW.broadcast(json.dumps(cpm_payload, ensure_ascii=False, default=str))
+            # envia CPM conforme cadência própria
+            now = time.perf_counter()
+            if now >= next_cpm:
+                cpm_payload = build_cpm_payload(MON_CPM_WINDOW_S)
+                WS_SLOW.buf.append(cpm_payload)
+                await WS_SLOW.broadcast(json.dumps(cpm_payload, ensure_ascii=False, default=str))
+                next_cpm = now + cpm_period
+
         except Exception as e:
             print(f"[slow_producer_loop] error: {e}")
-        await asyncio.sleep(max(0, next_t - time.perf_counter()))
 
+        await asyncio.sleep(max(0, next_t - time.perf_counter()))
 # -----------------------------------------------------------------------------
 # Startup
 # -----------------------------------------------------------------------------
@@ -1008,11 +1026,15 @@ async def api_live_snapshot():
         raise HTTPException(status_code=500, detail=f"snapshot error: {e}")
 
 @app.get("/api/monitoring/snapshot")
-async def api_monitoring_snapshot():
+def api_monitoring_snapshot(window_s: int = Query(60, ge=5, le=600)):
+    """
+    Snapshot do Monitoring. Só leitura histórica; Live permanece igual.
+    """
     try:
-        payload = build_monitoring_payload()
-        return JSONResponse(payload)
+        payload = build_monitoring_payload(window_s=window_s)
+        return payload
     except Exception as e:
+        print(f"[monitoring/snapshot] erro: {e}", flush=True)
         raise HTTPException(status_code=500, detail=f"monitoring error: {e}")
 
 # --------- HOT-PATH: collector empurra mudanças ---------
@@ -1169,44 +1191,71 @@ def _parse_since_to_seconds(s: str) -> int:
     return max(1, total or 600)
 
 @app.get("/api/mpu/history")
-async def api_mpu_history(
-    id: int = Query(..., description="mpu_id"),
-    since: str = Query("-10m"),
-    limit: int = Query(2000, ge=1, le=10000),
-    asc: int = Query(1, description="1=ASC, 0=DESC"),
+def api_mpu_history(
+    id: int = Query(..., ge=1, le=2, description="ID do MPU (1 ou 2)"),
+    since: str = Query("-10m", description="Janela relativa (ex.: -5s, -2m, -1h)"),
+    limit: int = Query(2000, ge=1, le=20000),
+    asc: int = Query(1, description="1 = ASC, 0 = DESC"),
 ):
     """
-    Compat com chamadas antigas:
-      /api/mpu/history?id=1&since=-10m&limit=2000&asc=1
+    Histórico de MPU considerando que ts_utc no banco está em UTC-3.
+    Apenas MPU usa este ajuste; nada de OPC é alterado aqui.
     """
+    def _parse_since_to_seconds_local(expr: str) -> int:
+        s = (expr or "").strip().lower()
+        if not s.startswith("-"):
+            if s.isdigit():
+                return int(s) * 60
+            raise HTTPException(status_code=400, detail="Parâmetro 'since' deve ser relativo, ex.: -10m, -5s.")
+        m = re.match(r"^-\s*(\d+)\s*([smhd])?$", s)
+        if not m:
+            raise HTTPException(status_code=400, detail="Formato inválido para 'since'. Use -5s, -2m, -1h, -1d.")
+        qty = int(m.group(1))
+        unit = (m.group(2) or "m")
+        mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+        return qty * mult
+
     try:
-        seconds = _parse_since_to_seconds(since)
-        order = "ASC" if asc else "DESC"
-        rows = fetch_all(f"""
-        SELECT ts_utc, mpu_id, ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps
-        FROM {MPU_TABLE}
-        WHERE mpu_id = %s
-          AND ts_utc >= (UTC_TIMESTAMP(6) - INTERVAL %s SECOND)
-        ORDER BY ts_utc {order}
-        LIMIT %s
-        """, (id, seconds, limit))
-        out = []
-        for ts_utc, mpu_id, ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps in rows or []:
-            out.append({
-                "ts": (_coerce_to_datetime(ts_utc) or datetime.now(timezone.utc)).isoformat(),
-                "mpu_id": int(mpu_id),
-                "ax_g": float(ax_g or 0),
-                "ay_g": float(ay_g or 0),
-                "az_g": float(az_g or 0),
-                "gx_dps": float(gx_dps or 0),
-                "gy_dps": float(gy_dps or 0),
-                "gz_dps": float(gz_dps or 0),
-            })
-        if asc and order == "DESC":
-            out.reverse()
-        return JSONResponse({"rows": out, "since_s": seconds})
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"mpu history error: {e}")
+        window_seconds = _parse_since_to_seconds_local(since)
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=400, detail="Não foi possível interpretar 'since'.")
+
+    try:
+        tz_offset_sec = int(os.getenv("LOCAL_TZ_OFFSET_SEC", "-10800"))
+    except Exception:
+        tz_offset_sec = -10800
+
+    order = "ASC" if asc else "DESC"
+
+    sql = f"""
+    SELECT ts_utc, mpu_id, ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps
+    FROM mpu_samples
+    WHERE mpu_id = %s
+      AND ts_utc >= (UTC_TIMESTAMP() + INTERVAL %s SECOND) - INTERVAL %s SECOND
+    ORDER BY ts_utc {order}
+    LIMIT %s
+    """
+
+    rows: List[Tuple[Any, ...]] = fetch_all(sql, (id, tz_offset_sec, window_seconds, limit)) or []
+
+    items = []
+    for r in rows:
+        ts, mid, ax, ay, az, gx, gy, gz = r
+        items.append({
+            "ts": ts,
+            "mpu_id": int(mid),
+            "ax_g": float(ax), "ay_g": float(ay), "az_g": float(az),
+            "gx_dps": float(gx), "gy_dps": float(gy), "gz_dps": float(gz),
+        })
+
+    return {
+        "id": id,
+        "since": since,
+        "count": len(items),
+        "items": items,
+    }
 
 @app.get("/api/db/mpu_values")
 async def api_db_mpu_values(limit: int = Query(100, ge=1, le=5000)):
@@ -1705,3 +1754,171 @@ async def api_debug_force_refresh():
         return {"ok": True, "size": len(latest)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"force refresh error: {e}")
+
+# -----------------------------------------------------------------------------
+# Simulation Catalog / Scenarios / Draw (error_catalog + error_scenarios)
+# -----------------------------------------------------------------------------
+def _json_or(v, fallback):
+    try:
+        if v is None:
+            return fallback
+        s = v if isinstance(v, str) else str(v)
+        s = s.strip()
+        if not s:
+            return fallback
+        return json.loads(s)
+    except Exception:
+        return fallback
+
+def _load_catalog() -> Dict[str, Dict[str, Any]]:
+    rows = fetch_all(
+        """
+        SELECT id, code, name, grp, severity, stop_required, description, default_actions
+        FROM error_catalog
+        ORDER BY id
+        """
+    ) or []
+    by_code: Dict[str, Dict[str, Any]] = {}
+    for (eid, code, name, grp, sev, stop_req, desc, def_actions) in rows:
+        by_code[str(code)] = {
+            "id": int(eid),                # <--- IMPORTANTE p/ sua tela
+            "code": str(code),
+            "name": name or str(code),
+            "grp": grp or "SISTEMA",
+            "severity": int(sev or 0),
+            "stop_required": int(stop_req or 0),
+            "description": desc,
+            "default_actions": _json_or(def_actions, []),
+            "scenarios": [],               # sobressalente (a UI ignora se não usar)
+        }
+    return by_code
+
+def _load_scenarios(code: Optional[str] = None) -> List[Dict[str, Any]]:
+    if code:
+        rows = fetch_all(
+            """
+            SELECT s.scenario_id, c.id AS error_id, c.code, c.name, c.grp, c.severity,
+                   s.title, s.description, s.signal_overrides, s.expected_alert, s.actions
+            FROM error_scenarios s
+            JOIN error_catalog c ON c.id = s.error_id
+            WHERE c.code = %s
+            ORDER BY s.scenario_id
+            """,
+            (code,),
+        ) or []
+    else:
+        rows = fetch_all(
+            """
+            SELECT s.scenario_id, c.id AS error_id, c.code, c.name, c.grp, c.severity,
+                   s.title, s.description, s.signal_overrides, s.expected_alert, s.actions
+            FROM error_scenarios s
+            JOIN error_catalog c ON c.id = s.error_id
+            ORDER BY s.scenario_id
+            """
+        ) or []
+
+    out: List[Dict[str, Any]] = []
+    for (sid, err_id, ccode, cname, cgrp, csev, title, desc, sig_over, exp_alert, actions) in rows:
+        out.append({
+            "scenario_id": int(sid),
+            "code": str(ccode),
+            "error": {                       # facilita o POST /draw
+                "id": int(err_id),
+                "code": str(ccode),
+                "name": cname or str(ccode),
+                "grp": cgrp or "SISTEMA",
+                "severity": int(csev or 0),
+            },
+            "title": title or f"Scenario {sid}",
+            "description": desc,
+            "signal_overrides": _json_or(sig_over, {}),
+            "expected_alert": _json_or(exp_alert, {}),
+            "actions": _json_or(actions, []),
+        })
+    return out
+
+@app.get("/api/simulation/catalog")
+async def api_simulation_catalog():
+    """
+    Retorna o catálogo a partir de error_catalog + scenarios aninhados.
+    Formato: { items: [{id, code, name, grp, severity, ...}] }
+    """
+    try:
+        by_code = _load_catalog()
+        for sc in _load_scenarios():
+            if sc["code"] in by_code:
+                by_code[sc["code"]]["scenarios"].append(sc)
+        # sua tela usa normalizeCatalog(j.items)
+        return JSONResponse({"items": list(by_code.values())})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"catalog error: {e}")
+
+@app.get("/api/simulation/scenarios")
+async def api_simulation_scenarios(code: Optional[str] = Query(default=None, description="Filtra por error code")):
+    """
+    Lista de cenários; use ?code=VIB_HIGH para filtrar.
+    """
+    try:
+        items = _load_scenarios(code.strip() if code else None)
+        return JSONResponse(items)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"scenarios error: {e}")
+
+@app.post("/api/simulation/draw")
+async def api_simulation_draw(body: Dict[str, Any] = Body(...)):
+    """
+    Gera um Scenario mínimo viável no formato esperado pela sua UI.
+    Entrada típica: { "mode": "by_code", "code": "VIB_HIGH" }
+    Resposta: conforme o tipo Scenario do front.
+    """
+    try:
+        mode = str(body.get("mode", "by_code")).strip().lower()
+        code = str(body.get("code", "")).strip() if mode == "by_code" else ""
+
+        # Busca o erro pelo code
+        if not code:
+            raise HTTPException(status_code=400, detail="Informe 'code'")
+
+        cat = _load_catalog()
+        if code not in cat:
+            raise HTTPException(status_code=404, detail=f"code '{code}' não encontrado em error_catalog")
+
+        err = cat[code]
+
+        # Pega o primeiro cenário cadastrado para esse code (se houver) para enriquecer
+        sc_list = _load_scenarios(code)
+        sc = sc_list[0] if sc_list else None
+
+        # Heurística simples para escolher atuador
+        actuator = 1 if code in ("STATE_STUCK", "CYCLE_SLOW") else 2
+        if isinstance(body.get("actuator"), int) and body["actuator"] in (1, 2):
+            actuator = int(body["actuator"])
+
+        # Monta no shape exato que sua tela espera
+        scenario = {
+            "scenario_id": str(sc["scenario_id"]) if sc else f"{code}-1",
+            "actuator": actuator,
+            "error": {
+                "id": int(err["id"]),
+                "code": err["code"],
+                "name": err["name"],
+                "grp": err["grp"],
+                "severity": int(err.get("severity") or 0),
+            },
+            "cause": (sc.get("description") if sc else err.get("description")) or "—",
+            "actions": sc["actions"] if sc and isinstance(sc.get("actions"), list) else (err.get("default_actions") or []),
+            "params": sc.get("signal_overrides", {}) if sc else {},
+            "ui": {
+                "halt_sim": True,
+                "halt_3d": False,
+                "show_popup": True,
+            },
+            "resume_allowed": True if int(err.get("stop_required") or 0) == 0 else False,
+        }
+
+        return JSONResponse(scenario)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"draw error: {e}")
+
