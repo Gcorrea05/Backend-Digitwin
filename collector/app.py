@@ -50,10 +50,10 @@ except Exception:
 load_dotenv(find_dotenv())
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
-DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
-DB_PORT = int(os.getenv("DB_PORT", "3306"))
-DB_USER = os.getenv("DB_USER", "root")
-DB_PASS = os.getenv("DB_PASS", "")
+DB_HOST = os.getenv("DB_HOST", "feierabendbier.ddns.net")
+DB_PORT = int(os.getenv("DB_PORT", "9187"))
+DB_USER = os.getenv("DB_USER", "gabs")
+DB_PASS = os.getenv("DB_PASS", "ichbinpasqualesschlampe")
 DB_NAME = os.getenv("DB_NAME", "gmdigital")
 
 OPC_ENDPOINT = os.getenv("OPC_ENDPOINT", "opc.tcp://192.168.0.40:4840")
@@ -183,7 +183,7 @@ def _mk_pool() -> MySQLConnectionPool:
         database=DB_NAME,
         autocommit=True,
         charset="utf8mb4",
-        collation="utf8mb4_0900_ai_ci",
+        collation="utf8mb4_unicode_ci",
     )
 
 DB_POOL = _mk_pool()

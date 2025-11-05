@@ -42,10 +42,10 @@ app.add_middleware(
 # DB CONFIG
 # -----------------------------------------------------------------------------
 DB_DSN = os.getenv("DB_DSN", "")
-DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
-DB_PORT = int(os.getenv("DB_PORT", "3306"))
-DB_USER = os.getenv("DB_USER", "entry")
-DB_PASS = os.getenv("DB_PASS", "root")
+DB_HOST = os.getenv("DB_HOST", "feierabendbier.ddns.net")
+DB_PORT = int(os.getenv("DB_PORT", "9187"))
+DB_USER = os.getenv("DB_USER", "gabs")
+DB_PASS = os.getenv("DB_PASS", "ichbinpasqualesschlampe")
 DB_NAME = os.getenv("DB_NAME", "gmdigital")
 DB_POOL_NAME = os.getenv("DB_POOL_NAME", "gmdigital_pool")
 DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "8"))
@@ -53,7 +53,7 @@ DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "8"))
 # ⚠️ Historico sempre em opc_samples; view opc_latest pode existir para debug
 OPC_TABLE = os.getenv("OPC_TABLE", "opc_samples")
 OPC_LATEST_VIEW = os.getenv("OPC_LATEST_VIEW", "opc_latest")
-MPU_TABLE = os.getenv("MPU_TABLE", "mpu_values")
+MPU_TABLE = os.getenv("MPU_TABLE", "mpu_samples")
 
 STORE_TZ = os.getenv("STORE_TZ", "UTC").upper()           # "UTC" ou "LOCAL"
 LOCAL_TZ_OFFSET_SEC = int(os.getenv("LOCAL_TZ_OFFSET_SEC", "-10800"))  # UTC-3
@@ -68,16 +68,23 @@ SLOW_TICK_MS       = int(os.getenv("SLOW_TICK_MS", "60000"))
 WS_BUFFER_MAX      = int(os.getenv("WS_BUFFER_MAX", "500"))
 WS_HEARTBEAT_MS    = int(os.getenv("WS_HEARTBEAT_MS", "10000"))
 
+# Timings robustos (debounce + min/max)
+MON_TIMING_WINDOW_S = int(os.getenv("MON_TIMING_WINDOW_S", "60"))
+MON_DEBOUNCE_MS     = int(os.getenv("MON_DEBOUNCE_MS", "80"))
+MON_MIN_OPEN_MS     = int(os.getenv("MON_MIN_OPEN_MS", "80"))
+MON_MIN_CLOSE_MS    = int(os.getenv("MON_MIN_CLOSE_MS", "80"))
+MON_MAX_DT_MS       = int(os.getenv("MON_MAX_DT_MS", "5000"))
+
+# 🔹 CPM (janela usada para estimar ciclos por minuto)
+MON_CPM_WINDOW_S    = int(os.getenv("MON_CPM_WINDOW_S", "60"))
+
+# 🔹 VIBRAÇÃO (janela curta para RMS/overall) — compat com “antigos”
+MON_VIB_WINDOW_S    = int(os.getenv("MON_VIB_WINDOW_S", "2"))  # 2s por padrão
+
 # -----------------------------------------------------------------------------
 # Helpers de tempo
 # -----------------------------------------------------------------------------
 def _now_for_db() -> datetime:
-    """
-    Retorna datetime 'naive' (sem tzinfo) no fuso escolhido para gravar em MySQL DATETIME.
-    - STORE_TZ == 'LOCAL'  -> usa UTC-3 (BRT)
-    - STORE_TZ == 'UTC'    -> usa UTC
-    Aplica também DEV_TIME_OFFSET_SEC (se quiser simular).
-    """
     t = datetime.utcnow()  # base em UTC
     if STORE_TZ == "LOCAL":
         t = t + timedelta(seconds=LOCAL_TZ_OFFSET_SEC)  # vai pra UTC-3
@@ -85,9 +92,6 @@ def _now_for_db() -> datetime:
     return t.replace(tzinfo=None)
 
 def _epoch_ms_from_local_naive(ts_local_naive: datetime) -> int:
-    """
-    Converte um datetime 'naive' (local se STORE_TZ=='LOCAL') para epoch ms em UTC.
-    """
     if ts_local_naive.tzinfo is not None:
         ts_utc = ts_local_naive.astimezone(timezone.utc)
         return int(ts_utc.timestamp() * 1000)
@@ -264,9 +268,6 @@ _CFG_A2 = _LatchCfg(
     s_adv="Recuado_2S1",
 )
 
-# -----------------------------------------------------------------------------
-# Mapeamento S1/S2 a partir dos nomes (regex simples)
-# -----------------------------------------------------------------------------
 def _facet_names(cfg: _LatchCfg) -> Tuple[str, str]:
     s1, s2 = None, None
     for n in (cfg.s_adv, cfg.s_rec):
@@ -329,25 +330,268 @@ def _fetch_series(names: List[str], window_s: int) -> Dict[str, List[Tuple[datet
     return series
 
 # -----------------------------------------------------------------------------
-# Monitoring payload
+# Helpers de séries / bordas com estabilidade (debounce)
+# -----------------------------------------------------------------------------
+def _validated_edges(series: List[Tuple[datetime,int]], debounce_ms: int) -> Dict[str, List[datetime]]:
+    rises: List[datetime] = []
+    falls: List[datetime] = []
+    if not series:
+        return {"rises": rises, "falls": falls}
+
+    for i in range(1, len(series)):
+        ts, v = series[i]
+        ts_prev, v_prev = series[i-1]
+        if v == v_prev:
+            continue
+        ts_next = series[i+1][0] if i+1 < len(series) else None
+        if ts_next is None:
+            hold_ms = 10_000.0
+        else:
+            hold_ms = (ts_next - ts).total_seconds() * 1000.0
+
+        if hold_ms is None or hold_ms >= debounce_ms:
+            if v_prev == 0 and v == 1:
+                rises.append(ts)
+            elif v_prev == 1 and v == 0:
+                falls.append(ts)
+    return {"rises": rises, "falls": falls}
+
+def _pick_last_pair(dt_min_ms: int, dt_max_ms: int,
+                    starts: List[datetime], ends: List[datetime]) -> Optional[float]:
+    if not starts or not ends:
+        return None
+    j = len(starts) - 1
+    for i in range(len(ends)-1, -1, -1):
+        t_end = ends[i]
+        while j >= 0 and starts[j] > t_end:
+            j -= 1
+        if j < 0:
+            break
+        t_start = starts[j]
+        dt_ms = (t_end - t_start).total_seconds() * 1000.0
+        if dt_ms >= dt_min_ms and dt_ms <= dt_max_ms:
+            return dt_ms / 1000.0
+    return None
+
+# -----------------------------------------------------------------------------
+# Fallback herdado (versão antiga) — apenas para casos em que dt_* ficou None
+# -----------------------------------------------------------------------------
+def _dedup(seq: List[Tuple[datetime,int]]) -> List[Tuple[datetime,int]]:
+    """Remove repetições consecutivas (…,(t,0),(t,0),…) mantendo a última."""
+    if not seq:
+        return seq
+    out = [seq[0]]
+    for t, v in seq[1:]:
+        if out[-1][1] != v:
+            out.append((t, v))
+        else:
+            out[-1] = (t, v)
+    return out
+
+def _derive_open_closed_from_S1S2(
+    s1: List[Tuple[datetime,int]],
+    s2: List[Tuple[datetime,int]],
+) -> Tuple[List[Tuple[datetime,int]], List[Tuple[datetime,int]]]:
+    """
+    Constrói duas séries booleanas:
+      - opened == 1 quando (S1=1 e S2=0)  -> movimento de ABRIR
+      - closed == 1 quando (S1=0 e S2=1)  -> movimento de FECHAR
+    """
+    if not s1 and not s2:
+        return [], []
+
+    times = sorted({t for t,_ in s1} | {t for t,_ in s2})
+    if not times:
+        return [], []
+
+    def val_at(seq: List[Tuple[datetime,int]], t: datetime) -> int:
+        if not seq:
+            return 0
+        lo, hi = 0, len(seq) - 1
+        last = seq[0][1]
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if seq[mid][0] <= t:
+                last = seq[mid][1]
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return last
+
+    opened: List[Tuple[datetime,int]] = []
+    closed: List[Tuple[datetime,int]] = []
+    prev_open: Optional[int] = None
+
+    for t in times:
+        v1 = val_at(s1, t)
+        v2 = val_at(s2, t)
+        if v1 == 1 and v2 == 0:
+            cur_open, cur_close = 1, 0
+            prev_open = 1
+        elif v1 == 0 and v2 == 1:
+            cur_open, cur_close = 0, 1
+            prev_open = 0
+        else:
+            if prev_open is None:
+                cur_open, cur_close = 0, 0
+            else:
+                cur_open = 1 if prev_open == 1 else 0
+                cur_close = 0 if prev_open == 1 else 1
+        opened.append((t, cur_open))
+        closed.append((t, cur_close))
+    return _dedup(opened), _dedup(closed)
+
+def _last_pulse_duration(seq: List[Tuple[datetime,int]], now_dt: Optional[datetime] = None) -> Optional[float]:
+    """
+    Duração do último ‘pulso’ (0→1→0). Se terminou em 1, mede até `now_dt`.
+    """
+    if not seq:
+        return None
+    if now_dt is None:
+        now_dt = datetime.now(timezone.utc)
+    last_on: Optional[datetime] = None
+    last_pulse: Optional[Tuple[datetime, datetime]] = None
+    for i in range(1, len(seq)):
+        if seq[i-1][1] == 0 and seq[i][1] == 1:
+            last_on = seq[i][0]
+        if seq[i-1][1] == 1 and seq[i][1] == 0 and last_on:
+            last_pulse = (last_on, seq[i][0])
+    if last_pulse:
+        t_on, t_off = last_pulse
+        return (t_off - t_on).total_seconds()
+    if seq[-1][1] == 1 and last_on:
+        return (now_dt - last_on).total_seconds()
+    return None
+
+# -----------------------------------------------------------------------------
+# Cálculo dos timings (robusto + fallback)
+# -----------------------------------------------------------------------------
+def _last_timing_for_actuator(aid: int,
+                              s1: List[Tuple[datetime, int]],
+                              s2: List[Tuple[datetime, int]]) -> Dict[str, Optional[float]]:
+    """
+    1) Tenta calcular com bordas validadas (debounce):
+       dt_abre_s  = S1↓ -> S2↑
+       dt_fecha_s = S2↓ -> S1↑
+    2) Se qualquer um sair None, re-calcula apenas o que faltou com a
+       lógica antiga (opened/closed + last pulse).
+    """
+    # --- caminho principal (bordas validadas)
+    edges1 = _validated_edges(s1, MON_DEBOUNCE_MS)
+    edges2 = _validated_edges(s2, MON_DEBOUNCE_MS)
+
+    s1_falls = edges1["falls"]   # 1→0
+    s1_rises = edges1["rises"]   # 0→1
+    s2_falls = edges2["falls"]   # 1→0
+    s2_rises = edges2["rises"]   # 0→1
+
+    dt_abre_s  = _pick_last_pair(MON_MIN_OPEN_MS,  MON_MAX_DT_MS, s1_falls, s2_rises)
+    dt_fecha_s = _pick_last_pair(MON_MIN_CLOSE_MS, MON_MAX_DT_MS, s2_falls, s1_rises)
+
+    # --- fallback fino (só se faltou algo)
+    if dt_abre_s is None or dt_fecha_s is None:
+        opened, closed = _derive_open_closed_from_S1S2(s1, s2)
+        now_dt = datetime.now(timezone.utc)
+
+        if dt_abre_s is None:
+            v = _last_pulse_duration(opened, now_dt=now_dt)
+            if v is not None:
+                ms = v * 1000.0
+                if MON_MIN_OPEN_MS <= ms <= MON_MAX_DT_MS:
+                    dt_abre_s = round(v, 6)
+
+        if dt_fecha_s is None:
+            v = _last_pulse_duration(closed, now_dt=now_dt)
+            if v is not None:
+                ms = v * 1000.0
+                if MON_MIN_CLOSE_MS <= ms <= MON_MAX_DT_MS:
+                    dt_fecha_s = round(v, 6)
+
+    dt_ciclo_s: Optional[float] = None
+    if dt_abre_s is not None and dt_fecha_s is not None:
+        dt_ciclo_s = dt_abre_s + dt_fecha_s
+
+    return {"dt_abre_s": dt_abre_s, "dt_fecha_s": dt_fecha_s, "dt_ciclo_s": dt_ciclo_s}
+
+# -----------------------------------------------------------------------------
+# >>> VIBRAÇÃO (RMS por eixo + overall) conforme tabela atual (mpu_id/ts_utc) <<<
+# -----------------------------------------------------------------------------
+def _fetch_mpu_window(window_s: int, conn_like=None) -> List[Tuple[int, float, float, float]]:
+    """
+    Lê amostras do MPU na janela recente (ts_utc >= UTC_TIMESTAMP(6)-window_s).
+    Retorna [(mpu_id, ax_g, ay_g, az_g), ...]
+    """
+    c, created = _ensure_mysql_connection(conn_like)
+    try:
+        cur = c.cursor()
+        cur.execute(f"""
+        SELECT mpu_id, ax_g, ay_g, az_g
+        FROM {MPU_TABLE}
+        WHERE ts_utc >= (UTC_TIMESTAMP(6) - INTERVAL %s SECOND)
+        ORDER BY ts_utc ASC
+        """, (int(window_s),))
+        rows = cur.fetchall() or []
+        out: List[Tuple[int, float, float, float]] = []
+        for mpu_id, ax_g, ay_g, az_g in rows:
+            out.append((int(mpu_id), float(ax_g or 0.0), float(ay_g or 0.0), float(az_g or 0.0)))
+        return out
+    finally:
+        try: cur.close()
+        except Exception: pass
+        if created:
+            try: c.close()
+            except Exception: pass
+
+def _vibration_items(window_s: int) -> List[Dict[str, float]]:
+    """
+    Calcula RMS por eixo e overall por sensor na janela dada.
+    overall = sqrt(RMSx^2 + RMSy^2 + RMSz^2)
+    Retorna: [{"mpu_id": <int>, "overall": <float>}, ...]
+    """
+    rows = _fetch_mpu_window(window_s, "ENV")
+    if not rows:
+        return []
+    by: Dict[int, Dict[str, List[float]]] = {}
+    for mpu_id, ax, ay, az in rows:
+        d = by.setdefault(int(mpu_id), {"ax": [], "ay": [], "az": []})
+        d["ax"].append(ax); d["ay"].append(ay); d["az"].append(az)
+
+    items: List[Dict[str, float]] = []
+    for mpu_id, d in by.items():
+        def _rms(vals: List[float]) -> float:
+            n = max(1, len(vals))
+            return (sum(v*v for v in vals) / n) ** 0.5
+        rms_ax = _rms(d["ax"])
+        rms_ay = _rms(d["ay"])
+        rms_az = _rms(d["az"])
+        overall = float((rms_ax*rms_ax + rms_ay*rms_ay + rms_az*rms_az) ** 0.5)
+        items.append({"mpu_id": int(mpu_id), "overall": overall})
+    return items
+
+# -----------------------------------------------------------------------------
+# Monitoring payload (com timings robustos + VIBRAÇÃO)
 # -----------------------------------------------------------------------------
 def build_monitoring_payload() -> dict:
-    """
-    Monta séries de S1/S2 dos dois atuadores em uma janela configurável.
-    Usa _fetch_series (lendo direto de opc_samples) para minimizar lag.
-    """
-    WINDOW_S_PRIMARY = int(os.getenv("MON_TIMING_WINDOW_S", "60"))
-    window_s = max(1, WINDOW_S_PRIMARY)
+    window_s = max(2, int(os.getenv("MON_TIMING_WINDOW_S", str(MON_TIMING_WINDOW_S))))
 
-    # Nomes corretos de S1/S2 para cada atuador, a partir das CFGs
     a1_s1, a1_s2 = _facet_names(_CFG_A1)
     a2_s1, a2_s2 = _facet_names(_CFG_A2)
 
     names = [a1_s1, a1_s2, a2_s1, a2_s2]
     series = _fetch_series(names, window_s)
 
-    # timestamp de referência (agora) — ISO com TZ UTC
+    a1_last = _last_timing_for_actuator(1, series.get(a1_s1, []), series.get(a1_s2, []))
+    a2_last = _last_timing_for_actuator(2, series.get(a2_s1, []), series.get(a2_s2, []))
+
     ref_ts = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+
+    # vibração tolerante a erro
+    vib_window = int(os.getenv("MON_VIB_WINDOW_S", str(MON_VIB_WINDOW_S)))
+    try:
+        vib_items = _vibration_items(vib_window)
+    except Exception as e:
+        print(f"[monitoring] vibration calc failed: {e}")
+        vib_items = []
 
     return {
         "type": "monitoring",
@@ -365,17 +609,39 @@ def build_monitoring_payload() -> dict:
                 "s2": [(ts.isoformat(), v) for (ts, v) in series.get(a2_s2, [])],
             },
         ],
+        "timings": [
+            {"actuator_id": 1, "last": a1_last},
+            {"actuator_id": 2, "last": a2_last},
+        ],
+        "vibration": {
+            "window_s": vib_window,
+            "items": vib_items,   # [{mpu_id, overall}]
+        },
     }
 
+# -----------------------------------------------------------------------------
+# NEW: Compat endpoint -> /api/live/actuators/timings
+# -----------------------------------------------------------------------------
+@app.get("/api/live/actuators/timings")
+async def api_live_actuators_timings(window_s: int = Query(60, ge=5, le=3600)):
+    prev = os.getenv("MON_TIMING_WINDOW_S")
+    try:
+        os.environ["MON_TIMING_WINDOW_S"] = str(window_s)
+        snap = build_monitoring_payload()
+        return {"ts": snap.get("ref_ts"), "timings": snap.get("timings", [])}
+    except Exception as e:
+        print(f"[/api/live/actuators/timings] error: {e}")
+        raise HTTPException(status_code=500, detail=f"erro ao montar timings: {e}")
+    finally:
+        if prev is not None:
+            os.environ["MON_TIMING_WINDOW_S"] = prev
+        else:
+            os.environ.pop("MON_TIMING_WINDOW_S", None)
 
 # -----------------------------------------------------------------------------
 # LIVE fast-paths
 # -----------------------------------------------------------------------------
 def _fetch_latest_rows_fast(names: Tuple[str, ...]) -> Dict[str, int]:
-    """
-    Lê o último value_bool (0/1) de cada 'name' diretamente em opc_samples
-    usando join no MAX(ts_utc). Exige índice (name, ts_utc).
-    """
     out: Dict[str, int] = {}
     if not names:
         return out
@@ -397,7 +663,6 @@ def _fetch_latest_rows_fast(names: Tuple[str, ...]) -> Dict[str, int]:
         cur.execute(sql, names)
         for n, vb in (cur.fetchall() or []):
             out[str(n)] = 1 if (vb in (1, True, "1", "true", "TRUE")) else 0
-        # garantir chaves faltantes:
         for n in names:
             out.setdefault(n, 0)
         return out
@@ -409,21 +674,18 @@ def _fetch_latest_rows_fast(names: Tuple[str, ...]) -> Dict[str, int]:
             except Exception: pass
 
 # -----------------------------------------------------------------------------
-# Inferência de estado a partir do latest
+# Inferência de estado a partir do latest (para /live)
 # -----------------------------------------------------------------------------
 def _infer_state_from_latest(cfg: _LatchCfg, latest: Dict[str, int]) -> _LatchState:
     st = _LatchState()
     s1_name, s2_name = _facet_names(cfg)
 
-    # Sensores (primário)
     st.s1 = int(latest.get(s1_name, 0))
     st.s2 = int(latest.get(s2_name, 0))
 
-    # Válvulas (fallback / intenção)
     v_av = int(latest.get(cfg.v_av, 0))   # V*_14  -> AVANÇAR
     v_rec = int(latest.get(cfg.v_rec, 0)) # V*_12  -> RECUAR
 
-    # 1) Primeiro: decisão por sensores (estados estáveis)
     if st.s1 == 1 and st.s2 == 0:
         st.raw_state = "RECUADO"
     elif st.s1 == 0 and st.s2 == 1:
@@ -432,17 +694,14 @@ def _infer_state_from_latest(cfg: _LatchCfg, latest: Dict[str, int]) -> _LatchSt
         st.raw_state = None
         st.note = "S1=1 e S2=1 (inconsistente)"
     else:
-        # 2) S1=0 e S2=0 -> inferir posição pela válvula energizada
         if v_av == 1 and v_rec == 0:
             st.raw_state = "AVANÇADO"
         elif v_rec == 1 and v_av == 0:
             st.raw_state = "RECUADO"
         else:
-            # ambas 0 ou ambas 1 -> ambíguo; fallback final será no build_live_payload
             st.raw_state = None
             st.note = "ambíguo por válvula (ambas 0 ou ambas 1)"
 
-    # pending baseado em válvulas (sinal de intenção/comando)
     if v_av and not v_rec:
         st.pending = "AVANÇAR"
     elif v_rec and not v_av:
@@ -453,7 +712,7 @@ def _infer_state_from_latest(cfg: _LatchCfg, latest: Dict[str, int]) -> _LatchSt
     return st
 
 # -----------------------------------------------------------------------------
-# FSM mínimo em memória para "estado esperado" + último estável
+# FSM mínimo (esperado + último estável)
 # -----------------------------------------------------------------------------
 _FSM_EXPECTED: Dict[str, Optional[str]] = {"A1": None, "A2": None}
 _LAST_STABLE:  Dict[str, Optional[str]] = {"A1": None, "A2": None}
@@ -463,48 +722,37 @@ async def api_debug_fsm_command(
     actuator: str = Query(..., regex="^(A1|A2)$"),
     cmd: str = Query(..., regex="^(ADVANCE|RETRACT)$"),
 ):
-    """
-    Debug: alimenta 'expected' sem DB.
-    ADVANCE -> 'AVANCADO'; RETRACT -> 'RECUADO'.
-    """
     target = "A1" if actuator == "A1" else "A2"
     _FSM_EXPECTED[target] = "AVANCADO" if cmd == "ADVANCE" else "RECUADO"
     return {"ok": True, "actuator": target, "expected": _FSM_EXPECTED[target]}
 
 # -----------------------------------------------------------------------------
-# Payload de /api/live/snapshot (com expected/mismatch)
+# Payload de /api/live/snapshot
 # -----------------------------------------------------------------------------
 def build_live_payload() -> dict:
-    # lê cache do sampler / push
     latest = _LIVE_CACHE.get("vals") or {}
     a1 = _infer_state_from_latest(_CFG_A1, latest)
     a2 = _infer_state_from_latest(_CFG_A2, latest)
 
-    # timestamp coerente com STORE_TZ
     now_local_naive = _now_for_db()
     ts_ms = _epoch_ms_from_local_naive(now_local_naive)
     ts_iso = datetime.utcfromtimestamp(ts_ms / 1000.0).replace(tzinfo=timezone.utc).isoformat()
 
-    # "estado esperado" (FSM em memória; opcionalmente alimentado por /api/debug/fsm/command)
     exp_a1 = _FSM_EXPECTED.get("A1")
     exp_a2 = _FSM_EXPECTED.get("A2")
 
     def _finalize(cfg_id: str, st: _LatchState, expected: Optional[str]) -> Dict[str, Any]:
-        # escolha do estado final com fallback:
         raw = st.raw_state
         reason = None
         confidence = "high"
 
         if raw is None:
-            # 1) expected guia (medium)
             if expected in ("AVANÇADO", "RECUADO", "AVANCADO"):
                 final = "AVANÇADO" if expected == "AVANCADO" else expected
                 reason, confidence = "expected", "medium"
-            # 2) último estável (low)
             elif _LAST_STABLE.get(cfg_id) in ("AVANÇADO", "RECUADO"):
                 final = _LAST_STABLE[cfg_id]
                 reason, confidence = "last_stable", "low"
-            # 3) default conservador (low)
             else:
                 final = "RECUADO"
                 reason, confidence = "default", "low"
@@ -512,12 +760,10 @@ def build_live_payload() -> dict:
             final = raw
             reason = "sensor_or_valve"
 
-        # atualiza último estável quando for confiável (não-default)
         if reason in ("sensor_or_valve", "expected"):
             if final in ("AVANÇADO", "RECUADO"):
                 _LAST_STABLE[cfg_id] = final
 
-        # normalização ascii
         state_ascii = "AVANCADO" if final == "AVANÇADO" else final
 
         mismatch = None
@@ -539,7 +785,6 @@ def build_live_payload() -> dict:
             "last_state": _LAST_STABLE.get(cfg_id),
             "note": st.note,
             "mismatch_kind": mismatch,
-            # compat
             "state": final,
             "state_ascii": state_ascii,
             "is_avancado": state_ascii == "AVANCADO",
@@ -564,6 +809,48 @@ def build_live_payload() -> dict:
         "a2": a2_pack,
         "ts": legacy["ts"],
         "actuators": legacy["actuators"],
+    }
+
+# -----------------------------------------------------------------------------
+# 🔹 CPM helpers (contagem a partir das bordas validadas)
+# -----------------------------------------------------------------------------
+def _cpm_from_edges(window_s: int,
+                    s1_series: List[Tuple[datetime, int]],
+                    s2_series: List[Tuple[datetime, int]]) -> float:
+    """
+    Estima CPM usando bordas validadas.
+    Heurística: conta subidas (0→1) de S2 (AVANÇADO) como 1 ciclo por avanço.
+    """
+    if window_s <= 0:
+        return 0.0
+    _ = _validated_edges(s1_series, MON_DEBOUNCE_MS)  # mantido para futura heurística
+    e2 = _validated_edges(s2_series, MON_DEBOUNCE_MS)
+    advances = len(e2["rises"])  # cada avanço (S2↑) = 1 ciclo
+    cpm = advances * (60.0 / float(window_s))
+    return round(cpm, 2)
+
+def build_cpm_payload(window_s: Optional[int] = None) -> dict:
+    """
+    Monta payload {type:'cpm', window_s, items:[{actuator_id, cpm}, ...]}.
+    Usa as mesmas séries do monitoring.
+    """
+    w = int(window_s or MON_CPM_WINDOW_S)
+    a1_s1, a1_s2 = _facet_names(_CFG_A1)
+    a2_s1, a2_s2 = _facet_names(_CFG_A2)
+    names = [a1_s1, a1_s2, a2_s1, a2_s2]
+    series = _fetch_series(names, w)
+
+    cpm1 = _cpm_from_edges(w, series.get(a1_s1, []), series.get(a1_s2, []))
+    cpm2 = _cpm_from_edges(w, series.get(a2_s1, []), series.get(a2_s2, []))
+
+    return {
+        "type": "cpm",
+        "ts": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(),
+        "window_s": w,
+        "items": [
+            {"actuator_id": 1, "cpm": cpm1},
+            {"actuator_id": 2, "cpm": cpm2},
+        ],
     }
 
 # -----------------------------------------------------------------------------
@@ -609,14 +896,10 @@ async def hot_drain_loop():
         await asyncio.sleep(0.250)
 
 async def live_producer_loop():
-    """
-    Envia imediatamente quando o sampler/push marcar dirty; caso contrário, heartbeat leve.
-    """
     hb_sec = max(0.5, WS_HEARTBEAT_MS / 1000.0)
     last_compact = None
     while True:
         try:
-            # aguarda mudança ou timeout para heartbeat
             try:
                 await asyncio.wait_for(_LIVE_DIRTY.wait(), timeout=hb_sec)
             except asyncio.TimeoutError:
@@ -628,7 +911,6 @@ async def live_producer_loop():
 
             _LIVE_DIRTY.clear()
 
-            # verificação leve (evita recomputar JSON caro sem necessidade)
             vals = _LIVE_CACHE.get("vals") or {}
             compact = (
                 vals.get("Recuado_1S1",0), vals.get("Avancado_1S2",0),
@@ -647,10 +929,6 @@ async def live_producer_loop():
             await asyncio.sleep(0.05)
 
 async def live_sampler_loop():
-    """
-    Consulta dedicada aos 8 nomes (S1/S2 e válvulas) em opc_samples; atualiza cache
-    e dispara envio imediato quando houver mudança.
-    """
     period = max(0.050, LIVE_TICK_MS / 1000.0)
     next_t = time.perf_counter()
     while True:
@@ -662,7 +940,7 @@ async def live_sampler_loop():
             if latest != _LIVE_CACHE.get("vals"):
                 _LIVE_CACHE["vals"] = latest
                 _LIVE_CACHE["ts"] = datetime.now(timezone.utc)
-                _LIVE_DIRTY.set()  # <- dispara envio imediato
+                _LIVE_DIRTY.set()
             if t_db > 10:
                 print(f"[live_sampler_loop] t_db={t_db:.2f} ms")
         except Exception as e:
@@ -689,11 +967,17 @@ async def slow_producer_loop():
     while True:
         next_t += period
         try:
+            # pacote leve (compat)
             payload = {"type": "slow", "ts": datetime.utcnow().isoformat() + "Z"}
             WS_SLOW.buf.append(payload)
             await WS_SLOW.broadcast(json.dumps(payload))
-        except Exception:
-            pass
+
+            # 🔹 NOVO: envia CPM (usado pela tela Monitoring)
+            cpm_payload = build_cpm_payload(MON_CPM_WINDOW_S)
+            WS_SLOW.buf.append(cpm_payload)
+            await WS_SLOW.broadcast(json.dumps(cpm_payload, ensure_ascii=False, default=str))
+        except Exception as e:
+            print(f"[slow_producer_loop] error: {e}")
         await asyncio.sleep(max(0, next_t - time.perf_counter()))
 
 # -----------------------------------------------------------------------------
@@ -711,6 +995,10 @@ async def _on_startup():
 async def health():
     return {"ok": True, "ts": datetime.utcnow().isoformat() + "Z"}
 
+@app.get("/api/health")
+async def api_health_alias():
+    return await health()
+
 @app.get("/api/live/snapshot")
 async def api_live_snapshot():
     try:
@@ -727,13 +1015,9 @@ async def api_monitoring_snapshot():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"monitoring error: {e}")
 
-# --------- HOT-PATH: collector empurra mudanças (sub-50ms) ---------
+# --------- HOT-PATH: collector empurra mudanças ---------
 @app.post("/api/live/push_bit_update")
 async def api_live_push_bit_update(body: Dict[str, Any] = Body(...)):
-    """
-    Body: {"name":"<OPC tag>", "value":0|1}
-    Atualiza o cache live e dispara envio imediato se houver mudança.
-    """
     try:
         n = str(body.get("name", "")).strip()
         v = 1 if int(body.get("value", 0)) else 0
@@ -752,10 +1036,6 @@ async def api_live_push_bit_update(body: Dict[str, Any] = Body(...)):
 
 @app.post("/api/live/push_bulk")
 async def api_live_push_bulk(body: Dict[str, Any] = Body(...)):
-    """
-    Body: {"items":[{"name":"Recuado_1S1","value":1}, ...]}
-    Atualiza vários bits de uma vez e dispara um único envio.
-    """
     try:
         items = body.get("items", [])
         if not isinstance(items, list):
@@ -808,21 +1088,243 @@ async def api_opc_series(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"series error: {e}")
 
+# 🔹 Fallback HTTP para CPM (útil para testes/debug)
+@app.get("/api/slow/cpm")
+async def api_slow_cpm(window_s: int = Query(MON_CPM_WINDOW_S, ge=10, le=600)):
+    try:
+        return JSONResponse(build_cpm_payload(window_s))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"cpm error: {e}")
+
 # -----------------------------------------------------------------------------
-# WebSockets (snapshot no handshake do LIVE)
+# Endpoints MPU (alinhados ao esquema atual)
+# -----------------------------------------------------------------------------
+def _fetch_mpu_latest(conn_like=None, limit: int = 20):
+    c, created = _ensure_mysql_connection(conn_like)
+    try:
+        cur = c.cursor()
+        cur.execute(f"""
+        SELECT mpu_id, ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps, ts_utc
+        FROM {MPU_TABLE}
+        ORDER BY ts_utc DESC
+        LIMIT %s
+        """, (limit,))
+        rows = cur.fetchall() or []
+        out = []
+        for mpu_id, ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps, ts_utc in rows:
+            ts = _coerce_to_datetime(ts_utc) or datetime.now(timezone.utc)
+            out.append({
+                "mpu_id": int(mpu_id),
+                "ax_g": float(ax_g or 0),
+                "ay_g": float(ay_g or 0),
+                "az_g": float(az_g or 0),
+                "gx_dps": float(gx_dps or 0),
+                "gy_dps": float(gy_dps or 0),
+                "gz_dps": float(gz_dps or 0),
+                "ts": ts.isoformat(),
+            })
+        return out
+    finally:
+        try: cur.close()
+        except Exception: pass
+        if created:
+            try: c.close()
+            except Exception: pass
+
+@app.get("/api/mpu/latest")
+async def api_mpu_latest(limit: int = Query(20, ge=1, le=200)):
+    try:
+        out = _fetch_mpu_latest("ENV", limit=limit)
+        return JSONResponse({"rows": out})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"mpu latest error: {e}")
+
+def _parse_since_to_seconds(s: str) -> int:
+    """
+    Aceita formatos tipo '-10m', '-30s', '-1h', '-2h30m'. Default: 600s (10m).
+    """
+    if not s:
+        return 600
+    s = s.strip().lower()
+    if not s.startswith("-"):
+        return 600
+    s = s[1:]
+    total = 0
+    num = ""
+    unit = ""
+    for ch in s:
+        if ch.isdigit():
+            if unit:
+                if unit == "h": total += int(num) * 3600
+                elif unit == "m": total += int(num) * 60
+                elif unit == "s": total += int(num)
+                num, unit = "", ""
+            num += ch
+        else:
+            unit = ch if ch in "hms" else unit
+    if num:
+        if unit == "h": total += int(num) * 3600
+        elif unit == "m": total += int(num) * 60
+        else: total += int(num)
+    return max(1, total or 600)
+
+@app.get("/api/mpu/history")
+async def api_mpu_history(
+    id: int = Query(..., description="mpu_id"),
+    since: str = Query("-10m"),
+    limit: int = Query(2000, ge=1, le=10000),
+    asc: int = Query(1, description="1=ASC, 0=DESC"),
+):
+    """
+    Compat com chamadas antigas:
+      /api/mpu/history?id=1&since=-10m&limit=2000&asc=1
+    """
+    try:
+        seconds = _parse_since_to_seconds(since)
+        order = "ASC" if asc else "DESC"
+        rows = fetch_all(f"""
+        SELECT ts_utc, mpu_id, ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps
+        FROM {MPU_TABLE}
+        WHERE mpu_id = %s
+          AND ts_utc >= (UTC_TIMESTAMP(6) - INTERVAL %s SECOND)
+        ORDER BY ts_utc {order}
+        LIMIT %s
+        """, (id, seconds, limit))
+        out = []
+        for ts_utc, mpu_id, ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps in rows or []:
+            out.append({
+                "ts": (_coerce_to_datetime(ts_utc) or datetime.now(timezone.utc)).isoformat(),
+                "mpu_id": int(mpu_id),
+                "ax_g": float(ax_g or 0),
+                "ay_g": float(ay_g or 0),
+                "az_g": float(az_g or 0),
+                "gx_dps": float(gx_dps or 0),
+                "gy_dps": float(gy_dps or 0),
+                "gz_dps": float(gz_dps or 0),
+            })
+        if asc and order == "DESC":
+            out.reverse()
+        return JSONResponse({"rows": out, "since_s": seconds})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"mpu history error: {e}")
+
+@app.get("/api/db/mpu_values")
+async def api_db_mpu_values(limit: int = Query(100, ge=1, le=5000)):
+    try:
+        rows = fetch_all(f"""
+        SELECT mpu_id, ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps, ts_utc
+        FROM {MPU_TABLE}
+        ORDER BY ts_utc DESC
+        LIMIT %s
+        """, (limit,))
+        out = []
+        for mpu_id, ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps, ts_utc in rows or []:
+            out.append({
+                "mpu_id": int(mpu_id),
+                "ax_g": float(ax_g or 0),
+                "ay_g": float(ay_g or 0),
+                "az_g": float(az_g or 0),
+                "gx_dps": float(gx_dps or 0),
+                "gy_dps": float(gy_dps or 0),
+                "gz_dps": float(gz_dps or 0),
+                "ts_utc": (_coerce_to_datetime(ts_utc) or datetime.now(timezone.utc)).isoformat(),
+            })
+        return JSONResponse({"rows": out})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"db mpu_values error: {e}")
+
+# -----------------------------------------------------------------------------
+# Dashboard helpers
+# -----------------------------------------------------------------------------
+@app.get("/api/dashboard/summary")
+async def api_dashboard_summary():
+    try:
+        live = build_live_payload()
+        mon  = build_monitoring_payload()
+        mpu  = _fetch_mpu_latest("ENV", limit=10)
+        return JSONResponse({"live": live, "monitoring": mon, "mpu": mpu})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"dashboard summary error: {e}")
+
+@app.get("/api/live/compact")
+async def api_live_compact():
+    try:
+        latest = _LIVE_CACHE.get("vals") or _fetch_latest_rows_fast(_NAMES_LATCH)
+        a1 = _infer_state_from_latest(_CFG_A1, latest)
+        a2 = _infer_state_from_latest(_CFG_A2, latest)
+        return JSONResponse({
+            "a1": {"s1": a1.s1, "s2": a1.s2, "state": a1.raw_state or a1.last_state},
+            "a2": {"s1": a2.s1, "s2": a2.s2, "state": a2.raw_state or a2.last_state},
+        })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"live compact error: {e}")
+
+@app.get("/api/opc/latest/by_names")
+async def api_opc_latest_by_names(names: str = Query(..., description="CSV de nomes")):
+    try:
+        name_list = [x.strip() for x in names.split(",") if x.strip()]
+        placeholders = ", ".join(["%s"] * len(name_list))
+        rows = fetch_all(f"""
+        SELECT name, value_bool, ts_utc
+        FROM {OPC_LATEST_VIEW}
+        WHERE name IN ({placeholders})
+        """, tuple(name_list))
+        out = []
+        for name, vbool, ts in rows or []:
+            out.append({
+                "name": name,
+                "value_bool": int(vbool or 0),
+                "ts_utc": (_coerce_to_datetime(ts) or datetime.now(timezone.utc)).isoformat(),
+            })
+        return JSONResponse({"rows": out})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"latest by_names error: {e}")
+
+@app.get("/api/latch/check")
+async def api_latch_check():
+    try:
+        latest = _LIVE_CACHE.get("vals") or _fetch_latest_rows_fast(_NAMES_LATCH)
+        res = {}
+        for cfg in (_CFG_A1, _CFG_A2):
+            s1n, s2n = _facet_names(cfg)
+            s1 = int(latest.get(s1n, 0))
+            s2 = int(latest.get(s2n, 0))
+            if s1 == 1 and s2 == 0:
+                st = "RECUADO"
+            elif s1 == 0 and s2 == 1:
+                st = "AVANCADO"
+            elif s1 == 1 and s2 == 1:
+                st = "INCONSISTENTE"
+            else:
+                st = "INDEFINIDO"
+            res[cfg.id] = {"S1": s1, "S2": s2, "state": st}
+        return JSONResponse(res)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"latch check error: {e}")
+
+@app.get("/api/debug/names")
+async def api_debug_names():
+    try:
+        return JSONResponse({
+            "names_latch": list(_NAMES_LATCH),
+            "names_control": list(CONTROL_NAMES),
+        })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"debug names error: {e}")
+
+# -----------------------------------------------------------------------------
+# WebSockets
 # -----------------------------------------------------------------------------
 @app.websocket("/ws/live")
 async def ws_live(ws: WebSocket):
     await WS_LIVE.add(ws)
     try:
-        # snapshot primeiro
         snap = build_live_payload()
         try:
             await ws.send_text(json.dumps({**snap, "snapshot": True}, ensure_ascii=False, default=str))
         except Exception:
             pass
 
-        # flush últimos itens
         for item in list(WS_LIVE.buf)[-10:]:
             try:
                 await ws.send_text(json.dumps(item, ensure_ascii=False))
@@ -908,46 +1410,6 @@ async def api_debug_ping():
 async def api_debug_state():
     vals = _LIVE_CACHE.get("vals") or {}
     return JSONResponse({"live_vals": vals, "ts": datetime.utcnow().isoformat()+"Z"})
-
-def _fetch_mpu_latest(conn_like=None, limit: int = 20):
-    c, created = _ensure_mysql_connection(conn_like)
-    try:
-        cur = c.cursor()
-        cur.execute(f"""
-        SELECT sensor_id, ax, ay, az, gx, gy, gz, ts_local
-        FROM {MPU_TABLE}
-        ORDER BY ts_local DESC
-        LIMIT %s
-        """, (limit,))
-        rows = cur.fetchall() or []
-        out = []
-        for sensor_id, ax, ay, az, gx, gy, gz, ts_local in rows:
-            ts = _coerce_to_datetime(ts_local) or datetime.now(timezone.utc)
-            out.append({
-                "sensor_id": sensor_id,
-                "ax": float(ax or 0),
-                "ay": float(ay or 0),
-                "az": float(az or 0),
-                "gx": float(gx or 0),
-                "gy": float(gy or 0),
-                "gz": float(gz or 0),
-                "ts": ts.isoformat(),
-            })
-        return out
-    finally:
-        try: cur.close()
-        except Exception: pass
-        if created:
-            try: c.close()
-            except Exception: pass
-
-@app.get("/api/mpu/latest")
-async def api_mpu_latest(limit: int = Query(20, ge=1, le=200)):
-    try:
-        out = _fetch_mpu_latest("ENV", limit=limit)
-        return JSONResponse({"rows": out})
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"mpu latest error: {e}")
 
 def _etag_for(obj: Any) -> str:
     s = json.dumps(obj, sort_keys=True, ensure_ascii=False, default=str)
@@ -1096,7 +1558,6 @@ async def api_db_opc_latest():
         for name, vbool, ts in rows or []:
             out.append({
                 "name": name,
-                "value": int(vbool or 0),
                 "value_bool": int(vbool or 0),
                 "ts_utc": (_coerce_to_datetime(ts) or datetime.now(timezone.utc)).isoformat(),
             })
@@ -1104,135 +1565,14 @@ async def api_db_opc_latest():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"db opc_latest error: {e}")
 
-@app.get("/api/db/mpu_values")
-async def api_db_mpu_values(limit: int = Query(100, ge=1, le=5000)):
-    try:
-        rows = fetch_all(f"""
-        SELECT sensor_id, ax, ay, az, gx, gy, gz, ts_local
-        FROM {MPU_TABLE}
-        ORDER BY ts_local DESC
-        LIMIT %s
-        """, (limit,))
-        out = []
-        for sid, ax, ay, az, gx, gy, gz, ts_local in rows or []:
-            out.append({
-                "sensor_id": sid,
-                "ax": float(ax or 0),
-                "ay": float(ay or 0),
-                "az": float(az or 0),
-                "gx": float(gx or 0),
-                "gy": float(gy or 0),
-                "gz": float(gz or 0),
-                "ts_local": (_coerce_to_datetime(ts_local) or datetime.now(timezone.utc)).isoformat(),
-            })
-        return JSONResponse({"rows": out})
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"db mpu_values error: {e}")
-
-@app.get("/api/dashboard/summary")
-async def api_dashboard_summary():
-    try:
-        live = build_live_payload()
-        mon  = build_monitoring_payload()
-        mpu  = _fetch_mpu_latest("ENV", limit=10)
-        return JSONResponse({"live": live, "monitoring": mon, "mpu": mpu})
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"dashboard summary error: {e}")
-
-@app.get("/api/live/compact")
-async def api_live_compact():
-    try:
-        latest = _LIVE_CACHE.get("vals") or _fetch_latest_rows_fast(_NAMES_LATCH)
-        a1 = _infer_state_from_latest(_CFG_A1, latest)
-        a2 = _infer_state_from_latest(_CFG_A2, latest)
-        return JSONResponse({
-            "a1": {"s1": a1.s1, "s2": a1.s2, "state": a1.raw_state or a1.last_state},
-            "a2": {"s1": a2.s1, "s2": a2.s2, "state": a2.raw_state or a2.last_state},
-        })
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"live compact error: {e}")
-
-@app.get("/api/opc/latest/by_names")
-async def api_opc_latest_by_names(names: str = Query(..., description="CSV de nomes")):
-    try:
-        name_list = [x.strip() for x in names.split(",") if x.strip()]
-        placeholders = ", ".join(["%s"] * len(name_list))
-        rows = fetch_all(f"""
-        SELECT name, value_bool, ts_utc
-        FROM {OPC_LATEST_VIEW}
-        WHERE name IN ({placeholders})
-        """, tuple(name_list))
-        out = []
-        for name, vbool, ts in rows or []:
-            out.append({
-                "name": name,
-                "value_bool": int(vbool or 0),
-                "ts_utc": (_coerce_to_datetime(ts) or datetime.now(timezone.utc)).isoformat(),
-            })
-        return JSONResponse({"rows": out})
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"latest by_names error: {e}")
-
-@app.get("/api/latch/check")
-async def api_latch_check():
-    try:
-        latest = _LIVE_CACHE.get("vals") or _fetch_latest_rows_fast(_NAMES_LATCH)
-        res = {}
-        for cfg in (_CFG_A1, _CFG_A2):
-            s1n, s2n = _facet_names(cfg)
-            s1 = int(latest.get(s1n, 0))
-            s2 = int(latest.get(s2n, 0))
-            if s1 == 1 and s2 == 0:
-                st = "RECUADO"
-            elif s1 == 0 and s2 == 1:
-                st = "AVANCADO"
-            elif s1 == 1 and s2 == 1:
-                st = "INCONSISTENTE"
-            else:
-                st = "INDEFINIDO"
-            res[cfg.id] = {"S1": s1, "S2": s2, "state": st}
-        return JSONResponse(res)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"latch check error: {e}")
-
-@app.get("/api/debug/names")
-async def api_debug_names():
-    try:
-        return JSONResponse({
-            "names_latch": list(_NAMES_LATCH),
-            "names_control": list(CONTROL_NAMES),
-        })
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"debug names error: {e}")
-
-@app.websocket("/ws/echo")
-async def ws_echo(ws: WebSocket):
-    await ws.accept()
-    try:
-        while True:
-            txt = await ws.receive_text()
-            await ws.send_text(txt)
-    except WebSocketDisconnect:
-        pass
-    except Exception:
-        pass
-    finally:
-        try:
-            await ws.close()
-        except Exception:
-            pass
-
 # -----------------------------------------------------------------------------
-# OpenAPI JSON
+# Utilidades extras
 # -----------------------------------------------------------------------------
 @app.get("/openapi.json")
 async def openapi_json():
     from fastapi.openapi.utils import get_openapi
     return get_openapi(title=app.title, version=app.version, routes=app.routes)
 
-# -----------------------------------------------------------------------------
-# Debug WS buffer clear / boom / db_ping / now / force_refresh
-# -----------------------------------------------------------------------------
 @app.post("/api/debug/ws/clear")
 async def api_debug_ws_clear(which: str = Query("live")):
     try:

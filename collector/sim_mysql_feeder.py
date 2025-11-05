@@ -9,10 +9,10 @@ from mysql.connector.errors import ProgrammingError
 # Conexão
 # -----------------------------
 DB = {
-    "host": os.getenv("DB_HOST", "127.0.0.1"),
-    "port": int(os.getenv("DB_PORT", "3306")),
+    "host": os.getenv("DB_HOST", "feierabendbier.ddns.net"),
+    "port": int(os.getenv("DB_PORT", "9187")),
     "user": os.getenv("DB_USER", "gabs"),
-    "password": os.getenv("DB_PASS", "root"),
+    "password": os.getenv("DB_PASS", "ichbinpasqualesschlampe"),
     "database": os.getenv("DB_NAME", "gmdigital"),
 }
 
