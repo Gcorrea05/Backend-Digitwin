@@ -119,6 +119,18 @@ def _coerce_to_datetime(v: Any) -> Optional[datetime]:
         except Exception:
             pass
     return None
+# --- Helpers para minute-agg (LOCAL, com offset configurável) ---
+def _minute_floor_local(dt_utc: datetime, tz_offset_sec: int = -10800) -> datetime:
+    """Converte ts (tz-aware) para horário local (UTC+offset), trunca para o minuto, e devolve com tzinfo do offset."""
+    if dt_utc.tzinfo is None:
+        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+    local = dt_utc + timedelta(seconds=tz_offset_sec)
+    local = local.replace(second=0, microsecond=0)
+    return local.replace(tzinfo=timezone(timedelta(seconds=tz_offset_sec)))
+
+def _iso_minute_local(dt_local: datetime) -> str:
+    """ISO 8601 com offset, ex.: 2025-11-05T15:57:00-03:00"""
+    return dt_local.isoformat(timespec="seconds")
 
 # -----------------------------------------------------------------------------
 # Conexão MySQL
@@ -522,9 +534,9 @@ def fetch_mpu_window_local(window_s: int, tz_offset_sec: int = -10800):
     A janela é (UTC_TIMESTAMP() + offset) - window_s.
     Retorna [{"mpu_id": mid, "overall": último_overall}, ...]
     """
-    sql = """
+    sql = f"""
     SELECT ts_utc, mpu_id, ax_g, ay_g, az_g
-    FROM mpu_samples
+    FROM {MPU_TABLE}
     WHERE ts_utc >= (UTC_TIMESTAMP() + INTERVAL %s SECOND) - INTERVAL %s SECOND
       AND mpu_id IN (1,2)
     ORDER BY ts_utc
@@ -572,7 +584,7 @@ def fetch_opc_window_local(window_s: int, tz_offset_sec: int = -10800):
     placeholders = ','.join(['%s'] * len(names))
     sql = f"""
     SELECT name, CAST(value_bool AS UNSIGNED) AS v, ts_utc
-    FROM opc_samples
+    FROM {OPC_TABLE}
     WHERE name IN ({placeholders})
       AND ts_utc >= (UTC_TIMESTAMP() + INTERVAL %s SECOND) - INTERVAL %s SECOND
     ORDER BY ts_utc
@@ -588,6 +600,40 @@ def fetch_opc_window_local(window_s: int, tz_offset_sec: int = -10800):
         elif name == 'Recuado_2S1':  out[2]['s1'].append((ts_dt, v))
         elif name == 'Avancado_2S2': out[2]['s2'].append((ts_dt, v))
     return out
+# ----------------------------------------------------------------------
+# OPC por INTERVALO FIXO (UTC-3 no banco) — para minute-agg por minuto
+# ----------------------------------------------------------------------
+def fetch_opc_between_local(start_utc: datetime, end_utc: datetime, tz_offset_sec: int = -10800):
+    """
+    Retorna séries (S1/S2 de A1/A2) no intervalo [start_utc, end_utc), assumindo
+    que ts_utc no banco foi gravado em UTC-3.
+    """
+    names = (
+        'Recuado_1S1','Avancado_1S2',
+        'Recuado_2S1','Avancado_2S2',
+    )
+    placeholders = ','.join(['%s'] * len(names))
+    # Ajuste: convertemos o intervalo UTC para "UTC + offset" (zona de gravação)
+    sql = f"""
+    SELECT name, CAST(value_bool AS UNSIGNED) AS v, ts_utc
+    FROM {OPC_TABLE}
+    WHERE name IN ({placeholders})
+      AND ts_utc >= (%s + INTERVAL %s SECOND)
+      AND ts_utc <  (%s + INTERVAL %s SECOND)
+    ORDER BY ts_utc
+    """
+    rows = fetch_all(sql, (*names, start_utc, tz_offset_sec, end_utc, tz_offset_sec)) or []
+
+    out = {1: {'s1': [], 's2': []}, 2: {'s1': [], 's2': []}}
+    for name, v, ts in rows:
+        v = 1 if int(v) else 0
+        ts_dt = _coerce_to_datetime(ts) or datetime.now(timezone.utc)
+        if   name == 'Recuado_1S1':  out[1]['s1'].append((ts_dt, v))
+        elif name == 'Avancado_1S2': out[1]['s2'].append((ts_dt, v))
+        elif name == 'Recuado_2S1':  out[2]['s1'].append((ts_dt, v))
+        elif name == 'Avancado_2S2': out[2]['s2'].append((ts_dt, v))
+    return out
+
 
 # -----------------------------------------------------------------------------
 # Monitoring payload (PLATÔs + vibração)
@@ -599,26 +645,37 @@ def build_monitoring_payload(window_s: int = 60):
       - MPU histórico (UTC-3, curto) -> vibration.items (window_s=2)
     Não altera o 'Live'.
     """
-    # OPC (UTC-3 apenas nesta leitura histórica)
+    # 🔹 Leitura OPC (UTC-3)
     opc = fetch_opc_window_local(window_s=window_s, tz_offset_sec=-10800)
 
-    # MPU (UTC-3 apenas nesta leitura histórica curta)
+    # 🔹 Leitura MPU (UTC-3, curto)
     vib_items = _vibration_items(2)
 
+    # 🔹 Montagem básica
     items = [
         {"id": 1, "s1": opc[1]["s1"], "s2": opc[1]["s2"]},
         {"id": 2, "s1": opc[2]["s1"], "s2": opc[2]["s2"]},
     ]
 
+    # 🔹 Alinha o fuso (end_ts) ao mesmo referencial UTC-3 das séries do banco
+    tz_offset_sec = int(os.getenv("LOCAL_TZ_OFFSET_SEC", "-10800") or "-10800")
+    end_ts_for_series = (
+        datetime.utcnow().replace(tzinfo=timezone.utc)
+        + timedelta(seconds=tz_offset_sec)
+    )
+
+    # 🔹 Calcula timings (PLATÔs) com base no fuso correto
     timings = []
     for aid in (1, 2):
         last = _timings_from_plateaus(
-            opc[aid]["s1"], opc[aid]["s2"],
-            end_ts=datetime.utcnow().replace(tzinfo=timezone.utc),
+            opc[aid]["s1"],
+            opc[aid]["s2"],
+            end_ts=end_ts_for_series,  # <<< Alinhado ao fuso UTC-3
             min_plateau_s=0.2,
         )
         timings.append({"actuator_id": aid, "last": last})
 
+    # 🔹 Payload final
     return {
         "type": "monitoring",
         "ref_ts": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(),
@@ -627,6 +684,63 @@ def build_monitoring_payload(window_s: int = 60):
         "timings": timings,
         "vibration": {"window_s": 2, "items": vib_items},
     }
+
+# ----------------------------------------------------------------------
+# Minute-agg a partir das séries — 1 linha por atuador e minuto
+# ----------------------------------------------------------------------
+def _count_cpm_in_window(series_s2: List[Tuple[datetime, int]], debounce_ms: int) -> int:
+    """Conta quantos avanços (subidas 0→1 em S2) no intervalo."""
+    e2 = _validated_edges(series_s2, debounce_ms)
+    return len(e2["rises"])
+
+def compute_minute_agg_row(actuator: str, minute_utc: datetime) -> Dict[str, Any]:
+    """
+    Calcula o agregado do minuto [minute_utc, minute_utc+60s) para A1 ou A2.
+    Retorna um dict padronizado para a UI.
+    """
+    aid = 1 if actuator == "A1" else 2
+    start_utc = minute_utc.replace(second=0, microsecond=0, tzinfo=timezone.utc)
+    end_utc   = start_utc + timedelta(seconds=60)
+
+    opc = fetch_opc_between_local(start_utc, end_utc, tz_offset_sec=-10800)
+    s1 = opc[aid]["s1"]
+    s2 = opc[aid]["s2"]
+
+    # Timings por platôs (mesma definição usada no Monitoring)
+    last = _timings_from_plateaus(s1, s2, end_ts=end_utc, min_plateau_s=0.2)
+
+    # Runtime (segundos com estado estável != TRANS)
+    states = _state_from_s1s2(s1, s2)
+    runs = _compress_runs(states, end_ts=end_utc)
+    runtime_s = 0.0
+    for t0, t1, st in runs:
+        if st in ("RECUADO", "AVANCADO"):
+            runtime_s += (t1 - t0).total_seconds()
+
+    # CPM = número de avanços no minuto
+    cycles = _count_cpm_in_window(s2, MON_DEBOUNCE_MS)
+
+    return {
+        "minute": start_utc.isoformat().replace("+00:00", "Z"),
+        "t_open_ms_avg": round((last["dt_abre_s"] or 0.0) * 1000),
+        "t_close_ms_avg": round((last["dt_fecha_s"] or 0.0) * 1000),
+        "t_cycle_ms_avg": round((last["dt_ciclo_s"] or 0.0) * 1000),
+        "runtime_s": round(runtime_s, 3),
+        "cpm": int(cycles),
+        "vib_avg": None,  # opcional; pode ser preenchido no futuro
+    }
+
+def build_minute_agg_snapshot(minute_utc: datetime) -> Dict[str, Any]:
+    return {
+        "type": "minute-agg",
+        "ts": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
+        "minute": minute_utc.replace(second=0, microsecond=0, tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
+        "items": [
+            {"actuator": "A1", "row": compute_minute_agg_row("A1", minute_utc)},
+            {"actuator": "A2", "row": compute_minute_agg_row("A2", minute_utc)},
+        ],
+    }
+
 
 # -----------------------------------------------------------------------------
 # NEW: Compat endpoint -> /api/live/actuators/timings
@@ -864,6 +978,297 @@ def build_cpm_payload(window_s: Optional[int] = None) -> dict:
             {"actuator_id": 2, "cpm": cpm2},
         ],
     }
+
+# -----------------------------------------------------------------------------
+# ### [NEW] Minute-agg (só vibração) — compat com front
+# -----------------------------------------------------------------------------
+def _resolve_act_to_id_qs(act: Any, actuator: Any, id_: Any) -> int:
+    cand = act if act is not None else (actuator if actuator is not None else id_)
+    if cand is None:
+        return 1
+    s = str(cand).strip().upper()
+    if s in ("A1", "1"): return 1
+    if s in ("A2", "2"): return 2
+    try:
+        n = int(s)
+        return 1 if n != 2 else 2
+    except Exception:
+        return 1
+
+def _parse_since_rel_minutes(s: str, default_sec: int = 7200) -> int:
+    if not s:
+        return default_sec
+    s = s.strip().lower()
+    if not s.startswith("-"):
+        return default_sec
+    s = s[1:]
+    total = 0
+    num = ""
+    unit = ""
+    for ch in s:
+        if ch.isdigit():
+            if unit:
+                if unit == "h": total += int(num) * 3600
+                elif unit == "m": total += int(num) * 60
+                elif unit == "s": total += int(num)
+                num, unit = "", ""
+            num += ch
+        else:
+            unit = ch if ch in "hms" else unit
+    if num:
+        if unit == "h": total += int(num) * 3600
+        elif unit == "m": total += int(num) * 60
+        else: total += int(num)
+    return max(60, total or default_sec)
+
+def _minute_floor_utc(dt: datetime) -> datetime:
+    dt = dt.astimezone(timezone.utc)
+    return dt.replace(second=0, microsecond=0, tzinfo=timezone.utc)
+
+def _minute_grid_iso_utc(window_s: int) -> List[str]:
+    now = datetime.utcnow().replace(tzinfo=timezone.utc)
+    start = _minute_floor_utc(now - timedelta(seconds=window_s))
+    out: List[str] = []
+    cur = start
+    while cur <= now:
+        out.append(cur.isoformat().replace("+00:00", "Z"))
+        cur += timedelta(minutes=1)
+    return out
+
+def _fetch_mpu_series_window_local(window_s: int, ids: Iterable[int] = (1, 2), tz_offset_sec: int = -10800):
+    placeholders = ",".join(["%s"] * len(tuple(ids)))
+    sql = f"""
+    SELECT mpu_id, ts_utc, ax_g, ay_g, az_g
+    FROM {MPU_TABLE}
+    WHERE mpu_id IN ({placeholders})
+      AND ts_utc >= (UTC_TIMESTAMP() + INTERVAL %s SECOND) - INTERVAL %s SECOND
+    ORDER BY ts_utc ASC
+    """
+    params = tuple(int(i) for i in ids) + (tz_offset_sec, int(window_s))
+    rows = fetch_all(sql, params) or []
+
+    out: Dict[int, List[Tuple[datetime, float]]] = {}
+    for mpu_id, ts, ax, ay, az in rows:
+        try:
+            overall = (float(ax) * float(ax) + float(ay) * float(ay) + float(az) * float(az)) ** 0.5
+        except Exception:
+            continue
+        ts_dt = _coerce_to_datetime(ts) or datetime.utcnow().replace(tzinfo=timezone.utc)
+        out.setdefault(int(mpu_id), []).append((ts_dt, float(overall)))
+    for i in ids:
+        out.setdefault(int(i), [])
+    return out
+
+def _minute_vib_avg_for_mpu(mpu_series: List[Tuple[datetime, float]], window_s: int) -> List[Dict[str, Any]]:
+    if not mpu_series:
+        return [{"minute": m, "vib_avg": None, "runtime_s": 0, "cpm": 0} for m in _minute_grid_iso_utc(window_s)]
+    buckets: Dict[str, List[float]] = {}
+    for ts, overall in mpu_series:
+        key = _minute_floor_utc(ts).isoformat().replace("+00:00", "Z")
+        buckets.setdefault(key, []).append(float(overall))
+    out: List[Dict[str, Any]] = []
+    for m in _minute_grid_iso_utc(window_s):
+        vals = buckets.get(m)
+        vib = None
+        if vals:
+            vib = float(sum(vals) / max(1, len(vals)))
+        out.append({"minute": m, "vib_avg": vib, "runtime_s": 0, "cpm": 0})
+    return out
+
+def _actuator_to_mpu_id(aid: int) -> int:
+    return 1 if int(aid) == 1 else 2
+
+@app.get("/metrics/minute-agg")
+async def metrics_minute_agg(
+    act: Optional[str] = Query(None, description="A1|A2|1|2"),
+    actuator: Optional[int] = Query(None),
+    id: Optional[int] = Query(None),
+    since: str = Query("-2h"),
+):
+    try:
+        aid = _resolve_act_to_id_qs(act, actuator, id)
+        window_s = _parse_since_rel_minutes(since, default_sec=7200)
+        mpu_id = _actuator_to_mpu_id(aid)
+        series = _fetch_mpu_series_window_local(window_s, ids=(mpu_id,), tz_offset_sec=-10800)
+        rows = _minute_vib_avg_for_mpu(series.get(mpu_id, []), window_s)
+        return JSONResponse(rows)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"minute-agg error: {e}")
+
+@app.get("/api/minute-agg")
+async def api_metrics_minute_agg(
+    act: Optional[str] = Query(None),
+    actuator: Optional[int] = Query(None),
+    id: Optional[int] = Query(None),
+    since: str = Query("-2h"),
+):
+    return await metrics_minute_agg(act, actuator, id, since)
+
+# -----------------------------------------------------------------------------
+# ### [NEW] OPC history endpoints (by-name / by-facet / generic)
+# -----------------------------------------------------------------------------
+def _since_to_seconds_generic(since: str, default_s: int = 600) -> int:
+    try:
+        return _parse_since_rel_minutes(since, default_s)
+    except Exception:
+        return default_s
+
+def _opc_rows_local_by_name(name: str, window_s: int, asc: bool, tz_offset_sec: int = -10800, limit: int = 20000):
+    order = "ASC" if asc else "DESC"
+    sql = f"""
+    SELECT ts_utc, CAST(value_bool AS UNSIGNED) AS v
+    FROM {OPC_TABLE}
+    WHERE name = %s
+      AND ts_utc >= (UTC_TIMESTAMP() + INTERVAL %s SECOND) - INTERVAL %s SECOND
+    ORDER BY ts_utc {order}
+    LIMIT %s
+    """
+    rows = fetch_all(sql, (name, tz_offset_sec, window_s, limit)) or []
+    items = [{"ts_utc": (_coerce_to_datetime(ts) or datetime.utcnow().replace(tzinfo=timezone.utc)).isoformat(),
+              "value_bool": int(v), "value": int(v)} for ts, v in rows]
+    return items
+
+def _facet_name_for(act_id: int, facet: str) -> str:
+    s1_a1, s2_a1 = _facet_names(_CFG_A1)
+    s1_a2, s2_a2 = _facet_names(_CFG_A2)
+    if int(act_id) == 1:
+        return s1_a1 if facet.upper() == "S1" else s2_a1
+    else:
+        return s1_a2 if facet.upper() == "S1" else s2_a2
+
+def _resolve_act_from_any(act: Any, actuator: Any, id_: Any) -> int:
+    return _resolve_act_to_id_qs(act, actuator, id_)
+
+# ---- by-name
+@app.get("/api/opc/history/name")
+async def api_opc_history_name_get(
+    name: str = Query(...),
+    since: str = Query("-10m"),
+    limit: int = Query(20000, ge=1, le=200000),
+    asc: int = Query(1),
+):
+    try:
+        window_s = _since_to_seconds_generic(since, 600)
+        items = _opc_rows_local_by_name(name, window_s, bool(asc), tz_offset_sec=-10800, limit=limit)
+        return JSONResponse(items)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"opc history name error: {e}")
+
+@app.post("/api/opc/history/name")
+async def api_opc_history_name_post(body: Dict[str, Any] = Body(...)):
+    try:
+        name = str(body.get("name", "")).strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="name obrigatório")
+        since = str(body.get("since", "-10m"))
+        asc = bool(int(body.get("asc", 1)))
+        limit = int(body.get("limit", 20000))
+        window_s = _since_to_seconds_generic(since, 600)
+        items = _opc_rows_local_by_name(name, window_s, asc, tz_offset_sec=-10800, limit=limit)
+        return JSONResponse(items)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"opc history name error: {e}")
+
+# aliases
+@app.get("/api/opc/by-name")
+async def api_opc_by_name_get(name: str = Query(...), since: str = Query("-10m"), limit: int = Query(20000), asc: int = Query(1)):
+    return await api_opc_history_name_get(name=name, since=since, limit=limit, asc=asc)
+
+@app.post("/api/opc/by-name")
+async def api_opc_by_name_post(body: Dict[str, Any] = Body(...)):
+    return await api_opc_history_name_post(body)
+
+# ---- by-facet
+@app.get("/api/opc/history/facet")
+async def api_opc_history_facet_get(
+    act: Optional[str] = Query(None),
+    actuator: Optional[int] = Query(None),
+    id: Optional[int] = Query(None),
+    facet: str = Query(..., regex="^(S1|S2)$", description="S1 ou S2"),
+    since: str = Query("-10m"),
+    asc: int = Query(1),
+    limit: int = Query(20000, ge=1, le=200000),
+):
+    try:
+        aid = _resolve_act_from_any(act, actuator, id)
+        name = _facet_name_for(aid, facet)
+        window_s = _since_to_seconds_generic(since, 600)
+        items = _opc_rows_local_by_name(name, window_s, bool(asc), tz_offset_sec=-10800, limit=limit)
+        return JSONResponse(items)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"opc history facet error: {e}")
+
+@app.post("/api/opc/history/facet")
+async def api_opc_history_facet_post(body: Dict[str, Any] = Body(...)):
+    try:
+        act = body.get("act")
+        actuator = body.get("actuator")
+        id_ = body.get("id")
+        facet = str(body.get("facet", "")).strip().upper()
+        if facet not in ("S1", "S2"):
+            raise HTTPException(status_code=400, detail="facet deve ser S1 ou S2")
+        since = str(body.get("since", "-10m"))
+        asc = bool(int(body.get("asc", 1)))
+        limit = int(body.get("limit", 20000))
+        aid = _resolve_act_from_any(act, actuator, id_)
+        name = _facet_name_for(aid, facet)
+        window_s = _since_to_seconds_generic(since, 600)
+        items = _opc_rows_local_by_name(name, window_s, asc, tz_offset_sec=-10800, limit=limit)
+        return JSONResponse(items)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"opc history facet error: {e}")
+
+# aliases
+@app.get("/api/opc/by-facet")
+async def api_opc_by_facet_get(
+    act: Optional[str] = Query(None),
+    actuator: Optional[int] = Query(None),
+    id: Optional[int] = Query(None),
+    facet: str = Query(..., regex="^(S1|S2)$"),
+    since: str = Query("-10m"),
+    asc: int = Query(1),
+    limit: int = Query(20000),
+):
+    return await api_opc_history_facet_get(act=act, actuator=actuator, id=id, facet=facet, since=since, asc=asc, limit=limit)
+
+@app.post("/api/opc/by-facet")
+async def api_opc_by_facet_post(body: Dict[str, Any] = Body(...)):
+    return await api_opc_history_facet_post(body)
+
+# ---- generic (name OU act+facet)
+@app.get("/api/opc/history")
+async def api_opc_history_get(
+    name: Optional[str] = Query(None),
+    act: Optional[str] = Query(None),
+    actuator: Optional[int] = Query(None),
+    id: Optional[int] = Query(None),
+    facet: Optional[str] = Query(None),
+    since: str = Query("-10m"),
+    asc: int = Query(1),
+    limit: int = Query(20000),
+):
+    if name:
+        return await api_opc_history_name_get(name=name, since=since, limit=limit, asc=asc)
+    if facet:
+        return await api_opc_history_facet_get(act=act, actuator=actuator, id=id, facet=facet, since=since, asc=asc, limit=limit)
+    raise HTTPException(status_code=400, detail="informe 'name' ou 'act+facet'")
+
+@app.post("/api/opc/history")
+async def api_opc_history_post(body: Dict[str, Any] = Body(...)):
+    name = (body.get("name") or "").strip() if isinstance(body.get("name"), str) else None
+    facet = (body.get("facet") or "").strip().upper() if isinstance(body.get("facet"), str) else None
+    if name:
+        return await api_opc_history_name_post(body)
+    if facet in ("S1", "S2"):
+        return await api_opc_history_facet_post(body)
+    raise HTTPException(status_code=400, detail="informe 'name' ou 'act+facet'")
+
 # -----------------------------------------------------------------------------
 # WebSocket infra (buffer limitado = backpressure)
 # -----------------------------------------------------------------------------
@@ -998,12 +1403,48 @@ async def slow_producer_loop():
             print(f"[slow_producer_loop] error: {e}")
 
         await asyncio.sleep(max(0, next_t - time.perf_counter()))
+
+async def minute_agg_producer_loop():
+    """
+    Emite um pacote 'minute-agg' no /ws/slow a cada virada de minuto (UTC).
+    """
+    def _ceil_to_next_minute(t: datetime) -> datetime:
+        t = t.replace(second=0, microsecond=0, tzinfo=timezone.utc)
+        return t + timedelta(minutes=1)
+
+    next_tick = _ceil_to_next_minute(datetime.utcnow().replace(tzinfo=timezone.utc))
+    while True:
+        # dorme até o topo do minuto
+        now = datetime.utcnow().replace(tzinfo=timezone.utc)
+        to_sleep = (next_tick - now).total_seconds()
+        if to_sleep > 0:
+            await asyncio.sleep(min(to_sleep, 1.0))
+            continue
+
+        minute_ref = next_tick - timedelta(minutes=1)  # agrega o minuto anterior
+        try:
+            payload = build_minute_agg_snapshot(minute_ref)
+            WS_SLOW.buf.append(payload)
+            await WS_SLOW.broadcast(json.dumps(payload, ensure_ascii=False, default=str))
+        except Exception as e:
+            print(f"[minute_agg_producer_loop] error: {e}")
+
+        # prepara o próximo
+        next_tick = next_tick + timedelta(minutes=1)
+
+
 # -----------------------------------------------------------------------------
 # Startup
 # -----------------------------------------------------------------------------
 @app.on_event("startup")
 async def _on_startup():
-    for fn in (hot_drain_loop, live_sampler_loop, live_producer_loop, monitoring_producer_loop, slow_producer_loop):
+    for fn in (hot_drain_loop,
+               live_sampler_loop,
+               live_producer_loop,
+               monitoring_producer_loop,
+               slow_producer_loop,
+               minute_agg_producer_loop,
+                      ):
         asyncio.create_task(fn())
 
 # -----------------------------------------------------------------------------
@@ -1118,6 +1559,77 @@ async def api_slow_cpm(window_s: int = Query(MON_CPM_WINDOW_S, ge=10, le=600)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"cpm error: {e}")
 
+# ======================== METRICS: minute-agg =========================
+def _minute_agg_local_for(actuator: int, since_expr: str, tz_offset_sec: int = -10800) -> List[Dict[str, Any]]:
+    """
+    Gera minute-agg LOCAL (UTC-3 por padrão) a partir de OPC (S2 = avançado).
+    Campos: minute (ISO com -03:00), runtime_s, cpm, t_*_ms_avg (nulos por ora).
+    """
+    win_s = _parse_since_to_seconds(since_expr)
+    opc = fetch_opc_window_local(window_s=win_s, tz_offset_sec=tz_offset_sec)
+    s2 = opc.get(int(actuator), {}).get("s2", [])
+
+    runtime_by_min: Dict[str, float] = {}
+    cpm_by_min: Dict[str, int] = {}
+
+    # runtime_s por minuto local
+    for i in range(len(s2)):
+        ts_i, v_i = s2[i]
+        ts_j = s2[i + 1][0] if i + 1 < len(s2) else datetime.now(timezone.utc)
+        if v_i != 1:
+            continue
+        t0, t1 = ts_i, ts_j
+        while t0 < t1:
+            m_local = _minute_floor_local(t0, tz_offset_sec)
+            m_end_local = m_local + timedelta(minutes=1)
+            m_end_utc = (m_end_local - timedelta(seconds=tz_offset_sec)).astimezone(timezone.utc)
+            seg_end = min(t1, m_end_utc)
+            secs = max(0.0, (seg_end - t0).total_seconds())
+            key = _iso_minute_local(m_local)
+            runtime_by_min[key] = min(60.0, (runtime_by_min.get(key, 0.0) + secs))
+            t0 = seg_end
+
+    # cpm por minuto local (subidas validadas de S2)
+    edges = _validated_edges(s2, MON_DEBOUNCE_MS)
+    for ts_up in edges["rises"]:
+        key = _iso_minute_local(_minute_floor_local(ts_up, tz_offset_sec))
+        cpm_by_min[key] = cpm_by_min.get(key, 0) + 1
+
+    out: List[Dict[str, Any]] = []
+    for key in sorted(set(runtime_by_min.keys()) | set(cpm_by_min.keys())):
+        cycles = cpm_by_min.get(key, 0)
+        out.append({
+            "minute": key,
+            "runtime_s": round(min(60.0, runtime_by_min.get(key, 0.0)), 6),
+            "cpm": float(cycles),
+            "t_open_ms_avg": None,
+            "t_close_ms_avg": None,
+            "t_cycle_ms_avg": None,
+            "vib_avg": None,
+        })
+    return out
+
+@app.get("/api/metrics/minute-agg")
+@app.get("/metrics/minute-agg")
+def api_metrics_minute_agg(
+    actuator: int = Query(..., ge=1, le=2, description="1=A1, 2=A2"),
+    since: str = Query("-120m", description="Ex.: -30m, -2h, -7200s"),
+):
+    """
+    Minute-agg em horário LOCAL (UTC-3 por padrão).
+    Retorna lista ordenada por 'minute' com offset -03:00.
+    """
+    try:
+        tz_offset_sec = int(os.getenv("LOCAL_TZ_OFFSET_SEC", "-10800"))
+    except Exception:
+        tz_offset_sec = -10800
+    try:
+        rows = _minute_agg_local_for(actuator, since, tz_offset_sec=tz_offset_sec)
+        return JSONResponse(rows)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"minute-agg error: {e}")
+
+
 # -----------------------------------------------------------------------------
 # Endpoints MPU (alinhados ao esquema atual)
 # -----------------------------------------------------------------------------
@@ -1160,6 +1672,100 @@ async def api_mpu_latest(limit: int = Query(20, ge=1, le=200)):
         return JSONResponse({"rows": out})
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"mpu latest error: {e}")
+
+# Alias compat: /mpu/latest (usa o mesmo handler do /api/mpu/latest)
+@app.get("/mpu/latest")
+async def api_mpu_latest_alias(limit: int = Query(20, ge=1, le=200)):
+    return await api_mpu_latest(limit=limit)
+
+# ---------------------------------------------------------------------
+# /api/mpu/history e /mpu/history — compat + name=MPUA1/MPUA2
+# ---------------------------------------------------------------------
+def _name_to_mpu_id(name: Optional[str]) -> Optional[int]:
+    if not name:
+        return None
+    s = str(name).strip().upper()
+    if s.startswith("MPUA"):
+        s = s[4:]
+    if s.isdigit():
+        n = int(s)
+        return n if n in (1, 2) else None
+    return None
+
+@app.get("/api/mpu/history")
+@app.get("/mpu/history")
+def api_mpu_history_compat(
+    id: Optional[int] = Query(None, ge=1, le=2, description="ID do MPU (1 ou 2)"),
+    name: Optional[str] = Query(None, description="Alternativa: 'MPUA1' ou 'MPUA2'"),
+    since: str = Query("-10m", description="Janela relativa (ex.: -5s, -2m, -1h)"),
+    limit: int = Query(2000, ge=1, le=20000),
+    asc: int = Query(1, description="1 = ASC, 0 = DESC"),
+):
+    """
+    Histórico de MPU considerando que ts_utc no banco está em UTC-3.
+    Suporta id=1|2 ou name=MPUA1|MPUA2. Disponível em /api/mpu/history e /mpu/history.
+    """
+    # Resolve id a partir de name (se id não vier)
+    mpu_id = id if id in (1, 2) else _name_to_mpu_id(name)
+    if mpu_id not in (1, 2):
+        raise HTTPException(status_code=400, detail="Informe id=1|2 ou name=MPUA1|MPUA2")
+
+    # parse since (mesma lógica do teu handler)
+    def _parse_since_to_seconds_local(expr: str) -> int:
+        s = (expr or "").strip().lower()
+        if not s.startswith("-"):
+            if s.isdigit():
+                return int(s) * 60
+            raise HTTPException(status_code=400, detail="Parâmetro 'since' deve ser relativo, ex.: -10m, -5s.")
+        m = re.match(r"^-\s*(\d+)\s*([smhd])?$", s)
+        if not m:
+            raise HTTPException(status_code=400, detail="Formato inválido para 'since'. Use -5s, -2m, -1h, -1d.")
+        qty = int(m.group(1))
+        unit = (m.group(2) or "m")
+        mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+        return qty * mult
+
+    try:
+        window_seconds = _parse_since_to_seconds_local(since)
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=400, detail="Não foi possível interpretar 'since'.")
+
+    try:
+        tz_offset_sec = int(os.getenv("LOCAL_TZ_OFFSET_SEC", "-10800"))
+    except Exception:
+        tz_offset_sec = -10800
+
+    order = "ASC" if asc else "DESC"
+    sql = f"""
+    SELECT ts_utc, mpu_id, ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps
+    FROM {MPU_TABLE}
+    WHERE mpu_id = %s
+      AND ts_utc >= (UTC_TIMESTAMP() + INTERVAL %s SECOND) - INTERVAL %s SECOND
+    ORDER BY ts_utc {order}
+    LIMIT %s
+    """
+
+    rows: List[Tuple[Any, ...]] = fetch_all(sql, (mpu_id, tz_offset_sec, window_seconds, limit)) or []
+
+    items = []
+    for r in rows:
+        ts, mid, ax, ay, az, gx, gy, gz = r
+        items.append({
+            "ts": ts,
+            "mpu_id": int(mid),
+            "ax_g": float(ax), "ay_g": float(ay), "az_g": float(az),
+            "gx_dps": float(gx), "gy_dps": float(gy), "gz_dps": float(gz),
+        })
+
+    return {
+        "id": mpu_id,
+        "since": since,
+        "count": len(items),
+        "items": items,
+    }
+
 
 def _parse_since_to_seconds(s: str) -> int:
     """
@@ -1231,7 +1837,7 @@ def api_mpu_history(
 
     sql = f"""
     SELECT ts_utc, mpu_id, ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps
-    FROM mpu_samples
+    FROM {MPU_TABLE}
     WHERE mpu_id = %s
       AND ts_utc >= (UTC_TIMESTAMP() + INTERVAL %s SECOND) - INTERVAL %s SECOND
     ORDER BY ts_utc {order}
@@ -1864,6 +2470,28 @@ async def api_simulation_scenarios(code: Optional[str] = Query(default=None, des
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"scenarios error: {e}")
 
+# ---------------------------------------------------------------------
+# Compat endpoints: /mpu/ids e /api/mpu/ids (mantém compatibilidade com front antigo)
+# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Compat endpoints: /mpu/ids e /api/mpu/ids
+# ---------------------------------------------------------------------
+@app.get("/mpu/ids")
+@app.get("/api/mpu/ids")
+async def api_mpu_ids():
+    """
+    Retorna a lista de IDs de MPU disponíveis.
+    Compatível com versões antigas do front.
+    """
+    try:
+        rows = fetch_all("SELECT DISTINCT mpu_id FROM mpu_samples ORDER BY mpu_id ASC")
+        ids = [int(r[0]) for r in rows if r and r[0] is not None]
+        if not ids:
+            ids = [1, 2]  # fallback seguro
+        return {"ids": ids}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"mpu ids error: {e}")
+
 @app.post("/api/simulation/draw")
 async def api_simulation_draw(body: Dict[str, Any] = Body(...)):
     """
@@ -1921,4 +2549,3 @@ async def api_simulation_draw(body: Dict[str, Any] = Body(...)):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"draw error: {e}")
-
