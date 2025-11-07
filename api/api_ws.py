@@ -17,6 +17,14 @@ from mysql.connector.errors import PoolError
 from collections import deque
 from hashlib import sha1
 from bisect import bisect_right  # <-- novo (para a lógica de platôs)
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+except Exception:
+    ZoneInfo = None
+
+from mysql.connector.pooling import MySQLConnectionPool
+import mysql.connector  # noqa: F401
+
 
 # -----------------------------------------------------------------------------
 # .env
@@ -43,13 +51,15 @@ app.add_middleware(
 # DB CONFIG
 # -----------------------------------------------------------------------------
 DB_DSN = os.getenv("DB_DSN", "")
-DB_HOST = os.getenv("DB_HOST", "feierabendbier.ddns.net")
-DB_PORT = int(os.getenv("DB_PORT", "9187"))
-DB_USER = os.getenv("DB_USER", "gabs")
-DB_PASS = os.getenv("DB_PASS", "ichbinpasqualesschlampe")
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = int(os.getenv("DB_PORT", "3306"))
+DB_USER = os.getenv("DB_USER", "entry")
+DB_PASS = os.getenv("DB_PASS", "root")
 DB_NAME = os.getenv("DB_NAME", "gmdigital")
 DB_POOL_NAME = os.getenv("DB_POOL_NAME", "gmdigital_pool")
 DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "8"))
+SAMPLES_TABLE = os.getenv("MPU_TABLE") or os.getenv("SAMPLES_TABLE") or "mpu_samples"
+
 
 # ⚠️ Historico sempre em opc_samples; view opc_latest pode existir para debug
 OPC_TABLE = os.getenv("OPC_TABLE", "opc_samples")
@@ -260,6 +270,104 @@ class _LatchState:
     pending: Optional[str] = None    # "AVANÇAR" | "RECUAR" | None
     last_state: Optional[str] = None
     note: Optional[str] = None
+
+#------------------------------------------------
+
+# Fuso São Paulo (UTC-3) — com fallback sem tz se zoneinfo não existir
+_LOCAL_TZ = None
+if ZoneInfo is not None:
+    try:
+        _LOCAL_TZ = ZoneInfo("America/Sao_Paulo")
+    except Exception:
+        _LOCAL_TZ = None
+
+def _now_local_floor_minute_aw() -> datetime:
+    n = datetime.now(_LOCAL_TZ) if _LOCAL_TZ is not None else datetime.now()
+    return n.replace(second=0, microsecond=0)
+
+def _to_iso_local(dt_aw: datetime) -> str:
+    return dt_aw.isoformat()
+
+async def _sleep_until(dt_aw: datetime):
+    while True:
+        now = datetime.now(dt_aw.tzinfo) if dt_aw.tzinfo else datetime.now()
+        delta = (dt_aw - now).total_seconds()
+        if delta <= 0:
+            break
+        await asyncio.sleep(min(delta, 0.5))
+
+try:
+    _POOL_GRAFICO  # type: ignore[name-defined]
+except NameError:
+    _POOL_GRAFICO = MySQLConnectionPool(
+        pool_name="mpu_pool_grafico",
+        pool_size=DB_POOL_SIZE,
+        host=DB_HOST,
+        port=DB_PORT,
+        user=DB_USER,
+        password=DB_PASS,
+        database=DB_NAME,
+        autocommit=True,
+    )
+
+_COLS_CACHE_GRAFICO: Optional[List[str]] = None
+
+def _get_columns(conn) -> List[str]:
+    global _COLS_CACHE_GRAFICO
+    if _COLS_CACHE_GRAFICO is not None:
+        return _COLS_CACHE_GRAFICO
+    with conn.cursor() as cur:
+        cur.execute(f"SHOW COLUMNS FROM {SAMPLES_TABLE}")
+        _COLS_CACHE_GRAFICO = [r[0] for r in cur.fetchall()]
+        return _COLS_CACHE_GRAFICO
+
+def _pick_ts_col(cols: List[str]) -> str:
+    return "ts_utc" if "ts_utc" in cols else "ts"
+
+def _build_value_expr(metric: str, cols: List[str]) -> str:
+    metric = (metric or "mag").lower()
+    has_ax = "ax_g" in cols
+    has_ay = "ay_g" in cols
+    has_az = "az_g" in cols
+    if metric == "ax" and has_ax: return "AVG(ax_g)"
+    if metric == "ay" and has_ay: return "AVG(ay_g)"
+    if metric == "az" and has_az: return "AVG(az_g)"
+    ax = "ax_g" if has_ax else "0"
+    ay = "ay_g" if has_ay else "0"
+    az = "az_g" if has_az else "0"
+    return f"AVG(SQRT(({ax}*{ax})+({ay}*{ay})+({az}*{az})))"
+
+def _avg_last_minute(
+    conn,
+    window_start_naive: datetime,
+    window_end_naive: datetime,
+    mpu_id: Optional[int],
+    actuator_id: Optional[int],
+    metric: str,
+) -> Dict[str, Any]:
+    cols = _get_columns(conn)
+    ts_col = _pick_ts_col(cols)
+    val_expr = _build_value_expr(metric, cols)
+
+    where = [f"{ts_col} >= %s", f"{ts_col} < %s"]
+    params: List[Any] = [window_start_naive, window_end_naive]
+
+    if mpu_id is not None and "mpu_id" in cols:
+        where.append("mpu_id = %s")
+        params.append(int(mpu_id))
+    if actuator_id is not None and "actuator_id" in cols:
+        where.append("actuator_id = %s")
+        params.append(int(actuator_id))
+
+    sql = f"SELECT {val_expr} AS avg_val, COUNT(*) AS n FROM {SAMPLES_TABLE} WHERE {' AND '.join(where)}"
+    with conn.cursor(dictionary=True) as cur:
+        cur.execute(sql, params)
+        row = cur.fetchone() or {"avg_val": None, "n": 0}
+
+    n = int(row["n"] or 0)
+    avg_val = float(row["avg_val"]) if row["avg_val"] is not None else 0.0
+    empty = (n == 0 or row["avg_val"] is None)
+    return {"avg": avg_val, "count": n, "empty": empty}
 
 # -----------------------------------------------------------------------------
 # CFGs
@@ -2549,3 +2657,75 @@ async def api_simulation_draw(body: Dict[str, Any] = Body(...)):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"draw error: {e}")
+@app.websocket("/ws/grafico")
+async def ws_grafico(
+    ws: WebSocket,
+    mpu_id: Optional[int] = Query(default=None),
+    actuator_id: Optional[int] = Query(default=None),
+    metric: str = Query(default="mag", description="ax|ay|az|mag (padrão: mag)"),
+):
+    await ws.accept()
+    conn = None
+    try:
+        conn = _POOL_GRAFICO.get_connection()
+
+        t0_aw = _now_local_floor_minute_aw()
+        win_start_aw = t0_aw - timedelta(minutes=1)
+        win_end_aw = t0_aw
+        win_start_naive = win_start_aw.replace(tzinfo=None)
+        win_end_naive = win_end_aw.replace(tzinfo=None)
+
+        agg = _avg_last_minute(conn, win_start_naive, win_end_naive, mpu_id, actuator_id, metric)
+
+        await ws.send_json({
+            "type": "grafico",
+            "bootstrap": True,
+            "minute": _to_iso_local(t0_aw),
+            "window_start": _to_iso_local(win_start_aw),
+            "window_end": _to_iso_local(win_end_aw),
+            "avg": agg["avg"],
+            "empty": bool(agg["empty"]),
+            "count": int(agg["count"]),
+            "window_s": 60,
+            "mpu_id": mpu_id,
+            "actuator_id": actuator_id,
+            "metric": metric,
+        })
+
+        next_tick_aw = t0_aw + timedelta(minutes=1)
+        while True:
+            await _sleep_until(next_tick_aw)
+            w_start_aw = next_tick_aw - timedelta(minutes=1)
+            w_end_aw = next_tick_aw
+            w_start_naive = w_start_aw.replace(tzinfo=None)
+            w_end_naive = w_end_aw.replace(tzinfo=None)
+
+            agg2 = _avg_last_minute(conn, w_start_naive, w_end_naive, mpu_id, actuator_id, metric)
+            await ws.send_json({
+                "type": "grafico",
+                "minute": _to_iso_local(next_tick_aw),
+                "window_start": _to_iso_local(w_start_aw),
+                "window_end": _to_iso_local(w_end_aw),
+                "avg": agg2["avg"],
+                "empty": bool(agg2["empty"]),
+                "count": int(agg2["count"]),
+                "window_s": 60,
+                "mpu_id": mpu_id,
+                "actuator_id": actuator_id,
+                "metric": metric,
+            })
+            next_tick_aw = next_tick_aw + timedelta(minutes=1)
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        try:
+            await ws.send_json({"type": "error", "error": str(e)})
+        except Exception:
+            pass
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
